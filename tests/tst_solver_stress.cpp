@@ -338,6 +338,132 @@ RModel buildTruss(double tipForce)
     return model;
 }
 
+//! Build a membrane strip in the XY plane. Its transverse in-plane strain and
+//! out-of-plane displacement are restrained so the two constitutive contracts
+//! have distinct closed-form axial stiffness and transverse stress values.
+RModel buildSurfaceStrip(double tipForce,
+                         RElementType elementType,
+                         RElementFormulation formulation,
+                         double expansion = thermalExpansion,
+                         double environmentTemperature = 293.15)
+{
+    constexpr uint surfaceSlices = 12;
+    constexpr double width = 0.1;
+    constexpr double thickness = 0.02;
+    constexpr double surfacePoissonRatio = 0.25;
+
+    RModel model;
+    model.setNNodes(2*(surfaceSlices+1));
+    for (uint i=0;i<=surfaceSlices;i++)
+    {
+        const double x = barLength*double(i)/double(surfaceSlices);
+        model.getNode(2*i+0).set(x,0.0,0.0);
+        model.getNode(2*i+1).set(x,width,0.0);
+    }
+
+    for (uint i=0;i<surfaceSlices;i++)
+    {
+        const uint n00 = 2*i;
+        const uint n01 = n00+1;
+        const uint n10 = 2*(i+1);
+        const uint n11 = n10+1;
+        if (elementType == R_ELEMENT_TRI1)
+        {
+            RElement lower(R_ELEMENT_TRI1);
+            lower.setNodeId(0,n00);
+            lower.setNodeId(1,n10);
+            lower.setNodeId(2,n11);
+            model.addElement(lower,true,0);
+
+            RElement upper(R_ELEMENT_TRI1);
+            // Keep the local x axis parallel to the strip axis so the
+            // element-local stress components have the same closed form.
+            upper.setNodeId(0,n11);
+            upper.setNodeId(1,n01);
+            upper.setNodeId(2,n00);
+            model.addElement(upper,true,0);
+        }
+        else if (elementType == R_ELEMENT_QUAD1)
+        {
+            RElement element(R_ELEMENT_QUAD1);
+            element.setNodeId(0,n00);
+            element.setNodeId(1,n10);
+            element.setNodeId(2,n11);
+            element.setNodeId(3,n01);
+            model.addElement(element,true,0);
+        }
+        else
+        {
+            throw std::invalid_argument("Unsupported surface element in strip model");
+        }
+    }
+
+    RMaterial material(RMaterial::Solid);
+    material.setName("Membrane material");
+    RMaterialProperty modulusProperty(RMaterialProperty::ModulusOfElasiticity);
+    modulusProperty.add(293.15,elasticityModulus);
+    material.add(modulusProperty);
+    RMaterialProperty poissonProperty(RMaterialProperty::PoissonRatio);
+    poissonProperty.add(293.15,surfacePoissonRatio);
+    material.add(poissonProperty);
+    RMaterialProperty densityProperty(RMaterialProperty::Density);
+    densityProperty.add(293.15,density);
+    material.add(densityProperty);
+    RMaterialProperty expansionProperty(RMaterialProperty::ThermalExpansionCoefficient);
+    expansionProperty.add(293.15,expansion);
+    material.add(expansionProperty);
+
+    RSurface &surface = model.getSurface(0);
+    surface.setName("Membrane strip");
+    surface.setThickness(thickness);
+    surface.setStructuralFormulation(formulation);
+    surface.setMaterial(material);
+
+    REnvironmentCondition temperature(R_ENVIRONMENT_CONDITION_TEMPERATURE);
+    temperature.getComponent(temperature.findComponentPosition(R_VARIABLE_TEMPERATURE))
+               .add(0.0,environmentTemperature);
+    surface.addEnvironmentCondition(temperature);
+
+    RBoundaryCondition lateralBc(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    lateralBc.getComponent(lateralBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).setEnabled(false);
+    lateralBc.getComponent(lateralBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+    lateralBc.getComponent(lateralBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+    surface.addBoundaryCondition(lateralBc);
+
+    for (uint j=0;j<2;j++)
+    {
+        RElement fixed(R_ELEMENT_POINT);
+        fixed.setNodeId(0,j);
+        model.addElement(fixed,true,0);
+
+        RElement loaded(R_ELEMENT_POINT);
+        loaded.setNodeId(0,2*surfaceSlices+j);
+        model.addElement(loaded,true,1);
+    }
+
+    RBoundaryCondition fixedBc(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    fixedBc.getComponent(fixedBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).add(0.0,0.0);
+    fixedBc.getComponent(fixedBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+    fixedBc.getComponent(fixedBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+    model.getPoint(0).addBoundaryCondition(fixedBc);
+
+    if (tipForce != 0.0)
+    {
+        RBoundaryCondition forceBc(R_BOUNDARY_CONDITION_FORCE);
+        forceBc.getComponent(forceBc.findComponentPosition(R_VARIABLE_FORCE_X)).add(0.0,tipForce);
+        forceBc.getComponent(forceBc.findComponentPosition(R_VARIABLE_FORCE_Y)).add(0.0,0.0);
+        forceBc.getComponent(forceBc.findComponentPosition(R_VARIABLE_FORCE_Z)).add(0.0,0.0);
+        model.getPoint(1).addBoundaryCondition(forceBc);
+    }
+
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setNInnerIterations(500);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setNOuterIterations(5000);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setSolverCvgValue(1.0e-14);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setOutputFrequency(0);
+    model.getTimeSolver().setEnabled(false);
+    return model;
+}
+
 //! Build a fixed-free bar whose free end face carries a Roller displacement
 //! oriented transversely to the bar.
 //!
@@ -495,6 +621,11 @@ private slots:
     void modalAxialBar();
     void staticTrussBar();
     void modalTrussBar();
+    void staticSurfaceFormulations_data();
+    void staticSurfaceFormulations();
+    void thermalSurfaceExpansion_data();
+    void thermalSurfaceExpansion();
+    void axisymmetricSurfaceIsRejected();
     void surfaceConstraintUsesEnteredDirection();
     void surfaceConstraintFallsBackToTheNormal();
     void explicitDirectionMatchingTheNormalAgrees();
@@ -636,6 +767,143 @@ void TestSolverStress::staticAdditionalVolumeElements()
     }
     QVERIFY2(std::fabs(reaction+tipForce) < 0.01*tipForce,
              qPrintable(QString("Reaction = %1 N, expected %2 N").arg(reaction).arg(-tipForce)));
+}
+
+void TestSolverStress::staticSurfaceFormulations_data()
+{
+    QTest::addColumn<int>("elementType");
+    QTest::addColumn<int>("formulation");
+    QTest::newRow("tri3-plane-stress")
+        << int(R_ELEMENT_TRI1) << int(RElementFormulation::PlaneStress);
+    QTest::newRow("tri3-plane-strain")
+        << int(R_ELEMENT_TRI1) << int(RElementFormulation::PlaneStrain);
+    QTest::newRow("quad4-plane-stress")
+        << int(R_ELEMENT_QUAD1) << int(RElementFormulation::PlaneStress);
+    QTest::newRow("quad4-plane-strain")
+        << int(R_ELEMENT_QUAD1) << int(RElementFormulation::PlaneStrain);
+}
+
+//! TRI3 and QUAD4 use the formulation stored on their surface group. With
+//! epsilon-y restrained, both the axial stiffness and sigma-y distinguish the
+//! plane-stress and plane-strain constitutive matrices unambiguously.
+void TestSolverStress::staticSurfaceFormulations()
+{
+    QFETCH(int,elementType);
+    QFETCH(int,formulation);
+    constexpr double tipForce = 1000.0;
+    constexpr double width = 0.1;
+    constexpr double thickness = 0.02;
+    constexpr double v = 0.25;
+
+    const RElementFormulation selected = static_cast<RElementFormulation>(formulation);
+    RModel model = buildSurfaceStrip(tipForce,static_cast<RElementType>(elementType),selected);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+
+    QString solverError;
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+    const double d00 = selected == RElementFormulation::PlaneStress
+                     ? elasticityModulus/(1.0-v*v)
+                     : elasticityModulus*(1.0-v)/((1.0+v)*(1.0-2.0*v));
+    const double expectedDisplacement = tipForce*barLength/(d00*width*thickness);
+    const uint tip0 = model.getNNodes()-2;
+    const uint tip1 = model.getNNodes()-1;
+    const double tipDisplacement = 0.5*(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,tip0)
+                                      + nodeValue(model,R_VARIABLE_DISPLACEMENT,0,tip1));
+    QVERIFY2(std::fabs(tipDisplacement-expectedDisplacement) < 0.02*expectedDisplacement,
+             qPrintable(QString("Tip displacement = %1 m, expected %2 m")
+                        .arg(tipDisplacement).arg(expectedDisplacement)));
+
+    const double expectedStressX = tipForce/(width*thickness);
+    const double expectedStressY = expectedStressX
+                                 * (selected == RElementFormulation::PlaneStress ? v : v/(1.0-v));
+    uint checked = 0;
+    for (uint i=0;i<model.getNElements();i++)
+    {
+        if (!R_ELEMENT_TYPE_IS_SURFACE(model.getElement(i).getType()))
+        {
+            continue;
+        }
+        const double stressX = elementValue(model,R_VARIABLE_STRESS_X,i);
+        const double stressY = elementValue(model,R_VARIABLE_STRESS_Y,i);
+        QVERIFY2(std::fabs(stressX-expectedStressX) < 0.03*expectedStressX,
+                 qPrintable(QString("Element %1: stress X = %2 Pa, expected %3 Pa")
+                            .arg(i).arg(stressX).arg(expectedStressX)));
+        QVERIFY2(std::fabs(stressY-expectedStressY) < 0.03*expectedStressX,
+                 qPrintable(QString("Element %1: stress Y = %2 Pa, expected %3 Pa")
+                            .arg(i).arg(stressY).arg(expectedStressY)));
+        checked++;
+    }
+    QVERIFY(checked > 0);
+
+    const double reaction = nodeValue(model,R_VARIABLE_FORCE,0,0)
+                          + nodeValue(model,R_VARIABLE_FORCE,0,1);
+    QVERIFY2(std::fabs(reaction+tipForce) < 0.02*tipForce,
+             qPrintable(QString("Reaction = %1 N, expected %2 N").arg(reaction).arg(-tipForce)));
+}
+
+void TestSolverStress::axisymmetricSurfaceIsRejected()
+{
+    RModel model = buildSurfaceStrip(1000.0,R_ELEMENT_TRI1,RElementFormulation::Axisymmetric);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+
+    QString solverError;
+    QVERIFY2(!runSolver(model,solverError),"Axisymmetric surface formulation was accepted");
+    QVERIFY2(solverError.contains("Axisymmetric"),qPrintable(solverError));
+}
+
+void TestSolverStress::thermalSurfaceExpansion_data()
+{
+    QTest::addColumn<int>("formulation");
+    QTest::newRow("plane-stress") << int(RElementFormulation::PlaneStress);
+    QTest::newRow("plane-strain") << int(RElementFormulation::PlaneStrain);
+}
+
+//! A free axial edge with restrained transverse strain expands according to
+//! the selected 2-D constitutive law. This protects both the equivalent nodal
+//! thermal force and the stress-recovery subtraction from thickness leakage.
+void TestSolverStress::thermalSurfaceExpansion()
+{
+    QFETCH(int,formulation);
+    constexpr double alpha = 1.2e-5;
+    constexpr double deltaT = 50.0;
+    constexpr double v = 0.25;
+    const RElementFormulation selected = static_cast<RElementFormulation>(formulation);
+    RModel model = buildSurfaceStrip(0.0,R_ELEMENT_QUAD1,selected,alpha,293.15-deltaT);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+
+    QString solverError;
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+    const double expectedStrain = selected == RElementFormulation::PlaneStress
+                                ? alpha*deltaT*(1.0+v)
+                                : alpha*deltaT/(1.0-v);
+    const double expectedTip = expectedStrain*barLength;
+    const uint tip0 = model.getNNodes()-2;
+    const uint tip1 = model.getNNodes()-1;
+    const double tip = 0.5*(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,tip0)
+                           + nodeValue(model,R_VARIABLE_DISPLACEMENT,0,tip1));
+    QVERIFY2(std::fabs(tip-expectedTip) < 0.02*expectedTip,
+             qPrintable(QString("Thermal tip displacement = %1 m, expected %2 m")
+                        .arg(tip).arg(expectedTip)));
+
+    const double expectedStressY = selected == RElementFormulation::PlaneStress
+                                 ? -elasticityModulus*alpha*deltaT
+                                 : -elasticityModulus*alpha*deltaT/(1.0-v*v);
+    for (uint i=0;i<model.getNElements();i++)
+    {
+        if (!R_ELEMENT_TYPE_IS_SURFACE(model.getElement(i).getType()))
+        {
+            continue;
+        }
+        const double stressX = elementValue(model,R_VARIABLE_STRESS_X,i);
+        const double stressY = elementValue(model,R_VARIABLE_STRESS_Y,i);
+        QVERIFY2(std::fabs(stressX) < 0.02*std::fabs(expectedStressY),
+                 qPrintable(QString("Element %1: free thermal stress X = %2 Pa").arg(i).arg(stressX)));
+        QVERIFY2(std::fabs(stressY-expectedStressY) < 0.02*std::fabs(expectedStressY),
+                 qPrintable(QString("Element %1: thermal stress Y = %2 Pa, expected %3 Pa")
+                            .arg(i).arg(stressY).arg(expectedStressY)));
+    }
 }
 
 //! The reported von Mises stress has to be the classical invariant of the

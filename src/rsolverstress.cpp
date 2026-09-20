@@ -7,6 +7,57 @@
 #include "rmatrixsolver.h"
 #include "reigenvaluesolver.h"
 
+namespace
+{
+
+void buildSurfaceConstitutiveMatrix(RElementFormulation formulation,
+                                    double elasticityModulus,
+                                    double poissonRatio,
+                                    RRMatrix &matrix)
+{
+    matrix.resize(3,3,0.0);
+    matrix.fill(0.0);
+
+    if (formulation == RElementFormulation::PlaneStress)
+    {
+        const double scale = elasticityModulus/(1.0-poissonRatio*poissonRatio);
+        matrix[0][0] = scale;
+        matrix[0][1] = scale*poissonRatio;
+        matrix[1][0] = scale*poissonRatio;
+        matrix[1][1] = scale;
+        matrix[2][2] = elasticityModulus/(2.0*(1.0+poissonRatio));
+        return;
+    }
+
+    if (formulation == RElementFormulation::PlaneStrain)
+    {
+        matrix[0][0] = 1.0-poissonRatio;
+        matrix[0][1] = poissonRatio;
+        matrix[1][0] = poissonRatio;
+        matrix[1][1] = 1.0-poissonRatio;
+        matrix[2][2] = (1.0-2.0*poissonRatio)/2.0;
+        matrix *= elasticityModulus/((1.0+poissonRatio)*(1.0-2.0*poissonRatio));
+        return;
+    }
+
+    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                 "Structural surface formulation '%s' is not supported by the stress solver.",
+                 RElementDescriptor::formulationToId(formulation).toUtf8().constData());
+}
+
+void validateSurfaceFormulation(const RSurface &surface)
+{
+    if (surface.getThickness() > 0.0 &&
+        surface.getStructuralFormulation() == RElementFormulation::Axisymmetric)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Axisymmetric formulation is not implemented for structural surface '%s'.",
+                     surface.getName().toUtf8().constData());
+    }
+}
+
+}
+
 RSolverStress::RSolverStress(RModel *pModel, const QString &modelFileName, const QString &convergenceFileName, RSolverSharedData &sharedData, bool modalAnalysis)
     : RSolverGeneric(pModel,modelFileName,convergenceFileName,sharedData)
 {
@@ -293,9 +344,9 @@ void RSolverStress::prepare()
                         Be.fill(0.0);
                         for (uint m=0;m<dN.getNRows();m++)
                         {
-                            Be[3*m+0][0] = Rt[3*m+0][0]*dN[m][0]*J[0][0];
-                            Be[3*m+1][0] = Rt[3*m+1][0]*dN[m][0]*J[0][0];
-                            Be[3*m+2][0] = Rt[3*m+2][0]*dN[m][0]*J[0][0];
+                            Be[3*m+0][0] = Rt[3*m+0][m]*dN[m][0]*J[0][0];
+                            Be[3*m+1][0] = Rt[3*m+1][m]*dN[m][0]*J[0][0];
+                            Be[3*m+2][0] = Rt[3*m+2][m]*dN[m][0]*J[0][0];
                         }
                         BeT.transpose(Be);
 
@@ -381,6 +432,7 @@ void RSolverStress::prepare()
         RSurface &surface = this->pModel->getSurface(i);
         double surfaceArea = surface.findArea(this->pModel->getNodes(),this->pModel->getElements());
         double surfaceThickness = surface.getThickness();
+        validateSurfaceFormulation(surface);
 
         std::atomic<bool> abort{false};
         #pragma omp parallel for default(shared)
@@ -420,15 +472,12 @@ void RSolverStress::prepare()
                 RRMatrix KeRt(element.size()*3,element.size()*2);
                 RRVector fet(element.size()*2);
 
-                RRMatrix De(3,3,0.0);
+                RRMatrix De;
 
                 double E = this->elementElasticityModulus[elementID];
                 double v = this->elementPoissonRatio[elementID];
 
-                De[0][0] = 1-v;   De[0][1] = v;
-                De[1][0] = v;     De[1][1] = 1-v;
-                De[2][2] = (1-2*v)/2;
-                De *= E/((1+v)*(1-2*v));
+                buildSurfaceConstitutiveMatrix(surface.getStructuralFormulation(),E,v,De);
 
                 double dT = this->elementTemperature[elementID] - this->elementEnvironmentTemperature[elementID];
 
@@ -443,6 +492,12 @@ void RSolverStress::prepare()
                     RRMatrix J, Rt, RtT;
                     double detJ = element.findJacobian(this->pModel->getNodes(),k,J,Rt);
                     RtT.transpose(Rt);
+
+                    fet.fill(0.0);
+                    if (needsMass)
+                    {
+                        Met.fill(0.0);
+                    }
 
                     if (surfaceThickness > 0.0)
                     {
@@ -463,9 +518,9 @@ void RSolverStress::prepare()
 
                         RRMatrix::mlt(Be,De,BeD);
                         RRMatrix::mlt(BeD,BeT,Ket);
+                        Ket *= surfaceThickness * detJ * shapeFunc.getW();
                         RRMatrix::mlt(Rt,Ket,KeRt);
-                        RRMatrix::mlt(KeRt,RtT,Ke);
-                        Ke *= detJ * shapeFunc.getW();
+                        RRMatrix::mlt(KeRt,RtT,Ke,true);
                     }
 
                     for (uint m=0;m<element.size();m++)
@@ -517,17 +572,17 @@ void RSolverStress::prepare()
                         // Thermal expansion
                         if (surfaceThickness > 0.0)
                         {
-                            fet.fill(0.0);
-                            for (uint n=0;n<3;n++)
-                            {
-                                fet[2*m+0] += this->elementThermalExpansion[elementID] * dT * BeD[2*m+0][n] * surfaceThickness * detJ * shapeFunc.getW();
-                                fet[2*m+1] += this->elementThermalExpansion[elementID] * dT * BeD[2*m+1][n] * surfaceThickness * detJ * shapeFunc.getW();
-                            }
-
-                            fe[3*m+0] += Rt[3*m+0][0]*fet[2*m+0] + Rt[3*m+0][1]*fet[2*m+1];
-                            fe[3*m+1] += Rt[3*m+1][0]*fet[2*m+0] + Rt[3*m+1][1]*fet[2*m+1];
-                            fe[3*m+2] += Rt[3*m+2][0]*fet[2*m+0] + Rt[3*m+2][1]*fet[2*m+1];
+                            const double thermalScale = this->elementThermalExpansion[elementID]
+                                                      * dT * surfaceThickness
+                                                      * detJ * shapeFunc.getW();
+                            fet[2*m+0] += thermalScale * (BeD[2*m+0][0] + BeD[2*m+0][1]);
+                            fet[2*m+1] += thermalScale * (BeD[2*m+1][0] + BeD[2*m+1][1]);
                         }
+                    }
+
+                    if (surfaceThickness > 0.0)
+                    {
+                        RRMatrix::mlt(Rt,fet,fe,true);
                     }
 
                     // Mass
@@ -966,9 +1021,9 @@ void RSolverStress::process()
                     Be.fill(0.0);
                     for (uint m=0;m<dN.getNRows();m++)
                     {
-                        Be[3*m+0][0] = Rt[3*m+0][0]*dN[m][0]*J[0][0];
-                        Be[3*m+1][0] = Rt[3*m+1][0]*dN[m][0]*J[0][0];
-                        Be[3*m+2][0] = Rt[3*m+2][0]*dN[m][0]*J[0][0];
+                        Be[3*m+0][0] = Rt[3*m+0][m]*dN[m][0]*J[0][0];
+                        Be[3*m+1][0] = Rt[3*m+1][m]*dN[m][0]*J[0][0];
+                        Be[3*m+2][0] = Rt[3*m+2][m]*dN[m][0]*J[0][0];
                     }
                     BeT.transpose(Be);
 
@@ -1037,6 +1092,7 @@ void RSolverStress::process()
         {
             continue;
         }
+        validateSurfaceFormulation(surface);
 
         std::atomic<bool> abort{false};
         #pragma omp parallel for default(shared)
@@ -1074,15 +1130,12 @@ void RSolverStress::process()
                 RRMatrix KeRt(element.size()*2,element.size()*2);
                 RRVector fet(element.size()*2);
 
-                RRMatrix De(3,3,0.0);
+                RRMatrix De;
 
                 double E = this->elementElasticityModulus[elementID];
                 double v = this->elementPoissonRatio[elementID];
 
-                De[0][0] = 1-v;   De[0][1] = v;
-                De[1][0] = v;     De[1][1] = 1-v;
-                De[2][2] = (1-2*v)/2;
-                De *= E/((1+v)*(1-2*v));
+                buildSurfaceConstitutiveMatrix(surface.getStructuralFormulation(),E,v,De);
 
                 RRMatrix Rl;
                 RRVector tl;
@@ -1137,9 +1190,9 @@ void RSolverStress::process()
 
                     RRMatrix::mlt(Be,De,BeD);
                     RRMatrix::mlt(BeD,BeT,Ket);
+                    Ket *= surfaceThickness * detJ * shapeFunc.getW();
                     RRMatrix::mlt(Rt,Ket,KeRt);
-                    RRMatrix::mlt(KeRt,RtT,Ke);
-                    Ke *= detJ * shapeFunc.getW();
+                    RRMatrix::mlt(KeRt,RtT,Ke,true);
 
                     double integValue = 1.0/double(nInp);
 
@@ -1151,12 +1204,10 @@ void RSolverStress::process()
                             Qe[n] += BeD[2*m+0][n] * lxe[2*m+0] * integValue
                                   +  BeD[2*m+1][n] * lxe[2*m+1] * integValue;
                         }
-                        for (uint n=0;n<2;n++)
-                        {
-                            Qe[0] -= BeD[2*m+0][n] * this->elementThermalExpansion[elementID] * dT * surfaceThickness * integValue;
-                            Qe[1] -= BeD[2*m+1][n] * this->elementThermalExpansion[elementID] * dT * surfaceThickness * integValue;
-                        }
                     }
+                    const double thermalStrain = this->elementThermalExpansion[elementID] * dT;
+                    Qe[0] -= thermalStrain * (De[0][0] + De[0][1]) * integValue;
+                    Qe[1] -= thermalStrain * (De[1][0] + De[1][1]) * integValue;
                 }
 
                 // Nodal force is the internal elastic force K*u. There is no
