@@ -9,6 +9,14 @@
 class RSolver
 {
 
+    public:
+
+        enum class ExecutionPolicy
+        {
+            StructuralProduct,
+            AllRegisteredSolvers
+        };
+
     protected:
 
         //! Pointer to model object.
@@ -17,6 +25,8 @@ class RSolver
         QString modelFileName;
         //! Convergence file name.
         QString convergenceFileName;
+        //! Controls whether product capability restrictions are enforced.
+        ExecutionPolicy executionPolicy;
         //! Shared variables.
         RSolverSharedData sharedData;
         //! Map of solvers.
@@ -32,7 +42,10 @@ class RSolver
     public:
 
         //! Constructor.
-        RSolver(RModel &model, const QString &modelFileName, const QString &convergenceFileName);
+        RSolver(RModel &model,
+                const QString &modelFileName,
+                const QString &convergenceFileName,
+                ExecutionPolicy executionPolicy = ExecutionPolicy::AllRegisteredSolvers);
 
         //! Copy constructor (deleted to prevent double-free of solvers).
         RSolver(const RSolver &solver) = delete;

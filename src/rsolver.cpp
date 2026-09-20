@@ -1,6 +1,8 @@
 #include <rbl_application_state.h>
+#include <rbl_error.h>
 
 #include <rml_file_utils.h>
+#include <rml_structural_product_profile.h>
 
 #include "rsolver.h"
 #include "rsolveracoustic.h"
@@ -17,8 +19,25 @@
 
 void RSolver::_init()
 {
-    this->sharedData.addData("element-temperature",RRVector(this->pModel->getNElements(),RVariable::getInitValue(R_VARIABLE_TEMPERATURE)));
     RProblemTypeMask problemTypeMask = this->pModel->getProblemTaskTree().getProblemTypeMask();
+    if (problemTypeMask == R_PROBLEM_NONE)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "No solver problem task is configured.");
+    }
+
+    if (this->executionPolicy == ExecutionPolicy::StructuralProduct)
+    {
+        const RProductProfileValidation profileValidation =
+            RStructuralProductProfile::validate(*this->pModel);
+        if (!profileValidation.isAccepted())
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         profileValidation.getDiagnostic());
+        }
+    }
+
+    this->sharedData.addData("element-temperature",RRVector(this->pModel->getNElements(),RVariable::getInitValue(R_VARIABLE_TEMPERATURE)));
 
     std::vector<RProblemType> problemTypes = RProblem::getTypes(problemTypeMask);
     for (uint i=0;i<problemTypes.size();i++)
@@ -86,10 +105,14 @@ void RSolver::_init()
     }
 }
 
-RSolver::RSolver(RModel &model, const QString &modelFileName, const QString &convergenceFileName)
+RSolver::RSolver(RModel &model,
+                 const QString &modelFileName,
+                 const QString &convergenceFileName,
+                 ExecutionPolicy executionPolicy)
     : pModel(&model)
     , modelFileName(modelFileName)
     , convergenceFileName(convergenceFileName)
+    , executionPolicy(executionPolicy)
 {
     this->_init();
 }
@@ -221,6 +244,12 @@ bool RSolver::runProblemTask(const RProblemTaskItem &problemTaskItem, uint taskI
                 std::vector<RProblemType> problemTypes = RProblem::getTypes(problemTypeMask);
                 for (uint i=0;i<problemTypes.size();i++)
                 {
+                    if (!this->solvers.contains(problemTypes[i]))
+                    {
+                        throw RError(RError::Type::Application,R_ERROR_REF,
+                                     "No solver is registered for enabled problem type '%s'.",
+                                     RProblem::getId(problemTypes[i]).toUtf8().constData());
+                    }
                     this->solvers[problemTypes[i]]->setMeshChanged(true);
                 }
             }
@@ -228,6 +257,12 @@ bool RSolver::runProblemTask(const RProblemTaskItem &problemTaskItem, uint taskI
             RLogger::unindent();
 
             this->solversExecutionCount[problemType]++;
+        }
+        else
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "No solver is registered for enabled problem type '%s'.",
+                         RProblem::getId(problemTaskItem.getProblemType()).toUtf8().constData());
         }
     }
 
