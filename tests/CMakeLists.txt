@@ -12,6 +12,7 @@ set(range_solver_lib_tests
     tst_local_rotation
     tst_iteration_info_value
     tst_matrix_solver
+    tst_equation_book
     tst_solver_acoustic
     tst_solver_stress
     tst_structural_solver_gate

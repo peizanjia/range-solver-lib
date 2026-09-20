@@ -3,6 +3,7 @@
 
 #include <rbl_rvector.h>
 
+#include "requationbook.h"
 #include "rsolvergeneric.h"
 
 class RSolverStress : public RSolverGeneric
@@ -51,6 +52,9 @@ class RSolverStress : public RSolverGeneric
         RRVector d;
         //! Eigen vectors.
         RRMatrix ev;
+
+        //! Structural node/DOF to equation mapping.
+        REquationBook equationBook;
 
     public:
 
@@ -110,8 +114,8 @@ class RSolverStress : public RSolverGeneric
         //! the number of constrained directions and the prescribed values.
         void generateLocalConstraints();
 
-        //! Generate node book.
-        void generateNodeBook();
+        //! Generate the active structural equation book.
+        void generateEquationBook();
 
         //! Return true if given component of the boundary condition is present
         //! and switched on.

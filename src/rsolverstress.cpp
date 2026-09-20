@@ -12,6 +12,25 @@ namespace
 
 constexpr double axisymmetricFullAngle = 2.0*3.14159265358979323846;
 
+RDofType translationDof(uint component)
+{
+    R_ERROR_ASSERT(component < 3);
+    return component == 0 ? RDofType::UX
+         : component == 1 ? RDofType::UY
+                          : RDofType::UZ;
+}
+
+bool findTranslationComponent(RDofType dof, uint &component)
+{
+    switch (dof)
+    {
+        case RDofType::UX: component = 0; return true;
+        case RDofType::UY: component = 1; return true;
+        case RDofType::UZ: component = 2; return true;
+        default: return false;
+    }
+}
+
 void lumpMassMatrix(RRMatrix &matrix)
 {
     R_ERROR_ASSERT(matrix.getNRows() == matrix.getNColumns());
@@ -274,9 +293,9 @@ void RSolverStress::prepare()
     RBVector temperatureSetValues;
 
     // The node frames and the directions they hold come from the constraints
-    // themselves, so they have to be known before the node book is built.
+    // themselves, so they have to be known before the equation book is built.
     this->generateLocalConstraints();
-    this->generateNodeBook();
+    this->generateEquationBook();
     this->generateVariableVector(R_VARIABLE_FORCE_X,elementForce.x,forceSetValues.x,true,this->firstRun,this->firstRun);
     this->generateVariableVector(R_VARIABLE_FORCE_Y,elementForce.y,forceSetValues.y,true,this->firstRun,this->firstRun);
     this->generateVariableVector(R_VARIABLE_FORCE_Z,elementForce.z,forceSetValues.z,true,this->firstRun,this->firstRun);
@@ -294,8 +313,8 @@ void RSolverStress::prepare()
     this->generateMaterialVecor(RMaterialProperty::ThermalExpansionCoefficient,this->elementThermalExpansion);
     this->generateVariableVector(R_VARIABLE_TEMPERATURE,this->elementEnvironmentTemperature,temperatureSetValues,false,false,true);
 
-    this->b.resize(this->nodeBook.getNEnabled());
-    this->x.resize(this->nodeBook.getNEnabled());
+    this->b.resize(this->equationBook.getNEnabled());
+    this->x.resize(this->equationBook.getNEnabled());
 
     this->M.clear();
     this->M.setNRows(this->b.size());
@@ -1067,7 +1086,7 @@ void RSolverStress::setDisplacement(const RRVector &v)
 
         for (uint c=0;c<3;c++)
         {
-            if (this->nodeBook.getValue(3*i+c,position))
+            if (this->equationBook.getValue(i,translationDof(c),position))
             {
                 du[c] = v[position];
             }
@@ -2353,39 +2372,32 @@ void RSolverStress::generateLocalConstraints()
     }
 }
 
-void RSolverStress::generateNodeBook()
+void RSolverStress::generateEquationBook()
 {
-    this->nodeBook.resize(this->pModel->getNNodes()*3);
-    this->nodeBook.initialize();
-
-    // The held directions of a node are the leading directions of its frame.
-    for (uint i=0;i<this->pModel->getNNodes();i++)
-    {
-        for (uint j=0;j<this->nodeConstrainedDirections[i];j++)
-        {
-            this->nodeBook.disable(3*i+j,true);
-        }
-    }
-
-    RBVector computableNodes(this->pModel->getNNodes(),false);
+    this->equationBook.resize(this->pModel->getNNodes());
     for (uint i=0;i<this->pModel->getNElements();i++)
     {
         if (this->computableElements[i])
         {
             const RElement &rElement = this->pModel->getElement(i);
+            const QList<RDofType> &dofs = RElementDescriptor::get(rElement.getType()).getDofsPerNode();
             for (uint j=0;j<rElement.size();j++)
             {
-                computableNodes[rElement.getNodeId(j)] = true;
+                for (RDofType dof : dofs)
+                {
+                    this->equationBook.enable(rElement.getNodeId(j),dof);
+                }
             }
         }
     }
-    for (uint i=0;i<computableNodes.size();i++)
+
+    // The held translational directions of a node are the leading directions
+    // of its local constraint frame.
+    for (uint i=0;i<this->pModel->getNNodes();i++)
     {
-        if (!computableNodes[i])
+        for (uint j=0;j<this->nodeConstrainedDirections[i];j++)
         {
-            this->nodeBook.disable(3*i+0,true);
-            this->nodeBook.disable(3*i+1,true);
-            this->nodeBook.disable(3*i+2,true);
+            this->equationBook.disable(i,translationDof(j));
         }
     }
 }
@@ -2396,10 +2408,17 @@ void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRM
     double dt = this->pModel->getTimeSolver().getCurrentTimeStepSize();
 
     const RElement &rElement = this->pModel->getElement(elementID);
+    const QList<RDofType> &elementDofs = RElementDescriptor::get(rElement.getType()).getDofsPerNode();
+    const uint nDofs = uint(elementDofs.size());
+    const uint nElementDofs = nDofs*rElement.size();
 
-    RRMatrix Ae(3*rElement.size(),3*rElement.size());
-    RRMatrix Be(3*rElement.size(),3*rElement.size());
-    RRVector be(3*rElement.size());
+    R_ERROR_ASSERT(Me.getNRows() == nElementDofs && Me.getNColumns() == nElementDofs);
+    R_ERROR_ASSERT(Ke.getNRows() == nElementDofs && Ke.getNColumns() == nElementDofs);
+    R_ERROR_ASSERT(fe.getNRows() == nElementDofs);
+
+    RRMatrix Ae(nElementDofs,nElementDofs);
+    RRMatrix Be(nElementDofs,nElementDofs);
+    RRVector be(nElementDofs);
 
     Ae.fill(0.0);
     Be.fill(0.0);
@@ -2407,36 +2426,31 @@ void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRM
 
     if (this->pModel->getTimeSolver().getEnabled())
     {
-        for (unsigned m=0;m<rElement.size();m++)
+        for (uint m=0;m<rElement.size();m++)
         {
-            be[3*m+0] = dt * fe[3*m+0];
-            be[3*m+1] = dt * fe[3*m+1];
-            be[3*m+2] = dt * fe[3*m+2];
-            for (unsigned n=0;n<rElement.size();n++)
+            for (uint i=0;i<nDofs;i++)
             {
-                Ae[3*m+0][3*n+0] = Me[3*m+0][3*n+0] + alpha * dt * Ke[3*m+0][3*n+0];
-                Ae[3*m+1][3*n+0] = Me[3*m+1][3*n+0] + alpha * dt * Ke[3*m+1][3*n+0];
-                Ae[3*m+2][3*n+0] = Me[3*m+2][3*n+0] + alpha * dt * Ke[3*m+2][3*n+0];
+                const uint row = nDofs*m+i;
+                be[row] = dt*fe[row];
+                for (uint n=0;n<rElement.size();n++)
+                {
+                    for (uint j=0;j<nDofs;j++)
+                    {
+                        const uint column = nDofs*n+j;
+                        Ae[row][column] = Me[row][column] + alpha*dt*Ke[row][column];
 
-                Ae[3*m+0][3*n+1] = Me[3*m+0][3*n+1] + alpha * dt * Ke[3*m+0][3*n+1];
-                Ae[3*m+1][3*n+1] = Me[3*m+1][3*n+1] + alpha * dt * Ke[3*m+1][3*n+1];
-                Ae[3*m+2][3*n+1] = Me[3*m+2][3*n+1] + alpha * dt * Ke[3*m+2][3*n+1];
-
-                Ae[3*m+0][3*n+2] = Me[3*m+0][3*n+2] + alpha * dt * Ke[3*m+0][3*n+2];
-                Ae[3*m+1][3*n+2] = Me[3*m+1][3*n+2] + alpha * dt * Ke[3*m+1][3*n+2];
-                Ae[3*m+2][3*n+2] = Me[3*m+2][3*n+2] + alpha * dt * Ke[3*m+2][3*n+2];
-
-                be[3*m+0] += (Me[3*m+0][3*n+0] - (1.0 - alpha) * dt * Ke[3*m+0][3*n+0]) * this->nodeDisplacement.x[rElement.getNodeId(n)]
-                          +  (Me[3*m+0][3*n+1] - (1.0 - alpha) * dt * Ke[3*m+0][3*n+1]) * this->nodeDisplacement.y[rElement.getNodeId(n)]
-                          +  (Me[3*m+0][3*n+2] - (1.0 - alpha) * dt * Ke[3*m+0][3*n+2]) * this->nodeDisplacement.z[rElement.getNodeId(n)];
-
-                be[3*m+1] += (Me[3*m+1][3*n+0] - (1.0 - alpha) * dt * Ke[3*m+1][3*n+0]) * this->nodeDisplacement.x[rElement.getNodeId(n)]
-                          +  (Me[3*m+1][3*n+1] - (1.0 - alpha) * dt * Ke[3*m+1][3*n+1]) * this->nodeDisplacement.y[rElement.getNodeId(n)]
-                          +  (Me[3*m+1][3*n+2] - (1.0 - alpha) * dt * Ke[3*m+1][3*n+2]) * this->nodeDisplacement.z[rElement.getNodeId(n)];
-
-                be[3*m+2] += (Me[3*m+2][3*n+0] - (1.0 - alpha) * dt * Ke[3*m+2][3*n+0]) * this->nodeDisplacement.x[rElement.getNodeId(n)]
-                          +  (Me[3*m+2][3*n+1] - (1.0 - alpha) * dt * Ke[3*m+2][3*n+1]) * this->nodeDisplacement.y[rElement.getNodeId(n)]
-                          +  (Me[3*m+2][3*n+2] - (1.0 - alpha) * dt * Ke[3*m+2][3*n+2]) * this->nodeDisplacement.z[rElement.getNodeId(n)];
+                        uint component = 0;
+                        double oldValue = 0.0;
+                        if (findTranslationComponent(elementDofs[j],component))
+                        {
+                            const uint nodeId = rElement.getNodeId(n);
+                            oldValue = component == 0 ? this->nodeDisplacement.x[nodeId]
+                                     : component == 1 ? this->nodeDisplacement.y[nodeId]
+                                                      : this->nodeDisplacement.z[nodeId];
+                        }
+                        be[row] += (Me[row][column] - (1.0-alpha)*dt*Ke[row][column])*oldValue;
+                    }
+                }
             }
         }
     }
@@ -2465,50 +2479,52 @@ void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRM
         {
             uint position;
             uint nodeID = rElement.getNodeId(m);
-            for (uint c=0;c<3;c++)
+            for (uint c=0;c<nDofs;c++)
             {
-                if (this->nodeBook.getValue(3*nodeID+c,position))
+                if (this->equationBook.getValue(nodeID,elementDofs[c],position))
                 {
                     continue;
                 }
-                double u = this->nodePrescribedDisplacement[nodeID][c];
+                uint component = 0;
+                const double u = findTranslationComponent(elementDofs[c],component)
+                               ? this->nodePrescribedDisplacement[nodeID][component]
+                               : 0.0;
                 if (std::fabs(u) <= 0.0)
                 {
                     continue;
                 }
-                for (uint n=0;n<3*rElement.size();n++)
+                for (uint n=0;n<nElementDofs;n++)
                 {
-                    be[n] -= Ae[n][3*m+c] * u;
+                    be[n] -= Ae[n][nDofs*m+c]*u;
                 }
             }
         }
     }
 
     // Assembly final matrix system
-    uint dims = 3;
     for (uint m=0;m<rElement.size();m++)
     {
-        for (uint i=0;i<dims;i++)
+        for (uint i=0;i<nDofs;i++)
         {
             uint mp = 0;
 
-            if (this->nodeBook.getValue(dims*rElement.getNodeId(m)+i,mp))
+            if (this->equationBook.getValue(rElement.getNodeId(m),elementDofs[i],mp))
             {
-                bp[mp] += be[dims*m+i];
+                bp[mp] += be[nDofs*m+i];
 
                 for (uint n=0;n<rElement.size();n++)
                 {
-                    for (uint j=0;j<dims;j++)
+                    for (uint j=0;j<nDofs;j++)
                     {
                         uint np = 0;
 
-                        if (this->nodeBook.getValue(dims*rElement.getNodeId(n)+j,np))
+                        if (this->equationBook.getValue(rElement.getNodeId(n),elementDofs[j],np))
                         {
-                            Ap.addValue(mp,np,Ae[dims*m+i][dims*n+j]);
+                            Ap.addValue(mp,np,Ae[nDofs*m+i][nDofs*n+j]);
                             if (this->problemType == R_PROBLEM_STRESS_MODAL)
                             {
                                 // Be carries the mass in the node frames.
-                                Mp.addValue(mp,np,Be[dims*m+i][dims*n+j]);
+                                Mp.addValue(mp,np,Be[nDofs*m+i][nDofs*n+j]);
                             }
                         }
                     }
@@ -2521,6 +2537,8 @@ void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRM
 void RSolverStress::applyLocalRotations(unsigned int elementID, RRMatrix &Ae)
 {
     const RElement &rElement = this->pModel->getElement(elementID);
+    const QList<RDofType> &dofs = RElementDescriptor::get(rElement.getType()).getDofsPerNode();
+    const uint nDofs = uint(dofs.size());
     RRMatrix T;
 
     bool first = true;
@@ -2535,7 +2553,16 @@ void RSolverStress::applyLocalRotations(unsigned int elementID, RRMatrix &Ae)
                 T.setIdentity(Ae.getNRows());
                 first = false;
             }
-            T.setBlock(this->localRotations[nodeId].getR(),3*i,3*i);
+            const int translationOffset = dofs.indexOf(RDofType::UX);
+            if (translationOffset >= 0 && dofs.indexOf(RDofType::UY) == translationOffset+1 && dofs.indexOf(RDofType::UZ) == translationOffset+2)
+            {
+                T.setBlock(this->localRotations[nodeId].getR(),nDofs*i+uint(translationOffset),nDofs*i+uint(translationOffset));
+            }
+            const int rotationOffset = dofs.indexOf(RDofType::RX);
+            if (rotationOffset >= 0 && dofs.indexOf(RDofType::RY) == rotationOffset+1 && dofs.indexOf(RDofType::RZ) == rotationOffset+2)
+            {
+                T.setBlock(this->localRotations[nodeId].getR(),nDofs*i+uint(rotationOffset),nDofs*i+uint(rotationOffset));
+            }
         }
     }
     if (!first)
@@ -2553,6 +2580,8 @@ void RSolverStress::applyLocalRotations(unsigned int elementID, RRMatrix &Ae)
 void RSolverStress::applyLocalRotations(unsigned int elementID, RRVector &fe)
 {
     const RElement &rElement = this->pModel->getElement(elementID);
+    const QList<RDofType> &dofs = RElementDescriptor::get(rElement.getType()).getDofsPerNode();
+    const uint nDofs = uint(dofs.size());
     RRMatrix T;
 
     bool first = true;
@@ -2567,7 +2596,16 @@ void RSolverStress::applyLocalRotations(unsigned int elementID, RRVector &fe)
                 T.setIdentity(fe.getNRows());
                 first = false;
             }
-            T.setBlock(this->localRotations[nodeId].getR(),3*i,3*i);
+            const int translationOffset = dofs.indexOf(RDofType::UX);
+            if (translationOffset >= 0 && dofs.indexOf(RDofType::UY) == translationOffset+1 && dofs.indexOf(RDofType::UZ) == translationOffset+2)
+            {
+                T.setBlock(this->localRotations[nodeId].getR(),nDofs*i+uint(translationOffset),nDofs*i+uint(translationOffset));
+            }
+            const int rotationOffset = dofs.indexOf(RDofType::RX);
+            if (rotationOffset >= 0 && dofs.indexOf(RDofType::RY) == rotationOffset+1 && dofs.indexOf(RDofType::RZ) == rotationOffset+2)
+            {
+                T.setBlock(this->localRotations[nodeId].getR(),nDofs*i+uint(rotationOffset),nDofs*i+uint(rotationOffset));
+            }
         }
     }
     if (!first)

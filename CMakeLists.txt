@@ -12,6 +12,7 @@ qt_add_library(range-solver-lib
         src/rmatrixmanager.cpp
         src/rmatrixpreconditioner.cpp
         src/rmatrixsolver.cpp
+        src/requationbook.cpp
         src/rscales.cpp
         src/rsolver.cpp
         src/rsolveracoustic.cpp
@@ -39,6 +40,7 @@ qt_add_library(range-solver-lib
         include/rmatrixmanager.h
         include/rmatrixpreconditioner.h
         include/rmatrixsolver.h
+        include/requationbook.h
         include/rscales.h
         include/rsolver.h
         include/rsolveracoustic.h
