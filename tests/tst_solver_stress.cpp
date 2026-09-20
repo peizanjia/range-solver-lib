@@ -1,6 +1,7 @@
 #include <QtTest>
 
 #include <cmath>
+#include <stdexcept>
 
 #include "rml_model.h"
 #include "rsolver.h"
@@ -60,7 +61,9 @@ void addTetrahedron(RModel &model, uint n1, uint n2, uint n3, uint n4)
 //! Displacement boundary condition whose X component is switched off, which
 //! makes the bar a clean one dimensional problem and at the same time exercises
 //! the per-component switch of an optional boundary condition.
-RModel buildBar(double tipForce, bool lateralRestraint = true)
+RModel buildBar(double tipForce,
+                bool lateralRestraint = true,
+                RElementType volumeElementType = R_ELEMENT_TETRA1)
 {
     RModel model;
 
@@ -77,7 +80,8 @@ RModel buildBar(double tipForce, bool lateralRestraint = true)
         }
     }
 
-    // Six tetrahedra per slice - a Kuhn decomposition of the brick.
+    // Use the same structured nodes for every first-order solid so the element
+    // formulations can be compared against the same closed-form bar solution.
     for (uint i=0;i<nSlices;i++)
     {
         uint v000 = nodeId(i,0,0);
@@ -89,12 +93,53 @@ RModel buildBar(double tipForce, bool lateralRestraint = true)
         uint v110 = nodeId(i+1,1,0);
         uint v111 = nodeId(i+1,1,1);
 
-        addTetrahedron(model,v000,v100,v110,v111);
-        addTetrahedron(model,v000,v110,v010,v111);
-        addTetrahedron(model,v000,v010,v011,v111);
-        addTetrahedron(model,v000,v011,v001,v111);
-        addTetrahedron(model,v000,v001,v101,v111);
-        addTetrahedron(model,v000,v101,v100,v111);
+        if (volumeElementType == R_ELEMENT_TETRA1)
+        {
+            // Six tetrahedra per slice - a Kuhn decomposition of the brick.
+            addTetrahedron(model,v000,v100,v110,v111);
+            addTetrahedron(model,v000,v110,v010,v111);
+            addTetrahedron(model,v000,v010,v011,v111);
+            addTetrahedron(model,v000,v011,v001,v111);
+            addTetrahedron(model,v000,v001,v101,v111);
+            addTetrahedron(model,v000,v101,v100,v111);
+        }
+        else if (volumeElementType == R_ELEMENT_WEDGE1)
+        {
+            RElement lower(R_ELEMENT_WEDGE1);
+            lower.setNodeId(0,v000);
+            lower.setNodeId(1,v010);
+            lower.setNodeId(2,v001);
+            lower.setNodeId(3,v100);
+            lower.setNodeId(4,v110);
+            lower.setNodeId(5,v101);
+            model.addElement(lower,true,0);
+
+            RElement upper(R_ELEMENT_WEDGE1);
+            upper.setNodeId(0,v011);
+            upper.setNodeId(1,v001);
+            upper.setNodeId(2,v010);
+            upper.setNodeId(3,v111);
+            upper.setNodeId(4,v101);
+            upper.setNodeId(5,v110);
+            model.addElement(upper,true,0);
+        }
+        else if (volumeElementType == R_ELEMENT_HEXA1)
+        {
+            RElement element(R_ELEMENT_HEXA1);
+            element.setNodeId(0,v000);
+            element.setNodeId(1,v100);
+            element.setNodeId(2,v110);
+            element.setNodeId(3,v010);
+            element.setNodeId(4,v001);
+            element.setNodeId(5,v101);
+            element.setNodeId(6,v111);
+            element.setNodeId(7,v011);
+            model.addElement(element,true,0);
+        }
+        else
+        {
+            throw std::invalid_argument("Unsupported volume element in the bar test model");
+        }
     }
 
     RMaterial material(RMaterial::Solid);
@@ -153,29 +198,40 @@ RModel buildBar(double tipForce, bool lateralRestraint = true)
     fixedBc.getComponent(fixedBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
     fixedPoint.addBoundaryCondition(fixedBc);
 
-    // Loaded end - the four nodes at x = L. The Force value is a total over the
-    // entity, spread over its four point elements.
+    // Loaded end - the four nodes at x = L. The diagonal nodes of the two-wedge
+    // section have twice the tributary area of the other corners, so use four
+    // point entities there to apply the consistent nodal force distribution.
+    const double wedgeWeights[4] = {1.0/6.0,1.0/3.0,1.0/3.0,1.0/6.0};
     for (uint j=0;j<2;j++)
     {
         for (uint k=0;k<2;k++)
         {
+            const uint corner = 2*j+k;
+            const uint pointGroup = volumeElementType == R_ELEMENT_WEDGE1 ? 1+corner : 1;
             RElement element(R_ELEMENT_POINT);
             element.setNodeId(0,nodeId(nSlices,j,k));
-            model.addElement(element,true,1);
+            model.addElement(element,true,pointGroup);
         }
     }
 
-    RPoint &loadedPoint = model.getPoint(1);
-    loadedPoint.setName("Free end");
-    loadedPoint.setVolume(0.0);
-
-    if (tipForce != 0.0)
+    const uint nLoadedGroups = volumeElementType == R_ELEMENT_WEDGE1 ? 4 : 1;
+    for (uint i=0;i<nLoadedGroups;i++)
     {
-        RBoundaryCondition forceBc(R_BOUNDARY_CONDITION_FORCE);
-        forceBc.getComponent(forceBc.findComponentPosition(R_VARIABLE_FORCE_X)).add(0.0,tipForce);
-        forceBc.getComponent(forceBc.findComponentPosition(R_VARIABLE_FORCE_Y)).add(0.0,0.0);
-        forceBc.getComponent(forceBc.findComponentPosition(R_VARIABLE_FORCE_Z)).add(0.0,0.0);
-        loadedPoint.addBoundaryCondition(forceBc);
+        RPoint &loadedPoint = model.getPoint(1+i);
+        loadedPoint.setName("Free end");
+        loadedPoint.setVolume(0.0);
+
+        if (tipForce != 0.0)
+        {
+            const double groupForce = volumeElementType == R_ELEMENT_WEDGE1
+                                    ? tipForce*wedgeWeights[i]
+                                    : tipForce;
+            RBoundaryCondition forceBc(R_BOUNDARY_CONDITION_FORCE);
+            forceBc.getComponent(forceBc.findComponentPosition(R_VARIABLE_FORCE_X)).add(0.0,groupForce);
+            forceBc.getComponent(forceBc.findComponentPosition(R_VARIABLE_FORCE_Y)).add(0.0,0.0);
+            forceBc.getComponent(forceBc.findComponentPosition(R_VARIABLE_FORCE_Z)).add(0.0,0.0);
+            loadedPoint.addBoundaryCondition(forceBc);
+        }
     }
 
     model.getMatrixSolverConf(RMatrixSolverConf::CG).setNInnerIterations(500);
@@ -433,6 +489,8 @@ class TestSolverStress : public QObject
 private slots:
 
     void staticAxialBar();
+    void staticAdditionalVolumeElements_data();
+    void staticAdditionalVolumeElements();
     void vonMisesMatchesComponents();
     void modalAxialBar();
     void staticTrussBar();
@@ -515,6 +573,68 @@ void TestSolverStress::staticAxialBar()
         }
     }
     QVERIFY2(std::fabs(reaction+tipForce) < 0.02*tipForce,
+             qPrintable(QString("Reaction = %1 N, expected %2 N").arg(reaction).arg(-tipForce)));
+}
+
+//! WEDGE6 and HEX8 reuse the generic three-dimensional assembly path. This
+//! test protects the complete path from interpolation and quadrature through
+//! global assembly, result recovery and reactions.
+void TestSolverStress::staticAdditionalVolumeElements_data()
+{
+    QTest::addColumn<int>("elementType");
+    QTest::newRow("wedge6") << int(R_ELEMENT_WEDGE1);
+    QTest::newRow("hex8") << int(R_ELEMENT_HEXA1);
+}
+
+void TestSolverStress::staticAdditionalVolumeElements()
+{
+    QFETCH(int,elementType);
+    const RElementType type = static_cast<RElementType>(elementType);
+    const double tipForce = 1000.0; // [N]
+
+    RModel model = buildBar(tipForce,true,type);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+
+    QString solverError;
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+    const double expectedDisplacement = tipForce*barLength/(elasticityModulus*barArea);
+    for (uint j=0;j<2;j++)
+    {
+        for (uint k=0;k<2;k++)
+        {
+            const double displacement = nodeValue(model,R_VARIABLE_DISPLACEMENT,0,nodeId(nSlices,j,k));
+            QVERIFY2(std::fabs(displacement-expectedDisplacement) < 0.01*expectedDisplacement,
+                     qPrintable(QString("Tip displacement = %1 m, expected %2 m")
+                                .arg(displacement).arg(expectedDisplacement)));
+        }
+    }
+
+    const double expectedStress = tipForce/barArea;
+    uint nChecked = 0;
+    for (uint i=0;i<model.getNElements();i++)
+    {
+        if (model.getElement(i).getType() != type)
+        {
+            continue;
+        }
+        const double stressX = elementValue(model,R_VARIABLE_STRESS_X,i);
+        QVERIFY2(std::fabs(stressX-expectedStress) < 0.01*expectedStress,
+                 qPrintable(QString("Element %1: stress X = %2 Pa, expected %3 Pa")
+                            .arg(i).arg(stressX).arg(expectedStress)));
+        nChecked++;
+    }
+    QVERIFY(nChecked > 0);
+
+    double reaction = 0.0;
+    for (uint j=0;j<2;j++)
+    {
+        for (uint k=0;k<2;k++)
+        {
+            reaction += nodeValue(model,R_VARIABLE_FORCE,0,nodeId(0,j,k));
+        }
+    }
+    QVERIFY2(std::fabs(reaction+tipForce) < 0.01*tipForce,
              qPrintable(QString("Reaction = %1 N, expected %2 N").arg(reaction).arg(-tipForce)));
 }
 
