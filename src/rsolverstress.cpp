@@ -10,6 +10,8 @@
 namespace
 {
 
+constexpr double axisymmetricFullAngle = 2.0*3.14159265358979323846;
+
 void lumpMassMatrix(RRMatrix &matrix)
 {
     R_ERROR_ASSERT(matrix.getNRows() == matrix.getNColumns());
@@ -58,6 +60,24 @@ void buildSurfaceConstitutiveMatrix(RElementFormulation formulation,
         return;
     }
 
+    if (formulation == RElementFormulation::Axisymmetric)
+    {
+        matrix.resize(4,4,0.0);
+        matrix.fill(0.0);
+        matrix[0][0] = 1.0-poissonRatio;
+        matrix[0][1] = poissonRatio;
+        matrix[0][2] = poissonRatio;
+        matrix[1][0] = poissonRatio;
+        matrix[1][1] = 1.0-poissonRatio;
+        matrix[1][2] = poissonRatio;
+        matrix[2][0] = poissonRatio;
+        matrix[2][1] = poissonRatio;
+        matrix[2][2] = 1.0-poissonRatio;
+        matrix[3][3] = (1.0-2.0*poissonRatio)/2.0;
+        matrix *= elasticityModulus/((1.0+poissonRatio)*(1.0-2.0*poissonRatio));
+        return;
+    }
+
     throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                  "Structural surface formulation '%s' is not supported by the stress solver.",
                  RElementDescriptor::formulationToId(formulation).toUtf8().constData());
@@ -65,13 +85,116 @@ void buildSurfaceConstitutiveMatrix(RElementFormulation formulation,
 
 void validateSurfaceFormulation(const RSurface &surface)
 {
-    if (surface.getThickness() > 0.0 &&
-        surface.getStructuralFormulation() == RElementFormulation::Axisymmetric)
+    if (surface.getStructuralFormulation() != RElementFormulation::PlaneStress &&
+        surface.getStructuralFormulation() != RElementFormulation::PlaneStrain &&
+        surface.getStructuralFormulation() != RElementFormulation::Axisymmetric)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Axisymmetric formulation is not implemented for structural surface '%s'.",
+                     "Unsupported structural formulation on surface '%s'.",
                      surface.getName().toUtf8().constData());
     }
+}
+
+//! Build the radius/axis derivatives and the local-to-global displacement map
+//! for the first axisymmetric contract. The meridian is the global XY plane:
+//! X is radius, Y is the revolution axis and Z is circumferential.
+double findAxisymmetricKinematics(const RElement &element,
+                                  const std::vector<RNode> &nodes,
+                                  const RElementShapeFunction &shapeFunction,
+                                  RRMatrix &derivatives,
+                                  RRMatrix &transformation,
+                                  double &radius)
+{
+    const RRVector &N = shapeFunction.getN();
+    const RRMatrix &dN = shapeFunction.getDN();
+    double dxDksi = 0.0;
+    double dxDeta = 0.0;
+    double dyDksi = 0.0;
+    double dyDeta = 0.0;
+    radius = 0.0;
+    double coordinateScale = 1.0;
+
+    for (uint i=0;i<element.size();i++)
+    {
+        const RNode &node = nodes[element.getNodeId(i)];
+        coordinateScale = std::max(coordinateScale,
+                                   std::max(std::fabs(node.getX()),std::fabs(node.getY())));
+        if (std::fabs(node.getZ()) > 1.0e-10*coordinateScale)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Axisymmetric elements must lie in the global XY meridian plane "
+                         "(X = radius, Y = axis); node %u has Z = %g.",
+                         element.getNodeId(i),node.getZ());
+        }
+        if (node.getX() < -1.0e-10*coordinateScale)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Axisymmetric radius must be non-negative; node %u has X = %g.",
+                         element.getNodeId(i),node.getX());
+        }
+        radius += N[i]*node.getX();
+        dxDksi += dN[i][0]*node.getX();
+        dxDeta += dN[i][1]*node.getX();
+        dyDksi += dN[i][0]*node.getY();
+        dyDeta += dN[i][1]*node.getY();
+    }
+
+    const double signedDeterminant = dxDksi*dyDeta-dxDeta*dyDksi;
+    const double determinant = std::fabs(signedDeterminant);
+    if (determinant <= 1.0e-14*coordinateScale*coordinateScale)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Axisymmetric element has a singular meridian Jacobian.");
+    }
+    if (radius <= 1.0e-12*coordinateScale)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Axisymmetric integration point lies on or beyond the revolution axis (radius = %g).",
+                     radius);
+    }
+
+    const double ksiX = dyDeta/signedDeterminant;
+    const double ksiY = -dxDeta/signedDeterminant;
+    const double etaX = -dyDksi/signedDeterminant;
+    const double etaY = dxDksi/signedDeterminant;
+    derivatives.resize(element.size(),2,0.0);
+    for (uint i=0;i<element.size();i++)
+    {
+        derivatives[i][0] = dN[i][0]*ksiX+dN[i][1]*etaX;
+        derivatives[i][1] = dN[i][0]*ksiY+dN[i][1]*etaY;
+    }
+
+    transformation.resize(3*element.size(),2*element.size(),0.0);
+    transformation.fill(0.0);
+    for (uint i=0;i<element.size();i++)
+    {
+        transformation[3*i+0][2*i+0] = 1.0;
+        transformation[3*i+1][2*i+1] = 1.0;
+    }
+    return determinant;
+}
+
+double findAxisymmetricMeasure(const RSurface &surface,
+                               const std::vector<RNode> &nodes,
+                               const std::vector<RElement> &elements)
+{
+    double measure = 0.0;
+    RRMatrix derivatives;
+    RRMatrix transformation;
+    for (uint i=0;i<surface.size();i++)
+    {
+        const RElement &element = elements[surface.get(i)];
+        const uint nIntegrationPoints = RElement::getNIntegrationPoints(element.getType());
+        for (uint k=0;k<nIntegrationPoints;k++)
+        {
+            const RElementShapeFunction &shapeFunction = RElement::getShapeFunction(element.getType(),k);
+            double radius = 0.0;
+            const double determinant = findAxisymmetricKinematics(element,nodes,shapeFunction,
+                                                                   derivatives,transformation,radius);
+            measure += axisymmetricFullAngle*radius*determinant*shapeFunction.getW();
+        }
+    }
+    return measure;
 }
 
 }
@@ -458,6 +581,11 @@ void RSolverStress::prepare()
         double surfaceArea = surface.findArea(this->pModel->getNodes(),this->pModel->getElements());
         double surfaceThickness = surface.getThickness();
         validateSurfaceFormulation(surface);
+        const bool axisymmetric = surface.getStructuralFormulation() == RElementFormulation::Axisymmetric;
+        const bool structuralSurface = axisymmetric || surfaceThickness > 0.0;
+        const double surfaceMeasure = axisymmetric
+                                    ? findAxisymmetricMeasure(surface,this->pModel->getNodes(),this->pModel->getElements())
+                                    : surfaceArea;
 
         std::atomic<bool> abort{false};
         #pragma omp parallel for default(shared)
@@ -478,6 +606,17 @@ void RSolverStress::prepare()
 
                 const RElement &element = this->pModel->getElement(elementID);
                 R_ERROR_ASSERT(R_ELEMENT_TYPE_IS_SURFACE(element.getType()));
+                if (axisymmetric &&
+                    (std::fabs(elementPressure[elementID]) > 0.0 ||
+                     std::fabs(elementForceUnitArea.x[elementID]) > 0.0 ||
+                     std::fabs(elementForceUnitArea.y[elementID]) > 0.0 ||
+                     std::fabs(elementForceUnitArea.z[elementID]) > 0.0))
+                {
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Axisymmetric pressure and surface-traction loads must be applied "
+                                 "on meridian boundary lines; area loads on surface '%s' are ambiguous.",
+                                 surface.getName().toUtf8().constData());
+                }
                 uint nInp = RElement::getNIntegrationPoints(element.getType());
                 RRMatrix Me(element.size()*3,element.size()*3);
                 RRMatrix Ke(element.size()*3,element.size()*3);
@@ -487,10 +626,11 @@ void RSolverStress::prepare()
                 Ke.fill(0.0);
                 fe.fill(0.0);
 
-                RRMatrix B(element.size(),3);
-                RRMatrix Be(element.size()*2,3);
-                RRMatrix BeT(3,element.size()*2);
-                RRMatrix BeD(element.size()*2,3);
+                const uint nStrainComponents = axisymmetric ? 4u : 3u;
+                RRMatrix B(element.size(),2,0.0);
+                RRMatrix Be(element.size()*2,nStrainComponents,0.0);
+                RRMatrix BeT(nStrainComponents,element.size()*2,0.0);
+                RRMatrix BeD(element.size()*2,nStrainComponents,0.0);
                 RRMatrix Met(element.size()*2,element.size()*2);
                 RRMatrix MeRt(element.size()*3,element.size()*2);
                 RRMatrix Ket(element.size()*2,element.size()*2);
@@ -506,8 +646,11 @@ void RSolverStress::prepare()
 
                 double dT = this->elementTemperature[elementID] - this->elementEnvironmentTemperature[elementID];
 
-                RR3Vector normal;
-                element.findNormal(this->pModel->getNodes(),normal[0],normal[1],normal[2]);
+                RR3Vector normal(0.0,0.0,0.0);
+                if (!axisymmetric)
+                {
+                    element.findNormal(this->pModel->getNodes(),normal[0],normal[1],normal[2]);
+                }
 
                 for (uint k=0;k<nInp;k++)
                 {
@@ -515,8 +658,28 @@ void RSolverStress::prepare()
                     const RRVector &N = shapeFunc.getN();
                     const RRMatrix &dN = shapeFunc.getDN();
                     RRMatrix J, Rt, RtT;
-                    double detJ = element.findJacobian(this->pModel->getNodes(),k,J,Rt);
+                    double radius = 0.0;
+                    double detJ = 0.0;
+                    if (axisymmetric)
+                    {
+                        detJ = findAxisymmetricKinematics(element,this->pModel->getNodes(),shapeFunc,
+                                                          B,Rt,radius);
+                    }
+                    else
+                    {
+                        detJ = element.findJacobian(this->pModel->getNodes(),k,J,Rt);
+                        B.fill(0.0);
+                        for (uint m=0;m<dN.getNRows();m++)
+                        {
+                            B[m][0] = dN[m][0]*J[0][0] + dN[m][1]*J[0][1];
+                            B[m][1] = dN[m][0]*J[1][0] + dN[m][1]*J[1][1];
+                        }
+                    }
                     RtT.transpose(Rt);
+                    const double integrationScale = (axisymmetric
+                                                    ? axisymmetricFullAngle*radius
+                                                    : surfaceThickness)
+                                                  * detJ*shapeFunc.getW();
 
                     fet.fill(0.0);
                     if (needsMass)
@@ -524,33 +687,39 @@ void RSolverStress::prepare()
                         Met.fill(0.0);
                     }
 
-                    if (surfaceThickness > 0.0)
+                    if (structuralSurface)
                     {
-                        B.fill(0.0);
-                        for (uint m=0;m<dN.getNRows();m++)
-                        {
-                            B[m][0] += (dN[m][0]*J[0][0] + dN[m][1]*J[0][1]);
-                            B[m][1] += (dN[m][0]*J[1][0] + dN[m][1]*J[1][1]);
-                        }
-
+                        Be.fill(0.0);
                         for (uint m=0;m<element.size();m++)
                         {
-                            Be[2*m][0] = B[m][0];   Be[2*m+1][0] = 0.0;
-                            Be[2*m][1] = 0.0;       Be[2*m+1][1] = B[m][1];
-                            Be[2*m][2] = B[m][1];   Be[2*m+1][2] = B[m][0];
+                            if (axisymmetric)
+                            {
+                                Be[2*m+0][0] = B[m][0];
+                                Be[2*m+0][2] = N[m]/radius;
+                                Be[2*m+0][3] = B[m][1];
+                                Be[2*m+1][1] = B[m][1];
+                                Be[2*m+1][3] = B[m][0];
+                            }
+                            else
+                            {
+                                Be[2*m+0][0] = B[m][0];
+                                Be[2*m+1][1] = B[m][1];
+                                Be[2*m+0][2] = B[m][1];
+                                Be[2*m+1][2] = B[m][0];
+                            }
                         }
                         BeT.transpose(Be);
 
                         RRMatrix::mlt(Be,De,BeD);
                         RRMatrix::mlt(BeD,BeT,Ket);
-                        Ket *= surfaceThickness * detJ * shapeFunc.getW();
+                        Ket *= integrationScale;
                         RRMatrix::mlt(Rt,Ket,KeRt);
                         RRMatrix::mlt(KeRt,RtT,Ke,true);
                     }
 
                     for (uint m=0;m<element.size();m++)
                     {
-                        if (surfaceThickness > 0.0)
+                        if (structuralSurface)
                         {
                             // Mass
                             if (needsMass)
@@ -559,59 +728,66 @@ void RSolverStress::prepare()
                                 {
                                     double value = N[m] * N[n]
                                                  * this->elementDensity[elementID]
-                                                 * detJ
-                                                 * shapeFunc.getW()
-                                                 * surfaceThickness;
+                                                 * integrationScale;
                                     Met[2*m+0][2*n+0] += value;
                                     Met[2*m+1][2*n+1] += value;
                                 }
                             }
                         }
 
-                        double integValue = N[m] * detJ * shapeFunc.getW();
+                        double integValue = N[m] * (axisymmetric
+                                                  ? axisymmetricFullAngle*radius*detJ*shapeFunc.getW()
+                                                  : detJ*shapeFunc.getW());
 
                         // Pressure vector
-                        fe[3*m+0] += elementPressure[elementID] * normal[0] * integValue * (this->inwardElements[elementID] ? 1.0 : -1.0);
-                        fe[3*m+1] += elementPressure[elementID] * normal[1] * integValue * (this->inwardElements[elementID] ? 1.0 : -1.0);
-                        fe[3*m+2] += elementPressure[elementID] * normal[2] * integValue * (this->inwardElements[elementID] ? 1.0 : -1.0);
+                        if (!axisymmetric)
+                        {
+                            fe[3*m+0] += elementPressure[elementID] * normal[0] * integValue * (this->inwardElements[elementID] ? 1.0 : -1.0);
+                            fe[3*m+1] += elementPressure[elementID] * normal[1] * integValue * (this->inwardElements[elementID] ? 1.0 : -1.0);
+                            fe[3*m+2] += elementPressure[elementID] * normal[2] * integValue * (this->inwardElements[elementID] ? 1.0 : -1.0);
+                        }
                         // Force per unit area
                         fe[3*m+0] += elementForceUnitArea.x[elementID] * integValue;
                         fe[3*m+1] += elementForceUnitArea.y[elementID] * integValue;
                         fe[3*m+2] += elementForceUnitArea.z[elementID] * integValue;
                         // Force
-                        fe[3*m+0] += (elementForce.x[elementID] / surfaceArea) * integValue;
-                        fe[3*m+1] += (elementForce.y[elementID] / surfaceArea) * integValue;
-                        fe[3*m+2] += (elementForce.z[elementID] / surfaceArea) * integValue;
+                        fe[3*m+0] += (elementForce.x[elementID] / surfaceMeasure) * integValue;
+                        fe[3*m+1] += (elementForce.y[elementID] / surfaceMeasure) * integValue;
+                        fe[3*m+2] += (elementForce.z[elementID] / surfaceMeasure) * integValue;
                         // Weight
-                        fe[3*m+0] += (elementWeight[elementID] * elementGravity.x[elementID] / surfaceArea) * integValue;
-                        fe[3*m+1] += (elementWeight[elementID] * elementGravity.y[elementID] / surfaceArea) * integValue;
-                        fe[3*m+2] += (elementWeight[elementID] * elementGravity.z[elementID] / surfaceArea) * integValue;
+                        fe[3*m+0] += (elementWeight[elementID] * elementGravity.x[elementID] / surfaceMeasure) * integValue;
+                        fe[3*m+1] += (elementWeight[elementID] * elementGravity.y[elementID] / surfaceMeasure) * integValue;
+                        fe[3*m+2] += (elementWeight[elementID] * elementGravity.z[elementID] / surfaceMeasure) * integValue;
                         // Own weight
-                        if (surfaceThickness > 0.0)
+                        if (structuralSurface)
                         {
-                            fe[3*m+0] += elementGravity.x[elementID] * this->elementDensity[elementID] * surfaceThickness * integValue;
-                            fe[3*m+1] += elementGravity.y[elementID] * this->elementDensity[elementID] * surfaceThickness * integValue;
-                            fe[3*m+2] += elementGravity.z[elementID] * this->elementDensity[elementID] * surfaceThickness * integValue;
+                            const double thicknessFactor = axisymmetric ? 1.0 : surfaceThickness;
+                            fe[3*m+0] += elementGravity.x[elementID] * this->elementDensity[elementID] * thicknessFactor * integValue;
+                            fe[3*m+1] += elementGravity.y[elementID] * this->elementDensity[elementID] * thicknessFactor * integValue;
+                            fe[3*m+2] += elementGravity.z[elementID] * this->elementDensity[elementID] * thicknessFactor * integValue;
                         }
 
                         // Thermal expansion
-                        if (surfaceThickness > 0.0)
+                        if (structuralSurface)
                         {
                             const double thermalScale = this->elementThermalExpansion[elementID]
-                                                      * dT * surfaceThickness
-                                                      * detJ * shapeFunc.getW();
-                            fet[2*m+0] += thermalScale * (BeD[2*m+0][0] + BeD[2*m+0][1]);
-                            fet[2*m+1] += thermalScale * (BeD[2*m+1][0] + BeD[2*m+1][1]);
+                                                      * dT * integrationScale;
+                            const uint nThermalNormals = axisymmetric ? 3u : 2u;
+                            for (uint n=0;n<nThermalNormals;n++)
+                            {
+                                fet[2*m+0] += thermalScale * BeD[2*m+0][n];
+                                fet[2*m+1] += thermalScale * BeD[2*m+1][n];
+                            }
                         }
                     }
 
-                    if (surfaceThickness > 0.0)
+                    if (structuralSurface)
                     {
                         RRMatrix::mlt(Rt,fet,fe,true);
                     }
 
                     // Mass
-                    if (surfaceThickness > 0.0 && needsMass)
+                    if (structuralSurface && needsMass)
                     {
                         if (lumpedMass)
                         {
@@ -1120,8 +1296,9 @@ void RSolverStress::process()
     {
         RSurface &surface = this->pModel->getSurface(i);
         double surfaceThickness = surface.getThickness();
+        const bool axisymmetric = surface.getStructuralFormulation() == RElementFormulation::Axisymmetric;
 
-        if (surfaceThickness == 0.0)
+        if (!axisymmetric && surfaceThickness == 0.0)
         {
             continue;
         }
@@ -1149,19 +1326,22 @@ void RSolverStress::process()
                 uint nInp = RElement::getNIntegrationPoints(element.getType());
                 RRMatrix Ke(element.size()*2,element.size()*2,0.0);
                 RRVector fe(element.size()*3,0.0);
+                RRVector thermalForce(element.size()*3,0.0);
                 RRVector xe(element.size()*3,0.0);
-                RRVector Qe(3,0.0);
+                const uint nStrainComponents = axisymmetric ? 4u : 3u;
+                RRVector Qe(nStrainComponents,0.0);
+                double accumulatedStressWeight = 0.0;
                 double QeN = 0.0;
                 double QeS = 0.0;
                 double QeVM = 0.0;
 
-                RRMatrix B(element.size(),3);
-                RRMatrix Be(element.size()*2,3);
-                RRMatrix BeT(3,element.size()*2);
-                RRMatrix BeD(element.size()*2,3);
+                RRMatrix B(element.size(),2,0.0);
+                RRMatrix Be(element.size()*2,nStrainComponents,0.0);
+                RRMatrix BeT(nStrainComponents,element.size()*2,0.0);
+                RRMatrix BeD(element.size()*2,nStrainComponents,0.0);
                 RRMatrix Ket(element.size()*2,element.size()*2);
                 RRMatrix KeRt(element.size()*2,element.size()*2);
-                RRVector fet(element.size()*2);
+                RRVector localThermalForce(element.size()*2,0.0);
 
                 RRMatrix De;
 
@@ -1170,21 +1350,31 @@ void RSolverStress::process()
 
                 buildSurfaceConstitutiveMatrix(surface.getStructuralFormulation(),E,v,De);
 
-                RRMatrix Rl;
-                RRVector tl;
-                element.findTransformationMatrix(this->pModel->getNodes(),Rl,tl);
-                Rl.invert();
-
                 RRVector lxe(element.size()*2);
-                for (uint k=0;k<element.size();k++)
+                if (axisymmetric)
                 {
-                    RR3Vector xg(this->nodeDisplacement.x[element.getNodeId(k)],
-                                 this->nodeDisplacement.y[element.getNodeId(k)],
-                                 this->nodeDisplacement.z[element.getNodeId(k)]);
-                    RR3Vector xl;
-                    RRMatrix::mlt(Rl,xg,xl);
-                    lxe[2*k+0] = xl[0];
-                    lxe[2*k+1] = xl[1];
+                    for (uint k=0;k<element.size();k++)
+                    {
+                        lxe[2*k+0] = this->nodeDisplacement.x[element.getNodeId(k)];
+                        lxe[2*k+1] = this->nodeDisplacement.y[element.getNodeId(k)];
+                    }
+                }
+                else
+                {
+                    RRMatrix Rl;
+                    RRVector tl;
+                    element.findTransformationMatrix(this->pModel->getNodes(),Rl,tl);
+                    Rl.invert();
+                    for (uint k=0;k<element.size();k++)
+                    {
+                        RR3Vector xg(this->nodeDisplacement.x[element.getNodeId(k)],
+                                     this->nodeDisplacement.y[element.getNodeId(k)],
+                                     this->nodeDisplacement.z[element.getNodeId(k)]);
+                        RR3Vector xl;
+                        RRMatrix::mlt(Rl,xg,xl);
+                        lxe[2*k+0] = xl[0];
+                        lxe[2*k+1] = xl[1];
+                    }
                 }
 
                 for (uint k=0;k<element.size();k++)
@@ -1203,55 +1393,124 @@ void RSolverStress::process()
                     const RRVector &N = shapeFunc.getN();
                     const RRMatrix &dN = shapeFunc.getDN();
                     RRMatrix J, Rt, RtT;
-                    double detJ = element.findJacobian(this->pModel->getNodes(),k,J,Rt);
-                    RtT.transpose(Rt);
-
-                    B.fill(0.0);
-                    for (uint m=0;m<dN.getNRows();m++)
+                    double radius = 0.0;
+                    double detJ = 0.0;
+                    if (axisymmetric)
                     {
-                        B[m][0] += (dN[m][0]*J[0][0] + dN[m][1]*J[0][1]);
-                        B[m][1] += (dN[m][0]*J[1][0] + dN[m][1]*J[1][1]);
+                        detJ = findAxisymmetricKinematics(element,this->pModel->getNodes(),shapeFunc,
+                                                          B,Rt,radius);
                     }
+                    else
+                    {
+                        detJ = element.findJacobian(this->pModel->getNodes(),k,J,Rt);
+                        B.fill(0.0);
+                        for (uint m=0;m<dN.getNRows();m++)
+                        {
+                            B[m][0] = dN[m][0]*J[0][0] + dN[m][1]*J[0][1];
+                            B[m][1] = dN[m][0]*J[1][0] + dN[m][1]*J[1][1];
+                        }
+                    }
+                    RtT.transpose(Rt);
+                    const double integrationScale = (axisymmetric
+                                                    ? axisymmetricFullAngle*radius
+                                                    : surfaceThickness)
+                                                  * detJ*shapeFunc.getW();
 
+                    Be.fill(0.0);
                     for (uint m=0;m<element.size();m++)
                     {
-                        Be[2*m][0] = B[m][0];   Be[2*m+1][0] = 0.0;
-                        Be[2*m][1] = 0.0;       Be[2*m+1][1] = B[m][1];
-                        Be[2*m][2] = B[m][1];   Be[2*m+1][2] = B[m][0];
+                        if (axisymmetric)
+                        {
+                            Be[2*m+0][0] = B[m][0];
+                            Be[2*m+0][2] = N[m]/radius;
+                            Be[2*m+0][3] = B[m][1];
+                            Be[2*m+1][1] = B[m][1];
+                            Be[2*m+1][3] = B[m][0];
+                        }
+                        else
+                        {
+                            Be[2*m+0][0] = B[m][0];
+                            Be[2*m+1][1] = B[m][1];
+                            Be[2*m+0][2] = B[m][1];
+                            Be[2*m+1][2] = B[m][0];
+                        }
                     }
                     BeT.transpose(Be);
 
                     RRMatrix::mlt(Be,De,BeD);
                     RRMatrix::mlt(BeD,BeT,Ket);
-                    Ket *= surfaceThickness * detJ * shapeFunc.getW();
+                    Ket *= integrationScale;
                     RRMatrix::mlt(Rt,Ket,KeRt);
                     RRMatrix::mlt(KeRt,RtT,Ke,true);
 
-                    double integValue = 1.0/double(nInp);
+                    localThermalForce.fill(0.0);
+                    const double thermalStrain = this->elementThermalExpansion[elementID] * dT;
+                    const uint nThermalNormals = axisymmetric ? 3u : 2u;
+                    for (uint m=0;m<element.size();m++)
+                    {
+                        for (uint q=0;q<nThermalNormals;q++)
+                        {
+                            localThermalForce[2*m+0] += thermalStrain*integrationScale*BeD[2*m+0][q];
+                            localThermalForce[2*m+1] += thermalStrain*integrationScale*BeD[2*m+1][q];
+                        }
+                    }
+                    RRMatrix::mlt(Rt,localThermalForce,thermalForce,true);
+
+                    const double stressWeight = axisymmetric
+                                              ? integrationScale
+                                              : 1.0/double(nInp);
+                    accumulatedStressWeight += stressWeight;
+                    RRVector pointStress(nStrainComponents,0.0);
 
                     // Element level stress.
                     for (uint m=0;m<element.size();m++)
                     {
-                        for (uint n=0;n<3;n++)
+                        for (uint n=0;n<nStrainComponents;n++)
                         {
-                            Qe[n] += BeD[2*m+0][n] * lxe[2*m+0] * integValue
-                                  +  BeD[2*m+1][n] * lxe[2*m+1] * integValue;
+                            pointStress[n] += BeD[2*m+0][n] * lxe[2*m+0]
+                                            + BeD[2*m+1][n] * lxe[2*m+1];
                         }
                     }
-                    const double thermalStrain = this->elementThermalExpansion[elementID] * dT;
-                    Qe[0] -= thermalStrain * (De[0][0] + De[0][1]) * integValue;
-                    Qe[1] -= thermalStrain * (De[1][0] + De[1][1]) * integValue;
+                    for (uint n=0;n<nStrainComponents;n++)
+                    {
+                        for (uint q=0;q<nThermalNormals;q++)
+                        {
+                            pointStress[n] -= thermalStrain*De[n][q];
+                        }
+                        Qe[n] += pointStress[n]*stressWeight;
+                    }
+                }
+                if (axisymmetric)
+                {
+                    for (uint n=0;n<nStrainComponents;n++)
+                    {
+                        Qe[n] /= accumulatedStressWeight;
+                    }
                 }
 
                 // Nodal force is the internal elastic force K*u. There is no
                 // acceleration state in the formulation, so no inertia term.
                 RRMatrix::mlt(Ke,xe,fe);
+                for (uint m=0;m<fe.size();m++)
+                {
+                    fe[m] -= thermalForce[m];
+                }
 
-                QeN = std::sqrt(Qe[0] * Qe[0] + Qe[1] * Qe[1] - Qe[0] * Qe[1]);
-                QeS = std::sqrt(3.0 * Qe[2] * Qe[2]);
-                // Von Mises combines the normal and the shear invariant in
-                // quadrature, not by adding them.
-                QeVM = std::sqrt(QeN * QeN + QeS * QeS);
+                if (axisymmetric)
+                {
+                    QeN = std::sqrt(Qe[0]*Qe[0] + Qe[1]*Qe[1] + Qe[2]*Qe[2]
+                                     - Qe[0]*Qe[1] - Qe[1]*Qe[2] - Qe[2]*Qe[0]);
+                    QeS = std::sqrt(3.0*Qe[3]*Qe[3]);
+                    QeVM = std::sqrt(QeN*QeN+QeS*QeS);
+                }
+                else
+                {
+                    QeN = std::sqrt(Qe[0] * Qe[0] + Qe[1] * Qe[1] - Qe[0] * Qe[1]);
+                    QeS = std::sqrt(3.0 * Qe[2] * Qe[2]);
+                    // Von Mises combines the normal and the shear invariant in
+                    // quadrature, not by adding them.
+                    QeVM = std::sqrt(QeN * QeN + QeS * QeS);
+                }
 
                 #pragma omp critical
                 {
@@ -1267,7 +1526,15 @@ void RSolverStress::process()
                 // In-plane components, in the local element frame.
                 this->elementStress[0][elementID] = Qe[0];
                 this->elementStress[1][elementID] = Qe[1];
-                this->elementStress[5][elementID] = Qe[2];
+                if (axisymmetric)
+                {
+                    this->elementStress[2][elementID] = Qe[2];
+                    this->elementStress[5][elementID] = Qe[3];
+                }
+                else
+                {
+                    this->elementStress[5][elementID] = Qe[2];
+                }
                 this->elementNormalStress[elementID] = QeN;
                 this->elementShearStress[elementID] = QeS;
                 this->elementVonMisses[elementID] = QeVM;

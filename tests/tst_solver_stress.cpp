@@ -1,6 +1,7 @@
 #include <QtTest>
 
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 #include "rml_model.h"
@@ -464,6 +465,161 @@ RModel buildSurfaceStrip(double tipForce,
     return model;
 }
 
+//! Build an annular meridian in the global XY plane. The axisymmetric solver
+//! contract uses X as radius, Y as the revolution axis and Z as circumferential.
+RModel buildAxisymmetricAnnulus(uint radialSlices,
+                                RElementType elementType,
+                                bool restrainAxialStrain,
+                                double expansion = thermalExpansion,
+                                double environmentTemperature = 293.15,
+                                double innerPressure = 0.0,
+                                double outerPressure = 0.0)
+{
+    constexpr double innerRadius = 1.0;
+    constexpr double outerRadius = 2.0;
+    constexpr double height = 1.0;
+    constexpr double axisymmetricPoissonRatio = 0.25;
+    constexpr double fullAngle = 2.0*3.14159265358979323846;
+
+    RModel model;
+    model.setNNodes(2*(radialSlices+1));
+    for (uint i=0;i<=radialSlices;i++)
+    {
+        const double radius = innerRadius
+                            + (outerRadius-innerRadius)*double(i)/double(radialSlices);
+        model.getNode(2*i+0).set(radius,0.0,0.0);
+        model.getNode(2*i+1).set(radius,height,0.0);
+    }
+
+    for (uint i=0;i<radialSlices;i++)
+    {
+        const uint n00 = 2*i;
+        const uint n01 = n00+1;
+        const uint n10 = 2*(i+1);
+        const uint n11 = n10+1;
+        if (elementType == R_ELEMENT_QUAD1)
+        {
+            RElement element(R_ELEMENT_QUAD1);
+            element.setNodeId(0,n00);
+            element.setNodeId(1,n10);
+            element.setNodeId(2,n11);
+            element.setNodeId(3,n01);
+            model.addElement(element,true,0);
+        }
+        else if (elementType == R_ELEMENT_TRI1)
+        {
+            RElement lower(R_ELEMENT_TRI1);
+            lower.setNodeId(0,n00);
+            lower.setNodeId(1,n10);
+            lower.setNodeId(2,n11);
+            model.addElement(lower,true,0);
+
+            RElement upper(R_ELEMENT_TRI1);
+            upper.setNodeId(0,n11);
+            upper.setNodeId(1,n01);
+            upper.setNodeId(2,n00);
+            model.addElement(upper,true,0);
+        }
+        else
+        {
+            throw std::invalid_argument("Unsupported axisymmetric surface element");
+        }
+    }
+
+    RMaterial material(RMaterial::Solid);
+    material.setName("Axisymmetric material");
+    RMaterialProperty modulusProperty(RMaterialProperty::ModulusOfElasiticity);
+    modulusProperty.add(293.15,elasticityModulus);
+    material.add(modulusProperty);
+    RMaterialProperty poissonProperty(RMaterialProperty::PoissonRatio);
+    poissonProperty.add(293.15,axisymmetricPoissonRatio);
+    material.add(poissonProperty);
+    RMaterialProperty densityProperty(RMaterialProperty::Density);
+    densityProperty.add(293.15,density);
+    material.add(densityProperty);
+    RMaterialProperty expansionProperty(RMaterialProperty::ThermalExpansionCoefficient);
+    expansionProperty.add(293.15,expansion);
+    material.add(expansionProperty);
+
+    RSurface &surface = model.getSurface(0);
+    surface.setName("Axisymmetric annulus");
+    surface.setThickness(0.0);
+    surface.setStructuralFormulation(RElementFormulation::Axisymmetric);
+    surface.setMaterial(material);
+
+    REnvironmentCondition temperature(R_ENVIRONMENT_CONDITION_TEMPERATURE);
+    temperature.getComponent(temperature.findComponentPosition(R_VARIABLE_TEMPERATURE))
+               .add(0.0,environmentTemperature);
+    surface.addEnvironmentCondition(temperature);
+
+    RBoundaryCondition meridianBc(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    meridianBc.getComponent(meridianBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).setEnabled(false);
+    if (restrainAxialStrain)
+    {
+        meridianBc.getComponent(meridianBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+    }
+    else
+    {
+        meridianBc.getComponent(meridianBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).setEnabled(false);
+    }
+    meridianBc.getComponent(meridianBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+    surface.addBoundaryCondition(meridianBc);
+
+    if (!restrainAxialStrain)
+    {
+        for (uint i=0;i<=radialSlices;i++)
+        {
+            RElement point(R_ELEMENT_POINT);
+            point.setNodeId(0,2*i);
+            model.addElement(point,true,0);
+        }
+        RBoundaryCondition bottomBc(R_BOUNDARY_CONDITION_DISPLACEMENT);
+        bottomBc.getComponent(bottomBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).setEnabled(false);
+        bottomBc.getComponent(bottomBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+        bottomBc.getComponent(bottomBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).setEnabled(false);
+        model.getPoint(0).addBoundaryCondition(bottomBc);
+    }
+
+    if (innerPressure != 0.0 || outerPressure != 0.0)
+    {
+        for (uint axial=0;axial<2;axial++)
+        {
+            RElement innerPoint(R_ELEMENT_POINT);
+            innerPoint.setNodeId(0,axial);
+            model.addElement(innerPoint,true,0);
+
+            RElement outerPoint(R_ELEMENT_POINT);
+            outerPoint.setNodeId(0,2*radialSlices+axial);
+            model.addElement(outerPoint,true,1);
+        }
+        if (innerPressure != 0.0)
+        {
+            RBoundaryCondition force(R_BOUNDARY_CONDITION_FORCE);
+            force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_X))
+                 .add(0.0,innerPressure*fullAngle*innerRadius*height);
+            force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_Y)).add(0.0,0.0);
+            force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_Z)).add(0.0,0.0);
+            model.getPoint(0).addBoundaryCondition(force);
+        }
+        if (outerPressure != 0.0)
+        {
+            RBoundaryCondition force(R_BOUNDARY_CONDITION_FORCE);
+            force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_X))
+                 .add(0.0,-outerPressure*fullAngle*outerRadius*height);
+            force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_Y)).add(0.0,0.0);
+            force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_Z)).add(0.0,0.0);
+            model.getPoint(1).addBoundaryCondition(force);
+        }
+    }
+
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setNInnerIterations(500);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setNOuterIterations(5000);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setSolverCvgValue(1.0e-14);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setOutputFrequency(0);
+    model.getTimeSolver().setEnabled(false);
+    return model;
+}
+
 //! Build a fixed-free bar whose free end face carries a Roller displacement
 //! oriented transversely to the bar.
 //!
@@ -629,7 +785,10 @@ private slots:
     void staticSurfaceFormulations();
     void thermalSurfaceExpansion_data();
     void thermalSurfaceExpansion();
-    void axisymmetricSurfaceIsRejected();
+    void axisymmetricThermalExpansion_data();
+    void axisymmetricThermalExpansion();
+    void axisymmetricCylinderConverges();
+    void axisymmetricGeometryIsValidated();
     void surfaceConstraintUsesEnteredDirection();
     void surfaceConstraintFallsBackToTheNormal();
     void explicitDirectionMatchingTheNormalAgrees();
@@ -846,14 +1005,137 @@ void TestSolverStress::staticSurfaceFormulations()
              qPrintable(QString("Reaction = %1 N, expected %2 N").arg(reaction).arg(-tipForce)));
 }
 
-void TestSolverStress::axisymmetricSurfaceIsRejected()
+void TestSolverStress::axisymmetricThermalExpansion_data()
 {
-    RModel model = buildSurfaceStrip(1000.0,R_ELEMENT_TRI1,RElementFormulation::Axisymmetric);
+    QTest::addColumn<int>("elementType");
+    QTest::newRow("tri3") << int(R_ELEMENT_TRI1);
+    QTest::newRow("quad4") << int(R_ELEMENT_QUAD1);
+}
+
+//! Uniform thermal expansion is an exact axisymmetric patch: radial, axial and
+//! hoop strains are all alpha*dT and all four stress components must vanish.
+void TestSolverStress::axisymmetricThermalExpansion()
+{
+    QFETCH(int,elementType);
+    constexpr uint radialSlices = 6;
+    constexpr double alpha = 1.2e-5;
+    constexpr double deltaT = 50.0;
+    RModel model = buildAxisymmetricAnnulus(radialSlices,
+                                             static_cast<RElementType>(elementType),
+                                             false,alpha,293.15-deltaT);
     model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
 
     QString solverError;
-    QVERIFY2(!runSolver(model,solverError),"Axisymmetric surface formulation was accepted");
-    QVERIFY2(solverError.contains("Axisymmetric"),qPrintable(solverError));
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+    for (uint i=0;i<2*(radialSlices+1);i++)
+    {
+        const double expectedRadial = alpha*deltaT*model.getNode(i).getX();
+        const double expectedAxial = alpha*deltaT*model.getNode(i).getY();
+        const double radial = nodeValue(model,R_VARIABLE_DISPLACEMENT,0,i);
+        const double axial = nodeValue(model,R_VARIABLE_DISPLACEMENT,1,i);
+        QVERIFY2(std::fabs(radial-expectedRadial) < 1.0e-5*alpha*deltaT*2.0,
+                 qPrintable(QString("Node %1 radial displacement = %2, expected %3")
+                            .arg(i).arg(radial).arg(expectedRadial)));
+        QVERIFY2(std::fabs(axial-expectedAxial) < 1.0e-5*alpha*deltaT,
+                 qPrintable(QString("Node %1 axial displacement = %2, expected %3")
+                            .arg(i).arg(axial).arg(expectedAxial)));
+    }
+
+    const double stressScale = elasticityModulus*alpha*deltaT;
+    for (uint i=0;i<model.getNElements();i++)
+    {
+        if (!R_ELEMENT_TYPE_IS_SURFACE(model.getElement(i).getType()))
+        {
+            continue;
+        }
+        QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_X,i)) < 1.0e-5*stressScale);
+        QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_Y,i)) < 1.0e-5*stressScale);
+        QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_Z,i)) < 1.0e-5*stressScale);
+        QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_XY,i)) < 1.0e-5*stressScale);
+    }
+
+    const double forceTolerance = 1.0e-6*stressScale*3.14159265358979323846*(4.0-1.0);
+    for (uint i=0;i<2*(radialSlices+1);i++)
+    {
+        QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_FORCE,0,i)) < forceTolerance);
+        QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_FORCE,1,i)) < forceTolerance);
+        QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_FORCE,2,i)) < forceTolerance);
+    }
+}
+
+//! A long thick cylinder under internal pressure has the Lame solution. Mesh
+//! refinement must reduce both radial-displacement and recovered-stress error.
+void TestSolverStress::axisymmetricCylinderConverges()
+{
+    constexpr double innerRadius = 1.0;
+    constexpr double outerRadius = 2.0;
+    constexpr double pressure = 1.0e6;
+    constexpr double v = 0.25;
+    const double A = pressure*innerRadius*innerRadius
+                   / (outerRadius*outerRadius-innerRadius*innerRadius);
+    const double B = pressure*innerRadius*innerRadius*outerRadius*outerRadius
+                   / (outerRadius*outerRadius-innerRadius*innerRadius);
+
+    double previousDisplacementError = std::numeric_limits<double>::infinity();
+    double previousStressError = std::numeric_limits<double>::infinity();
+    for (uint radialSlices : {2u,4u,8u,16u})
+    {
+        RModel model = buildAxisymmetricAnnulus(radialSlices,R_ELEMENT_QUAD1,true,
+                                                 0.0,293.15,pressure,0.0);
+        model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+        QString solverError;
+        QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+        double displacementError = 0.0;
+        for (uint i=0;i<=radialSlices;i++)
+        {
+            const double radius = model.getNode(2*i).getX();
+            const double expected = (1.0+v)/elasticityModulus
+                                  * ((1.0-2.0*v)*A*radius+B/radius);
+            const double value = 0.5*(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,2*i)
+                                      + nodeValue(model,R_VARIABLE_DISPLACEMENT,0,2*i+1));
+            displacementError = std::max(displacementError,std::fabs(value-expected));
+        }
+
+        double stressError = 0.0;
+        for (uint i=0;i<radialSlices;i++)
+        {
+            const double radius = 0.5*(model.getNode(2*i).getX()+model.getNode(2*(i+1)).getX());
+            const double expectedRadial = A-B/(radius*radius);
+            const double expectedHoop = A+B/(radius*radius);
+            const double expectedAxial = 2.0*v*A;
+            stressError = std::max(stressError,
+                                   std::fabs(elementValue(model,R_VARIABLE_STRESS_X,i)-expectedRadial));
+            stressError = std::max(stressError,
+                                   std::fabs(elementValue(model,R_VARIABLE_STRESS_Z,i)-expectedHoop));
+            stressError = std::max(stressError,
+                                   std::fabs(elementValue(model,R_VARIABLE_STRESS_Y,i)-expectedAxial));
+        }
+
+        QVERIFY2(displacementError < previousDisplacementError,
+                 qPrintable(QString("Displacement error did not decrease at %1 slices: %2 >= %3")
+                            .arg(radialSlices).arg(displacementError).arg(previousDisplacementError)));
+        QVERIFY2(stressError < previousStressError,
+                 qPrintable(QString("Stress error did not decrease at %1 slices: %2 >= %3")
+                            .arg(radialSlices).arg(stressError).arg(previousStressError)));
+        previousDisplacementError = displacementError;
+        previousStressError = stressError;
+    }
+
+    QVERIFY(previousDisplacementError < 2.0e-3*pressure/elasticityModulus);
+    QVERIFY(previousStressError < 0.03*pressure);
+}
+
+void TestSolverStress::axisymmetricGeometryIsValidated()
+{
+    RModel model = buildAxisymmetricAnnulus(2,R_ELEMENT_QUAD1,true);
+    model.getNode(0).setZ(0.1);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+
+    QString solverError;
+    QVERIFY2(!runSolver(model,solverError),"Out-of-plane axisymmetric geometry was accepted");
+    QVERIFY2(solverError.contains("meridian plane"),qPrintable(solverError));
 }
 
 void TestSolverStress::thermalSurfaceExpansion_data()
