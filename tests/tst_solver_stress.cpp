@@ -618,9 +618,13 @@ private slots:
     void staticAdditionalVolumeElements_data();
     void staticAdditionalVolumeElements();
     void vonMisesMatchesComponents();
+    void modalAxialBar_data();
     void modalAxialBar();
     void staticTrussBar();
+    void modalTrussBar_data();
     void modalTrussBar();
+    void modalSurfaceMassMatrices_data();
+    void modalSurfaceMassMatrices();
     void staticSurfaceFormulations_data();
     void staticSurfaceFormulations();
     void thermalSurfaceExpansion_data();
@@ -954,10 +958,22 @@ void TestSolverStress::vonMisesMatchesComponents()
 
 //! The fundamental axial mode of a fixed-free bar is at c/(4*L) with
 //! c = sqrt(E/rho). The modal setup has to report it in Hz.
+void TestSolverStress::modalAxialBar_data()
+{
+    QTest::addColumn<int>("massMatrixType");
+    QTest::addColumn<int>("expectedBias");
+    QTest::newRow("consistent-mass") << int(RMassMatrixType::Consistent) << 1;
+    QTest::newRow("lumped-mass") << int(RMassMatrixType::Lumped) << -1;
+}
+
 void TestSolverStress::modalAxialBar()
 {
+    QFETCH(int,massMatrixType);
+    QFETCH(int,expectedBias);
     RModel model = buildBar(0.0);
     model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS_MODAL));
+    model.getProblemSetup().setMassMatrixType(
+        static_cast<RMassMatrixType>(massMatrixType));
 
     RModalSetup &modalSetup = model.getProblemSetup().getModalSetup();
     modalSetup.setMethod(R_MODAL_MULTIPLE_MODES);
@@ -1033,10 +1049,22 @@ void TestSolverStress::staticTrussBar()
 }
 
 //! A truss bar has the same axial modes as the solid one.
+void TestSolverStress::modalTrussBar_data()
+{
+    QTest::addColumn<int>("massMatrixType");
+    QTest::addColumn<int>("expectedBias");
+    QTest::newRow("consistent-mass") << int(RMassMatrixType::Consistent) << 1;
+    QTest::newRow("lumped-mass") << int(RMassMatrixType::Lumped) << -1;
+}
+
 void TestSolverStress::modalTrussBar()
 {
+    QFETCH(int,massMatrixType);
+    QFETCH(int,expectedBias);
     RModel model = buildTruss(0.0);
     model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS_MODAL));
+    model.getProblemSetup().setMassMatrixType(
+        static_cast<RMassMatrixType>(massMatrixType));
 
     RModalSetup &modalSetup = model.getProblemSetup().getModalSetup();
     modalSetup.setMethod(R_MODAL_MULTIPLE_MODES);
@@ -1053,6 +1081,67 @@ void TestSolverStress::modalTrussBar()
 
     QVERIFY2(std::fabs(frequency-expectedFrequency) < 0.02*expectedFrequency,
              qPrintable(QString("Fundamental frequency = %1 Hz, expected %2 Hz").arg(frequency).arg(expectedFrequency)));
+    QVERIFY2(expectedBias*(frequency-expectedFrequency) > 0.0,
+             qPrintable(QString("Frequency = %1 Hz does not show the expected mass bias around %2 Hz")
+                        .arg(frequency).arg(expectedFrequency)));
+    QVERIFY2(expectedBias*(frequency-expectedFrequency) > 0.0,
+             qPrintable(QString("Frequency = %1 Hz does not show the expected %2 mass bias around %3 Hz")
+                        .arg(frequency)
+                        .arg(expectedBias > 0 ? "positive consistent" : "negative lumped")
+                        .arg(expectedFrequency)));
+}
+
+//! Membrane modes exercise the local two-dimensional mass matrix before it is
+//! rotated into the three-dimensional model frame. Both supported first-order
+//! topologies must retain the analytical fixed-free axial mode.
+void TestSolverStress::modalSurfaceMassMatrices_data()
+{
+    QTest::addColumn<int>("elementType");
+    QTest::addColumn<int>("massMatrixType");
+    QTest::addColumn<int>("expectedBias");
+    QTest::newRow("tri-consistent") << int(R_ELEMENT_TRI1) << int(RMassMatrixType::Consistent) << 1;
+    QTest::newRow("tri-lumped") << int(R_ELEMENT_TRI1) << int(RMassMatrixType::Lumped) << -1;
+    QTest::newRow("quad-consistent") << int(R_ELEMENT_QUAD1) << int(RMassMatrixType::Consistent) << 1;
+    QTest::newRow("quad-lumped") << int(R_ELEMENT_QUAD1) << int(RMassMatrixType::Lumped) << -1;
+}
+
+void TestSolverStress::modalSurfaceMassMatrices()
+{
+    QFETCH(int,elementType);
+    QFETCH(int,massMatrixType);
+    QFETCH(int,expectedBias);
+
+    RModel model = buildSurfaceStrip(0.0,
+                                     static_cast<RElementType>(elementType),
+                                     RElementFormulation::PlaneStress);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS_MODAL));
+    model.getProblemSetup().setMassMatrixType(
+        static_cast<RMassMatrixType>(massMatrixType));
+
+    RModalSetup &modalSetup = model.getProblemSetup().getModalSetup();
+    modalSetup.setMethod(R_MODAL_MULTIPLE_MODES);
+    modalSetup.setNModesToExtract(3);
+    modalSetup.setNIterations(300);
+    modalSetup.setConvergenceValue(1.0e-12);
+
+    QString solverError;
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+    constexpr double surfacePoissonRatio = 0.25;
+    const double effectiveModulus = elasticityModulus
+                                  / (1.0-surfacePoissonRatio*surfacePoissonRatio);
+    const double expectedFrequency = std::sqrt(effectiveModulus/density)
+                                   / (4.0*barLength);
+    const double frequency = modalSetup.getFrequency();
+
+    QVERIFY2(std::isfinite(frequency) && frequency > 0.0,
+             qPrintable(QString("Frequency = %1 Hz is not a usable value").arg(frequency)));
+    QVERIFY2(std::fabs(frequency-expectedFrequency) < 0.02*expectedFrequency,
+             qPrintable(QString("Fundamental frequency = %1 Hz, expected %2 Hz")
+                        .arg(frequency).arg(expectedFrequency)));
+    QVERIFY2(expectedBias*(frequency-expectedFrequency) > 0.0,
+             qPrintable(QString("Frequency = %1 Hz does not show the expected mass bias around %2 Hz")
+                        .arg(frequency).arg(expectedFrequency)));
 }
 
 //! A roller on the free end face restrains the direction of its local frame.

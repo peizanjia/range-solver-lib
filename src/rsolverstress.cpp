@@ -10,6 +10,24 @@
 namespace
 {
 
+void lumpMassMatrix(RRMatrix &matrix)
+{
+    R_ERROR_ASSERT(matrix.getNRows() == matrix.getNColumns());
+    RRVector rowSums(matrix.getNRows(),0.0);
+    for (uint i=0;i<matrix.getNRows();i++)
+    {
+        for (uint j=0;j<matrix.getNColumns();j++)
+        {
+            rowSums[i] += matrix[i][j];
+        }
+    }
+    matrix.fill(0.0);
+    for (uint i=0;i<matrix.getNRows();i++)
+    {
+        matrix[i][i] = rowSums[i];
+    }
+}
+
 void buildSurfaceConstitutiveMatrix(RElementFormulation formulation,
                                     double elasticityModulus,
                                     double poissonRatio,
@@ -107,6 +125,7 @@ void RSolverStress::recover()
 void RSolverStress::prepare()
 {
     const bool needsMass = this->pModel->getTimeSolver().getEnabled() || this->problemType == R_PROBLEM_STRESS_MODAL;
+    const bool lumpedMass = this->pModel->getProblemSetup().getMassMatrixType() == RMassMatrixType::Lumped;
 
     //! Element force vector.
     RSolverCartesianVector<RRVector> elementForce;
@@ -321,6 +340,8 @@ void RSolverStress::prepare()
 
                 RRMatrix Be(3*element.size(),1);
                 RRMatrix BeT(1,3*element.size());
+                RRMatrix Met(element.size(),element.size(),0.0);
+                RRMatrix MeRt(element.size()*3,element.size(),0.0);
 
                 double lineLength = 0.0;
                 element.findLength(this->pModel->getNodes(),lineLength);
@@ -337,6 +358,29 @@ void RSolverStress::prepare()
                     const RRMatrix &dN = shapeFunc.getDN();
                     RRMatrix J, Rt;
                     double detJ = element.findJacobian(this->pModel->getNodes(),k,J,Rt);
+                    if (needsMass && lineCrossArea > 0.0)
+                    {
+                        Met.fill(0.0);
+                        for (uint m=0;m<element.size();m++)
+                        {
+                            for (uint n=0;n<element.size();n++)
+                            {
+                                Met[m][n] = N[m] * N[n]
+                                          * this->elementDensity[elementID]
+                                          * detJ
+                                          * shapeFunc.getW()
+                                          * lineCrossArea;
+                            }
+                        }
+                        if (lumpedMass)
+                        {
+                            lumpMassMatrix(Met);
+                        }
+                        RRMatrix RtT;
+                        RtT.transpose(Rt);
+                        RRMatrix::mlt(Rt,Met,MeRt);
+                        RRMatrix::mlt(MeRt,RtT,Me,true);
+                    }
                     if (lineCrossArea > 0.0)
                     {
                         // Strain-displacement vector of the truss - it maps the
@@ -370,25 +414,6 @@ void RSolverStress::prepare()
 
                     for (uint m=0;m<element.size();m++)
                     {
-                        if (lineCrossArea > 0.0)
-                        {
-                            // Mass
-                            if (needsMass)
-                            {
-                                for (uint n=0;n<element.size();n++)
-                                {
-                                    double value = N[m] * N[n]
-                                                 * this->elementDensity[elementID]
-                                                 * detJ
-                                                 * shapeFunc.getW()
-                                                 * lineCrossArea;
-                                    Me[3*m+0][3*n+0] += std::pow(Rt[0][0],2.0)*value;
-                                    Me[3*m+1][3*n+1] += std::pow(Rt[1][0],2.0)*value;
-                                    Me[3*m+2][3*n+2] += std::pow(Rt[2][0],2.0)*value;
-                                }
-                            }
-                        }
-
                         double integValue = N[m] * detJ * shapeFunc.getW();
 
                         // Force
@@ -588,6 +613,10 @@ void RSolverStress::prepare()
                     // Mass
                     if (surfaceThickness > 0.0 && needsMass)
                     {
+                        if (lumpedMass)
+                        {
+                            lumpMassMatrix(Met);
+                        }
                         RRMatrix::mlt(Rt,Met,MeRt);
                         RRMatrix::mlt(MeRt,RtT,Me,true);
                     }
@@ -735,6 +764,10 @@ void RSolverStress::prepare()
                             fe[3*m+2] += this->elementThermalExpansion[elementID] * dT * BeD[3*m+2][n] * detJ * shapeFunc.getW();
                         }
                     }
+                }
+                if (needsMass && lumpedMass)
+                {
+                    lumpMassMatrix(Me);
                 }
                 this->assemblyMatrix(elementID,Me,Ke,fe,Ap[uint(omp_get_thread_num())],bp[uint(omp_get_thread_num())],Mp[uint(omp_get_thread_num())]);
             }
