@@ -855,6 +855,8 @@ private slots:
     void staticBeamBending_data();
     void staticBeamBending();
     void staticBeamRotatedFrame();
+    void staticBeamEndMoment();
+    void prescribedBeamTipRotation();
     void modalBeamBending_data();
     void modalBeamBending();
     void modalTrussBar_data();
@@ -1497,6 +1499,85 @@ void TestSolverStress::staticBeamRotatedFrame()
     QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,2,beamSlices)) < 1.0e-12);
     QVERIFY2(std::fabs(nodeValue(model,R_VARIABLE_FORCE,1,0)+tipForce) < 1.0e-5*tipForce,
              "Rotated beam root reaction does not balance the tip load");
+}
+
+//! A point moment must enter the rotational equation directly. The explicit
+//! root Rotation condition replaces the historical translation-only clamp
+//! fallback and the stored nodal moments must balance the applied end moment.
+void TestSolverStress::staticBeamEndMoment()
+{
+    constexpr uint beamSlices = 6;
+    constexpr double endMoment = 750.0;
+    constexpr double iz = 5.0e-5;
+    RModel model = buildBeam(0.0,0.0);
+
+    RBoundaryCondition fixedRotation(R_BOUNDARY_CONDITION_ROTATION);
+    fixedRotation.getComponent(fixedRotation.findComponentPosition(R_VARIABLE_ROTATION_X)).add(0.0,0.0);
+    fixedRotation.getComponent(fixedRotation.findComponentPosition(R_VARIABLE_ROTATION_Y)).add(0.0,0.0);
+    fixedRotation.getComponent(fixedRotation.findComponentPosition(R_VARIABLE_ROTATION_Z)).add(0.0,0.0);
+    model.getPoint(0).addBoundaryCondition(fixedRotation);
+
+    RBoundaryCondition moment(R_BOUNDARY_CONDITION_MOMENT);
+    moment.getComponent(moment.findComponentPosition(R_VARIABLE_MOMENT_X)).add(0.0,0.0);
+    moment.getComponent(moment.findComponentPosition(R_VARIABLE_MOMENT_Y)).add(0.0,0.0);
+    moment.getComponent(moment.findComponentPosition(R_VARIABLE_MOMENT_Z)).add(0.0,endMoment);
+    model.getPoint(1).addBoundaryCondition(moment);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+
+    QString solverError;
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+    const double expectedRotation = endMoment*barLength/(elasticityModulus*iz);
+    const double expectedDisplacement = endMoment*barLength*barLength/(2.0*elasticityModulus*iz);
+    QCOMPARE(nodeValue(model,R_VARIABLE_ROTATION,0,0),0.0);
+    QCOMPARE(nodeValue(model,R_VARIABLE_ROTATION,1,0),0.0);
+    QCOMPARE(nodeValue(model,R_VARIABLE_ROTATION,2,0),0.0);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_ROTATION,2,beamSlices)-expectedRotation)
+            < 1.0e-5*expectedRotation);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,1,beamSlices)-expectedDisplacement)
+            < 1.0e-5*expectedDisplacement);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_MOMENT,2,0)+endMoment)
+            < 1.0e-5*endMoment);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_MOMENT,2,beamSlices)-endMoment)
+            < 1.0e-5*endMoment);
+}
+
+//! Non-zero prescribed rotation exercises the elimination term, rather than
+//! merely removing an equation. With a free transverse tip the exact solution
+//! has v(L)=L*theta/2 and equal/opposite end moments E*I*theta/L.
+void TestSolverStress::prescribedBeamTipRotation()
+{
+    constexpr uint beamSlices = 6;
+    constexpr double prescribedRotation = 2.0e-3;
+    constexpr double iz = 5.0e-5;
+    RModel model = buildBeam(0.0,0.0);
+
+    RBoundaryCondition fixedRotation(R_BOUNDARY_CONDITION_ROTATION);
+    fixedRotation.getComponent(fixedRotation.findComponentPosition(R_VARIABLE_ROTATION_X)).add(0.0,0.0);
+    fixedRotation.getComponent(fixedRotation.findComponentPosition(R_VARIABLE_ROTATION_Y)).add(0.0,0.0);
+    fixedRotation.getComponent(fixedRotation.findComponentPosition(R_VARIABLE_ROTATION_Z)).add(0.0,0.0);
+    model.getPoint(0).addBoundaryCondition(fixedRotation);
+
+    RBoundaryCondition tipRotation(R_BOUNDARY_CONDITION_ROTATION);
+    tipRotation.getComponent(tipRotation.findComponentPosition(R_VARIABLE_ROTATION_X)).setEnabled(false);
+    tipRotation.getComponent(tipRotation.findComponentPosition(R_VARIABLE_ROTATION_Y)).setEnabled(false);
+    tipRotation.getComponent(tipRotation.findComponentPosition(R_VARIABLE_ROTATION_Z)).add(0.0,prescribedRotation);
+    model.getPoint(1).addBoundaryCondition(tipRotation);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+
+    QString solverError;
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+    const double expectedDisplacement = barLength*prescribedRotation/2.0;
+    const double expectedMoment = elasticityModulus*iz*prescribedRotation/barLength;
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_ROTATION,2,beamSlices)-prescribedRotation)
+            < 1.0e-10*prescribedRotation);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,1,beamSlices)-expectedDisplacement)
+            < 1.0e-5*expectedDisplacement);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_MOMENT,2,0)+expectedMoment)
+            < 1.0e-5*expectedMoment);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_MOMENT,2,beamSlices)-expectedMoment)
+            < 1.0e-5*expectedMoment);
 }
 
 //! The first cantilever mode checks the BEAM1 mass matrix together with the

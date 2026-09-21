@@ -11,6 +11,7 @@ private slots:
     void defaultsAreUnity();
     void settersAndGetters();
     void copyAndAssignment();
+    void frameVariablesUseCorrectDimensions();
     void beamSectionScalesWithLength();
 };
 
@@ -58,6 +59,19 @@ void TestScales::copyAndAssignment()
     // Modifying the original must not affect the copy.
     scales.setMetre(9.0);
     QCOMPARE(copy.getMetre(), 2.5);
+}
+
+void TestScales::frameVariablesUseCorrectDimensions()
+{
+    RScales scales;
+    scales.setMetre(0.5);
+    scales.setKilogram(3.0);
+    scales.setSecond(2.0);
+
+    QCOMPARE(scales.findScaleFactor(R_VARIABLE_ROTATION),1.0);
+    QCOMPARE(scales.findScaleFactor(R_VARIABLE_ROTATION_Z),1.0);
+    QCOMPARE(scales.findScaleFactor(R_VARIABLE_MOMENT),0.1875);
+    QCOMPARE(scales.findScaleFactor(R_VARIABLE_MOMENT_X),0.1875);
 }
 
 void TestScales::beamSectionScalesWithLength()

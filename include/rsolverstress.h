@@ -28,6 +28,16 @@ class RSolverStress : public RSolverGeneric
         //! node - the local frame where one is active, global otherwise. Only
         //! the first nodeConstrainedDirections components carry a meaning.
         RRMatrix nodePrescribedDisplacement;
+        //! Rotational equation frame. It normally follows the translational
+        //! frame for backward compatibility, but stays global when an explicit
+        //! global rotation condition is present on the node.
+        std::vector<RLocalRotation> rotationLocalRotations;
+        //! Bit mask of explicitly constrained global rotations (RX/RY/RZ).
+        RUVector nodeConstrainedRotations;
+        //! Whether a rotation boundary condition was explicitly attached.
+        RBVector nodeHasRotationCondition;
+        //! Prescribed global nodal rotations.
+        RRMatrix nodePrescribedRotation;
         //! Node displacement vector.
         RSolverCartesianVector<RRVector> nodeDisplacement;
         //! Node rotation vector used by frame elements.
@@ -36,6 +46,8 @@ class RSolverStress : public RSolverGeneric
         RSolverCartesianVector<RRVector> nodeInitialDisplacement;
         //! Node force vector.
         RSolverCartesianVector<RRVector> nodeForce;
+        //! Node moment vector used by frame elements.
+        RSolverCartesianVector<RRVector> nodeMoment;
         //! Node pressure.
         RRVector nodePressure;
         //! Element stress components.

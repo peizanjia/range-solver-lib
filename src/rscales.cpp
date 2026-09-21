@@ -211,6 +211,16 @@ double RScales::findScaleFactor(RVariableType variableType) const
             return std::pow(this->metre,2);
         case R_VARIABLE_VOLUME:
             return std::pow(this->metre,3);
+        case R_VARIABLE_ROTATION:
+        case R_VARIABLE_ROTATION_X:
+        case R_VARIABLE_ROTATION_Y:
+        case R_VARIABLE_ROTATION_Z:
+            return 1.0;
+        case R_VARIABLE_MOMENT:
+        case R_VARIABLE_MOMENT_X:
+        case R_VARIABLE_MOMENT_Y:
+        case R_VARIABLE_MOMENT_Z:
+            return this->kilogram*std::pow(this->metre,2)/std::pow(this->second,2);
         default:
             return 1.0;
     }

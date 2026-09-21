@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 
@@ -479,11 +480,13 @@ void RSolverStress::recover()
     this->recoverVariable(R_VARIABLE_FORCE,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),0,this->nodeForce.x,0.0);
     this->recoverVariable(R_VARIABLE_FORCE,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),1,this->nodeForce.y,0.0);
     this->recoverVariable(R_VARIABLE_FORCE,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),2,this->nodeForce.z,0.0);
+    this->recoverVariable(R_VARIABLE_ROTATION,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),0,this->nodeRotation.x,0.0);
+    this->recoverVariable(R_VARIABLE_ROTATION,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),1,this->nodeRotation.y,0.0);
+    this->recoverVariable(R_VARIABLE_ROTATION,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),2,this->nodeRotation.z,0.0);
+    this->recoverVariable(R_VARIABLE_MOMENT,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),0,this->nodeMoment.x,0.0);
+    this->recoverVariable(R_VARIABLE_MOMENT,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),1,this->nodeMoment.y,0.0);
+    this->recoverVariable(R_VARIABLE_MOMENT,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),2,this->nodeMoment.z,0.0);
     this->recoverVariable(R_VARIABLE_PRESSURE,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),0,this->nodePressure,0.0);
-
-    this->nodeRotation.x.resize(this->pModel->getNNodes(),0.0);
-    this->nodeRotation.y.resize(this->pModel->getNNodes(),0.0);
-    this->nodeRotation.z.resize(this->pModel->getNNodes(),0.0);
 
 //    this->syncShared("node-displacement-x",this->nodeDisplacement.x);
 //    this->syncShared("node-displacement-y",this->nodeDisplacement.y);
@@ -499,6 +502,11 @@ void RSolverStress::prepare()
     //! Element force vector.
     RSolverCartesianVector<RRVector> elementForce;
     RSolverCartesianVector<RBVector> forceSetValues;
+
+    //! Element moment vector. Moments are currently accepted on point
+    //! entities and assembled directly into frame rotational equations.
+    RSolverCartesianVector<RRVector> elementMoment;
+    RSolverCartesianVector<RBVector> momentSetValues;
 
 
     //! Element gravity vector.
@@ -526,6 +534,9 @@ void RSolverStress::prepare()
     this->generateVariableVector(R_VARIABLE_FORCE_X,elementForce.x,forceSetValues.x,true,this->firstRun,this->firstRun);
     this->generateVariableVector(R_VARIABLE_FORCE_Y,elementForce.y,forceSetValues.y,true,this->firstRun,this->firstRun);
     this->generateVariableVector(R_VARIABLE_FORCE_Z,elementForce.z,forceSetValues.z,true,this->firstRun,this->firstRun);
+    this->generateVariableVector(R_VARIABLE_MOMENT_X,elementMoment.x,momentSetValues.x,true,false,false);
+    this->generateVariableVector(R_VARIABLE_MOMENT_Y,elementMoment.y,momentSetValues.y,true,false,false);
+    this->generateVariableVector(R_VARIABLE_MOMENT_Z,elementMoment.z,momentSetValues.z,true,false,false);
     this->generateVariableVector(R_VARIABLE_G_ACCELERATION_X,elementGravity.x,gGravitySetValues.x,true,true,true);
     this->generateVariableVector(R_VARIABLE_G_ACCELERATION_Y,elementGravity.y,gGravitySetValues.y,true,true,true);
     this->generateVariableVector(R_VARIABLE_G_ACCELERATION_Z,elementGravity.z,gGravitySetValues.z,true,true,true);
@@ -661,6 +672,36 @@ void RSolverStress::prepare()
                 }
 
                 this->assemblyMatrix(elementID,Me,Ke,fe,Ap[uint(omp_get_thread_num())],bp[uint(omp_get_thread_num())],Mp[uint(omp_get_thread_num())]);
+
+                if (this->problemType != R_PROBLEM_STRESS_MODAL)
+                {
+                    const uint nodeId = this->pModel->getElement(elementID).getNodeId(0);
+                    RR3Vector moment(elementMoment.x[elementID]/pointCount,
+                                     elementMoment.y[elementID]/pointCount,
+                                     elementMoment.z[elementID]/pointCount);
+                    if (this->rotationLocalRotations[nodeId].isActive())
+                    {
+                        const RRMatrix &rotation = this->rotationLocalRotations[nodeId].getR();
+                        const RR3Vector globalMoment(moment);
+                        for (uint c=0;c<3;c++)
+                        {
+                            moment[c] = rotation[0][c]*globalMoment[0]
+                                      + rotation[1][c]*globalMoment[1]
+                                      + rotation[2][c]*globalMoment[2];
+                        }
+                    }
+                    for (uint c=0;c<3;c++)
+                    {
+                        const RDofType dof = c == 0 ? RDofType::RX
+                                            : c == 1 ? RDofType::RY
+                                                     : RDofType::RZ;
+                        uint position = 0;
+                        if (this->equationBook.getValue(nodeId,dof,position))
+                        {
+                            bp[uint(omp_get_thread_num())][position] += moment[c];
+                        }
+                    }
+                }
             }
             catch (const RError &rError)
             {
@@ -1372,12 +1413,19 @@ void RSolverStress::setDisplacement(const RRVector &v)
             {
                 dr[c] = v[position];
             }
+            else
+            {
+                dr[c] = (this->problemType == R_PROBLEM_STRESS_MODAL) ? 0.0 : this->nodePrescribedRotation[i][c];
+            }
         }
 
         if (this->localRotations[i].isActive())
         {
             this->localRotations[i].rotateResultsVector(du);
-            this->localRotations[i].rotateResultsVector(dr);
+        }
+        if (this->rotationLocalRotations[i].isActive())
+        {
+            this->rotationLocalRotations[i].rotateResultsVector(dr);
         }
 
         if (this->problemType == R_PROBLEM_STRESS_MODAL)
@@ -1437,6 +1485,13 @@ void RSolverStress::process()
     this->nodeForce.x.fill(0.0);
     this->nodeForce.y.fill(0.0);
     this->nodeForce.z.fill(0.0);
+
+    this->nodeMoment.x.resize(this->pModel->getNNodes(),0.0);
+    this->nodeMoment.y.resize(this->pModel->getNNodes(),0.0);
+    this->nodeMoment.z.resize(this->pModel->getNNodes(),0.0);
+    this->nodeMoment.x.fill(0.0);
+    this->nodeMoment.y.fill(0.0);
+    this->nodeMoment.z.fill(0.0);
 
     // Initialize stress vectors
     for (uint i=0;i<6;i++)
@@ -1514,6 +1569,9 @@ void RSolverStress::process()
                             this->nodeForce.x[nodeId] += internalForce[6*node+0];
                             this->nodeForce.y[nodeId] += internalForce[6*node+1];
                             this->nodeForce.z[nodeId] += internalForce[6*node+2];
+                            this->nodeMoment.x[nodeId] += internalForce[6*node+3];
+                            this->nodeMoment.y[nodeId] += internalForce[6*node+4];
+                            this->nodeMoment.z[nodeId] += internalForce[6*node+5];
                         }
                     }
 
@@ -2079,6 +2137,16 @@ void RSolverStress::store()
     RLogger::info("Storing results\n");
     RLogger::indent();
 
+    bool hasFrameDofs = false;
+    for (uint i=0;i<this->pModel->getNElements() && !hasFrameDofs;i++)
+    {
+        if (this->computableElements[i] &&
+            RElementDescriptor::get(this->pModel->getElement(i).getType()).getDofsPerNode().contains(RDofType::RX))
+        {
+            hasFrameDofs = true;
+        }
+    }
+
     // Displacement
     uint displacementPos = this->pModel->findVariable(R_VARIABLE_DISPLACEMENT);
     if (displacementPos == RConstants::eod)
@@ -2114,6 +2182,25 @@ void RSolverStress::store()
         displacement.setValue(0,i,this->nodeDisplacement.x[i]);
         displacement.setValue(1,i,this->nodeDisplacement.y[i]);
         displacement.setValue(2,i,this->nodeDisplacement.z[i]);
+    }
+
+    if (hasFrameDofs)
+    {
+        // Rotation
+        uint rotationPos = this->pModel->findVariable(R_VARIABLE_ROTATION);
+        if (rotationPos == RConstants::eod)
+        {
+            rotationPos = this->pModel->addVariable(R_VARIABLE_ROTATION);
+        }
+        RVariable &rotation = this->pModel->getVariable(rotationPos);
+        rotation.setApplyType(R_VARIABLE_APPLY_NODE);
+        rotation.resize(3,this->pModel->getNNodes());
+        for (uint i=0;i<this->pModel->getNNodes();i++)
+        {
+            rotation.setValue(0,i,this->nodeRotation.x[i]);
+            rotation.setValue(1,i,this->nodeRotation.y[i]);
+            rotation.setValue(2,i,this->nodeRotation.z[i]);
+        }
     }
 
     // VonMises Stress
@@ -2230,7 +2317,7 @@ void RSolverStress::store()
             }
         }
 
-        this->pModel->getVariable(displacementPos).getVariableData().setMinMaxDisplayValue(fmin,fmax);
+        this->pModel->getVariable(forcePos).getVariableData().setMinMaxDisplayValue(fmin,fmax);
     }
     RVariable &force =  this->pModel->getVariable(forcePos);
 
@@ -2243,14 +2330,41 @@ void RSolverStress::store()
         force.setValue(2,i,this->nodeForce.z[i]);
     }
 
+    if (hasFrameDofs)
+    {
+        // Moment
+        uint momentPos = this->pModel->findVariable(R_VARIABLE_MOMENT);
+        if (momentPos == RConstants::eod)
+        {
+            momentPos = this->pModel->addVariable(R_VARIABLE_MOMENT);
+        }
+        RVariable &moment = this->pModel->getVariable(momentPos);
+        moment.setApplyType(R_VARIABLE_APPLY_NODE);
+        moment.resize(3,this->pModel->getNNodes());
+        for (uint i=0;i<this->pModel->getNNodes();i++)
+        {
+            moment.setValue(0,i,this->nodeMoment.x[i]);
+            moment.setValue(1,i,this->nodeMoment.y[i]);
+            moment.setValue(2,i,this->nodeMoment.z[i]);
+        }
+    }
+
     RLogger::unindent();
 }
 
 void RSolverStress::statistics()
 {
     this->printStats(R_VARIABLE_DISPLACEMENT);
+    if (this->pModel->findVariable(R_VARIABLE_ROTATION) != RConstants::eod)
+    {
+        this->printStats(R_VARIABLE_ROTATION);
+    }
     this->printStats(R_VARIABLE_STRESS_VON_MISES);
     this->printStats(R_VARIABLE_FORCE);
+    if (this->pModel->findVariable(R_VARIABLE_MOMENT) != RConstants::eod)
+    {
+        this->printStats(R_VARIABLE_MOMENT);
+    }
     this->processMonitoringPoints();
 }
 
@@ -2318,6 +2432,13 @@ void RSolverStress::generateLocalConstraints()
     this->nodeConstrainedDirections.fill(0);
     this->nodePrescribedDisplacement.resize(nNodes,3,0.0);
     this->nodePrescribedDisplacement.fill(0.0);
+    this->rotationLocalRotations.resize(nNodes);
+    this->nodeConstrainedRotations.resize(nNodes,0);
+    this->nodeConstrainedRotations.fill(0);
+    this->nodeHasRotationCondition.resize(nNodes,false);
+    this->nodeHasRotationCondition.fill(false);
+    this->nodePrescribedRotation.resize(nNodes,3,0.0);
+    this->nodePrescribedRotation.fill(0.0);
 
     // Directions taken from the geometry. A node lying on several entities
     // collects the average of what they give it, as before.
@@ -2710,6 +2831,70 @@ void RSolverStress::generateLocalConstraints()
             this->localRotations[i].activate(R);
         }
     }
+
+    // Rotation conditions use explicit global X/Y/Z components. Keep their
+    // equation frame separate from translation-only normal/roller frames so a
+    // global rotational restraint cannot silently rotate with a surface normal.
+    // Nodes without an explicit rotation condition retain the historical frame
+    // behaviour used by the implicit fully-fixed clamp fallback.
+    for (uint i=0;i<nNodes;i++)
+    {
+        this->rotationLocalRotations[i] = this->localRotations[i];
+    }
+
+    const RVariableType rotationComponents[3] =
+    {
+        R_VARIABLE_ROTATION_X,
+        R_VARIABLE_ROTATION_Y,
+        R_VARIABLE_ROTATION_Z
+    };
+    for (uint i=0;i<this->pModel->getNElementGroups();i++)
+    {
+        const RElementGroup *pElementGroup = this->pModel->getElementGroupPtr(i);
+        if (!pElementGroup)
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Element group could not be found (%u of %u).",i,this->pModel->getNElementGroups());
+        }
+        for (uint j=0;j<pElementGroup->getNBoundaryConditions();j++)
+        {
+            const RBoundaryCondition &bc = pElementGroup->getBoundaryCondition(j);
+            if (bc.getType() != R_BOUNDARY_CONDITION_ROTATION)
+            {
+                continue;
+            }
+            for (uint k=0;k<pElementGroup->size();k++)
+            {
+                const RElement &element = this->pModel->getElement(pElementGroup->get(k));
+                for (uint l=0;l<element.size();l++)
+                {
+                    const uint nodeId = element.getNodeId(l);
+                    this->nodeHasRotationCondition[nodeId] = true;
+                    this->rotationLocalRotations[nodeId].deactivate();
+                    for (uint c=0;c<3;c++)
+                    {
+                        if (!RSolverStress::isComponentEnabled(bc,rotationComponents[c]))
+                        {
+                            continue;
+                        }
+                        const double value = this->findComponentValue(bc,rotationComponents[c]);
+                        const uint bit = 1u << c;
+                        if ((this->nodeConstrainedRotations[nodeId] & bit) != 0u &&
+                            std::fabs(this->nodePrescribedRotation[nodeId][c]-value) >
+                                1.0e-8*std::max({std::fabs(value),
+                                                std::fabs(this->nodePrescribedRotation[nodeId][c]),
+                                                1.0e-12}))
+                        {
+                            throw RError(RError::Type::Application,R_ERROR_REF,
+                                         "Node %u carries rotation constraints which contradict each other.",nodeId);
+                        }
+                        this->nodeConstrainedRotations[nodeId] |= bit;
+                        this->nodePrescribedRotation[nodeId][c] = value;
+                    }
+                }
+            }
+        }
+    }
 }
 
 void RSolverStress::generateEquationBook()
@@ -2739,10 +2924,23 @@ void RSolverStress::generateEquationBook()
         {
             this->equationBook.disable(i,translationDof(j));
         }
-        // Until explicit rotational boundary-condition components are added,
-        // a node fixed in all three translations represents a clamped frame
-        // node. Partial translational constraints do not suppress rotations.
-        if (this->nodeConstrainedDirections[i] == 3)
+        if (this->nodeHasRotationCondition[i])
+        {
+            for (uint c=0;c<3;c++)
+            {
+                if ((this->nodeConstrainedRotations[i] & (1u << c)) != 0u)
+                {
+                    const RDofType dof = c == 0 ? RDofType::RX
+                                        : c == 1 ? RDofType::RY
+                                                 : RDofType::RZ;
+                    this->equationBook.disable(i,dof);
+                }
+            }
+        }
+        // Old models have no rotation condition. Preserve their established
+        // meaning: a node fixed in all three translations is a clamped frame
+        // node. Adding an explicit Rotation condition opts out of this fallback.
+        else if (this->nodeConstrainedDirections[i] == 3)
         {
             this->equationBook.disable(i,RDofType::RX);
             this->equationBook.disable(i,RDofType::RY);
@@ -2842,9 +3040,15 @@ void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRM
                     continue;
                 }
                 uint component = 0;
-                const double u = findTranslationComponent(elementDofs[c],component)
-                               ? this->nodePrescribedDisplacement[nodeID][component]
-                               : 0.0;
+                double u = 0.0;
+                if (findTranslationComponent(elementDofs[c],component))
+                {
+                    u = this->nodePrescribedDisplacement[nodeID][component];
+                }
+                else if (findRotationComponent(elementDofs[c],component))
+                {
+                    u = this->nodePrescribedRotation[nodeID][component];
+                }
                 if (std::fabs(u) <= 0.0)
                 {
                     continue;
@@ -2902,7 +3106,9 @@ void RSolverStress::applyLocalRotations(unsigned int elementID, RRMatrix &Ae)
     for (uint i=0;i<rElement.size();i++)
     {
         uint nodeId = rElement.getNodeId(i);
-        if (this->localRotations[nodeId].isActive())
+        const bool translationActive = this->localRotations[nodeId].isActive();
+        const bool rotationActive = this->rotationLocalRotations[nodeId].isActive();
+        if (translationActive || rotationActive)
         {
             if (first)
             {
@@ -2910,14 +3116,14 @@ void RSolverStress::applyLocalRotations(unsigned int elementID, RRMatrix &Ae)
                 first = false;
             }
             const int translationOffset = dofs.indexOf(RDofType::UX);
-            if (translationOffset >= 0 && dofs.indexOf(RDofType::UY) == translationOffset+1 && dofs.indexOf(RDofType::UZ) == translationOffset+2)
+            if (translationActive && translationOffset >= 0 && dofs.indexOf(RDofType::UY) == translationOffset+1 && dofs.indexOf(RDofType::UZ) == translationOffset+2)
             {
                 T.setBlock(this->localRotations[nodeId].getR(),nDofs*i+uint(translationOffset),nDofs*i+uint(translationOffset));
             }
             const int rotationOffset = dofs.indexOf(RDofType::RX);
-            if (rotationOffset >= 0 && dofs.indexOf(RDofType::RY) == rotationOffset+1 && dofs.indexOf(RDofType::RZ) == rotationOffset+2)
+            if (rotationActive && rotationOffset >= 0 && dofs.indexOf(RDofType::RY) == rotationOffset+1 && dofs.indexOf(RDofType::RZ) == rotationOffset+2)
             {
-                T.setBlock(this->localRotations[nodeId].getR(),nDofs*i+uint(rotationOffset),nDofs*i+uint(rotationOffset));
+                T.setBlock(this->rotationLocalRotations[nodeId].getR(),nDofs*i+uint(rotationOffset),nDofs*i+uint(rotationOffset));
             }
         }
     }
@@ -2945,7 +3151,9 @@ void RSolverStress::applyLocalRotations(unsigned int elementID, RRVector &fe)
     for (uint i=0;i<rElement.size();i++)
     {
         uint nodeId = rElement.getNodeId(i);
-        if (this->localRotations[nodeId].isActive())
+        const bool translationActive = this->localRotations[nodeId].isActive();
+        const bool rotationActive = this->rotationLocalRotations[nodeId].isActive();
+        if (translationActive || rotationActive)
         {
             if (first)
             {
@@ -2953,14 +3161,14 @@ void RSolverStress::applyLocalRotations(unsigned int elementID, RRVector &fe)
                 first = false;
             }
             const int translationOffset = dofs.indexOf(RDofType::UX);
-            if (translationOffset >= 0 && dofs.indexOf(RDofType::UY) == translationOffset+1 && dofs.indexOf(RDofType::UZ) == translationOffset+2)
+            if (translationActive && translationOffset >= 0 && dofs.indexOf(RDofType::UY) == translationOffset+1 && dofs.indexOf(RDofType::UZ) == translationOffset+2)
             {
                 T.setBlock(this->localRotations[nodeId].getR(),nDofs*i+uint(translationOffset),nDofs*i+uint(translationOffset));
             }
             const int rotationOffset = dofs.indexOf(RDofType::RX);
-            if (rotationOffset >= 0 && dofs.indexOf(RDofType::RY) == rotationOffset+1 && dofs.indexOf(RDofType::RZ) == rotationOffset+2)
+            if (rotationActive && rotationOffset >= 0 && dofs.indexOf(RDofType::RY) == rotationOffset+1 && dofs.indexOf(RDofType::RZ) == rotationOffset+2)
             {
-                T.setBlock(this->localRotations[nodeId].getR(),nDofs*i+uint(rotationOffset),nDofs*i+uint(rotationOffset));
+                T.setBlock(this->rotationLocalRotations[nodeId].getR(),nDofs*i+uint(rotationOffset),nDofs*i+uint(rotationOffset));
             }
         }
     }
