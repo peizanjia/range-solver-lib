@@ -722,14 +722,14 @@ void RSolverGeneric::generateMaterialVecor(RMaterialProperty::Type materialPrope
 //                             pElementGroup->getName().toUtf8().constData());
             continue;
         }
-        const RMaterialProperty &materialProperty = material.get(materialPropertyPosition);
-
         // Apply values to element vectors.
         for (unsigned int j=0;j<pElementGroup->size();j++)
         {
             unsigned int elementID = pElementGroup->get(j);
             double temperature = this->elementTemperature[elementID];
-            materialPropertyValues[elementID] = materialProperty.get(temperature);
+            RMaterialEvaluationContext context;
+            context.setField(R_VARIABLE_TEMPERATURE,temperature);
+            materialPropertyValues[elementID] = material.evaluateProperty(materialPropertyType,context).getValue();
         }
     }
 }
