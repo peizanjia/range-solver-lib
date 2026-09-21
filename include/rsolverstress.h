@@ -69,6 +69,8 @@ class RSolverStress : public RSolverGeneric
 
         //! Structural node/DOF to equation mapping.
         REquationBook equationBook;
+        //! Number of Lagrange multiplier equations appended for MPCs.
+        uint nLinearConstraintEquations;
 
     public:
 
@@ -130,6 +132,9 @@ class RSolverStress : public RSolverGeneric
 
         //! Generate the active structural equation book.
         void generateEquationBook();
+
+        //! Validate and append independent linear constraints using Lagrange multipliers.
+        void applyLinearConstraints();
 
         //! Return true if given component of the boundary condition is present
         //! and switched on.

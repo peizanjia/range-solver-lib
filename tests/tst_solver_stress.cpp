@@ -1083,6 +1083,8 @@ private slots:
     void reactionsBalanceGravityWithTiltedRoller();
     void prescribedDisplacementIsAppliedInLocalFrame();
     void contradictingConstraintsAreReported();
+    void linearConstraintCouplesTrussNodes();
+    void contradictoryLinearConstraintsAreReported();
 };
 
 //! A fixed-free bar under an axial tip force stretches by F*L/(E*A) and carries
@@ -2309,6 +2311,53 @@ void TestSolverStress::contradictingConstraintsAreReported()
     QVERIFY2(!runSolver(model,solverError),"The contradicting constraints were accepted");
     QVERIFY2(solverError.contains("contradict"),
              qPrintable(QString("Unexpected error message: %1").arg(solverError)));
+}
+
+void TestSolverStress::linearConstraintCouplesTrussNodes()
+{
+    constexpr double tipForce = 1000.0;
+    RModel model = buildTruss(tipForce);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+    RMatrixSolverConf &gmres = model.getMatrixSolverConf(RMatrixSolverConf::GMRES);
+    gmres.setNInnerIterations(50);
+    gmres.setNOuterIterations(100);
+    gmres.setSolverCvgValue(1.0e-10);
+    gmres.setOutputFrequency(0);
+
+    RLinearConstraint constraint;
+    constraint.id = "tie-last-segment";
+    constraint.name = "Equal tip displacement";
+    constraint.terms = {{{nSlices,RDofType::UX},1.0},{{nSlices-1,RDofType::UX},-1.0}};
+    model.getProblemSetup().getStructuralInteractionSetup().getLinearConstraints().push_back(constraint);
+
+    QString solverError;
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+    const double expected = tipForce*(barLength-barLength/double(nSlices))/(elasticityModulus*barArea);
+    const double tip = nodeValue(model,R_VARIABLE_DISPLACEMENT,0,nSlices);
+    const double previous = nodeValue(model,R_VARIABLE_DISPLACEMENT,0,nSlices-1);
+    QVERIFY2(std::fabs(tip-previous) < 1.0e-8*expected,
+             qPrintable(QString("MPC residual = %1").arg(tip-previous)));
+    QVERIFY2(std::fabs(tip-expected) < 2.0e-5*expected,
+             qPrintable(QString("MPC tip = %1, expected %2").arg(tip).arg(expected)));
+}
+
+void TestSolverStress::contradictoryLinearConstraintsAreReported()
+{
+    RModel model = buildTruss(0.0);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+    RLinearConstraint first;
+    first.id = "tip-zero";
+    first.terms = {{{nSlices,RDofType::UX},1.0}};
+    RLinearConstraint second = first;
+    second.id = "tip-one";
+    second.rhs = 1.0;
+    RStructuralInteractionSetup &setup = model.getProblemSetup().getStructuralInteractionSetup();
+    setup.getLinearConstraints().push_back(first);
+    setup.getLinearConstraints().push_back(second);
+
+    QString solverError;
+    QVERIFY2(!runSolver(model,solverError),"Contradictory MPC equations were accepted");
+    QVERIFY2(solverError.contains("contradict",Qt::CaseInsensitive),qPrintable(solverError));
 }
 
 QTEST_APPLESS_MAIN(TestSolverStress)

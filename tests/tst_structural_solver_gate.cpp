@@ -15,7 +15,7 @@ private slots:
     void defaultPolicyPreservesRegisteredNonStructuralSolver();
     void rejectsNonStructuralProblemBeforeMutatingResults();
     void rejectsMixedStructuralAndHeatProblem();
-    void rejectsElementWithoutStructuralFormulation();
+    void acceptsImplementedBeamFormulation();
 };
 
 void TestStructuralSolverGate::rejectsEmptyProblemTask()
@@ -85,24 +85,14 @@ void TestStructuralSolverGate::rejectsMixedStructuralAndHeatProblem()
     }
 }
 
-void TestStructuralSolverGate::rejectsElementWithoutStructuralFormulation()
+void TestStructuralSolverGate::acceptsImplementedBeamFormulation()
 {
     RModel model;
     model.setProblemTaskTree(RProblemTaskItem::generateDefaultTree(R_PROBLEM_STRESS));
     model.addElement(RElement(R_ELEMENT_BEAM1));
 
-    try
-    {
-        RSolver solver(model,QString(),QString(),RSolver::ExecutionPolicy::StructuralProduct);
-        Q_UNUSED(solver);
-        QFAIL("An element without a structural formulation must be rejected.");
-    }
-    catch (const RError &error)
-    {
-        QCOMPARE(error.getType(), RError::Type::InvalidInput);
-        QVERIFY(error.getMessage().contains(RElement::getId(R_ELEMENT_BEAM1)));
-        QVERIFY(error.getMessage().contains("no enabled formulation"));
-    }
+    RSolver solver(model,QString(),QString(),RSolver::ExecutionPolicy::StructuralProduct);
+    Q_UNUSED(solver);
 }
 
 QTEST_APPLESS_MAIN(TestStructuralSolverGate)

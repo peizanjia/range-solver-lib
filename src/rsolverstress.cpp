@@ -512,6 +512,7 @@ double findAxisymmetricMeasure(const RSurface &surface,
 
 RSolverStress::RSolverStress(RModel *pModel, const QString &modelFileName, const QString &convergenceFileName, RSolverSharedData &sharedData, bool modalAnalysis)
     : RSolverGeneric(pModel,modelFileName,convergenceFileName,sharedData)
+    , nLinearConstraintEquations(0)
 {
     this->problemType = modalAnalysis ? R_PROBLEM_STRESS_MODAL : R_PROBLEM_STRESS;
 }
@@ -599,6 +600,33 @@ void RSolverStress::prepare()
     // themselves, so they have to be known before the equation book is built.
     this->generateLocalConstraints();
     this->generateEquationBook();
+    this->nLinearConstraintEquations = 0;
+
+    const RStructuralInteractionSetup &interactionSetup = this->pModel->getProblemSetup().getStructuralInteractionSetup();
+    const RStructuralValidationReport validation = interactionSetup.validate(*this->pModel);
+    for (const RStructuralDiagnostic &diagnostic : validation.getDiagnostics())
+    {
+        if (diagnostic.severity == RStructuralDiagnosticSeverity::Warning)
+        {
+            RLogger::warning("Structural setup [%s] %s\n",
+                             diagnostic.code.toUtf8().constData(),
+                             diagnostic.message.toUtf8().constData());
+        }
+        else if (diagnostic.severity == RStructuralDiagnosticSeverity::Error)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Structural setup '%s' is invalid [%s]: %s",
+                         diagnostic.objectId.toUtf8().constData(),
+                         diagnostic.code.toUtf8().constData(),
+                         diagnostic.message.toUtf8().constData());
+        }
+    }
+    if (this->problemType == R_PROBLEM_STRESS_MODAL &&
+        (!interactionSetup.getLinearConstraints().empty() || !interactionSetup.getCouplings().empty()))
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Modal analysis with linear constraints or couplings requires constraint elimination and is not supported yet.");
+    }
     this->generateVariableVector(R_VARIABLE_FORCE_X,elementForce.x,forceSetValues.x,true,this->firstRun,this->firstRun);
     this->generateVariableVector(R_VARIABLE_FORCE_Y,elementForce.y,forceSetValues.y,true,this->firstRun,this->firstRun);
     this->generateVariableVector(R_VARIABLE_FORCE_Z,elementForce.z,forceSetValues.z,true,this->firstRun,this->firstRun);
@@ -1374,6 +1402,10 @@ void RSolverStress::prepare()
             this->pModel->setNode(i,nodesBkp[i]);
         }
     }
+    else
+    {
+        this->applyLinearConstraints();
+    }
 }
 
 void RSolverStress::solve()
@@ -1402,8 +1434,13 @@ void RSolverStress::solveStressStrain()
     try
     {
         RLogger::indent();
-        RMatrixSolver matrixSolver(this->pModel->getMatrixSolverConf(RMatrixSolverConf::CG));
-        matrixSolver.solve(this->A,this->b,this->x,R_MATRIX_PRECONDITIONER_JACOBI,3);
+        const RMatrixSolverType solverType = this->nLinearConstraintEquations > 0
+                                           ? RMatrixSolverConf::GMRES
+                                           : RMatrixSolverConf::CG;
+        RMatrixSolver matrixSolver(this->pModel->getMatrixSolverConf(solverType));
+        matrixSolver.solve(this->A,this->b,this->x,
+                           this->nLinearConstraintEquations > 0 ? R_MATRIX_PRECONDITIONER_NONE : R_MATRIX_PRECONDITIONER_JACOBI,
+                           this->nLinearConstraintEquations > 0 ? 1 : 3);
         RLogger::unindent();
     }
     catch (const RError &error)
@@ -3050,6 +3087,185 @@ void RSolverStress::generateEquationBook()
             this->equationBook.disable(i,RDofType::RY);
             this->equationBook.disable(i,RDofType::RZ);
         }
+    }
+}
+
+void RSolverStress::applyLinearConstraints()
+{
+    const std::vector<RLinearConstraint> constraints = this->pModel->getProblemSetup()
+        .getStructuralInteractionSetup().buildLinearConstraints(*this->pModel);
+    if (constraints.empty())
+    {
+        return;
+    }
+
+    const uint nPhysicalEquations = this->equationBook.getNEnabled();
+    struct ReducedEquation
+    {
+        RRVector coefficients;
+        double rhs = 0.0;
+        uint pivot = 0;
+        QString id;
+    };
+    std::vector<ReducedEquation> independent;
+
+    for (const RLinearConstraint &constraint : constraints)
+    {
+        ReducedEquation reduced;
+        reduced.coefficients.resize(nPhysicalEquations,0.0);
+        reduced.coefficients.fill(0.0);
+        reduced.rhs = constraint.rhs;
+        reduced.id = constraint.id;
+
+        for (const RLinearConstraintTerm &term : constraint.terms)
+        {
+            const uint nodeId = term.reference.nodeId;
+            uint component = 0;
+            const bool translation = findTranslationComponent(term.reference.dof,component);
+            const bool rotation = !translation && findRotationComponent(term.reference.dof,component);
+            if (!translation && !rotation)
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Linear constraint '%s' contains a non-mechanical DOF.",
+                             constraint.id.toUtf8().constData());
+            }
+
+            const RLocalRotation &frame = translation ? this->localRotations[nodeId]
+                                                       : this->rotationLocalRotations[nodeId];
+            for (uint localComponent=0;localComponent<3;localComponent++)
+            {
+                const double transform = frame.isActive()
+                                       ? frame.getR()[component][localComponent]
+                                       : (component == localComponent ? 1.0 : 0.0);
+                const double coefficient = term.coefficient*transform;
+                if (std::fabs(coefficient) <= 1.0e-14)
+                {
+                    continue;
+                }
+                const RDofType localDof = translation ? translationDof(localComponent)
+                    : (localComponent == 0 ? RDofType::RX : localComponent == 1 ? RDofType::RY : RDofType::RZ);
+                uint equation = 0;
+                if (this->equationBook.getValue(nodeId,localDof,equation))
+                {
+                    reduced.coefficients[equation] += coefficient;
+                    continue;
+                }
+
+                bool prescribed = false;
+                double prescribedValue = 0.0;
+                if (translation && localComponent < this->nodeConstrainedDirections[nodeId])
+                {
+                    prescribed = true;
+                    prescribedValue = this->nodePrescribedDisplacement[nodeId][localComponent];
+                }
+                else if (rotation)
+                {
+                    prescribed = (this->nodeHasRotationCondition[nodeId] &&
+                                  (this->nodeConstrainedRotations[nodeId] & (1u << localComponent)) != 0u) ||
+                                 (!this->nodeHasRotationCondition[nodeId] && this->nodeConstrainedDirections[nodeId] == 3);
+                    prescribedValue = this->nodePrescribedRotation[nodeId][localComponent];
+                }
+                if (!prescribed)
+                {
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Linear constraint '%s' references inactive DOF '%s' on node %u.",
+                                 constraint.id.toUtf8().constData(),
+                                 RDofDescriptor::get(localDof).getId().toUtf8().constData(),nodeId);
+                }
+                reduced.rhs -= coefficient*prescribedValue;
+            }
+        }
+
+        // Incremental reduced-row echelon form identifies redundant equations
+        // and contradictory equations before an indefinite saddle system is built.
+        for (const ReducedEquation &basis : independent)
+        {
+            const double factor = reduced.coefficients[basis.pivot];
+            if (std::fabs(factor) <= 1.0e-12)
+            {
+                continue;
+            }
+            for (uint column=0;column<nPhysicalEquations;column++)
+            {
+                reduced.coefficients[column] -= factor*basis.coefficients[column];
+            }
+            reduced.rhs -= factor*basis.rhs;
+        }
+
+        double rowScale = 0.0;
+        uint pivot = nPhysicalEquations;
+        for (uint column=0;column<nPhysicalEquations;column++)
+        {
+            rowScale = std::max(rowScale,std::fabs(reduced.coefficients[column]));
+            if (pivot == nPhysicalEquations && std::fabs(reduced.coefficients[column]) > 1.0e-10)
+            {
+                pivot = column;
+            }
+        }
+        if (pivot == nPhysicalEquations)
+        {
+            if (std::fabs(reduced.rhs) > 1.0e-10*std::max(1.0,rowScale))
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Linear constraint '%s' contradicts prescribed or preceding constraints.",
+                             constraint.id.toUtf8().constData());
+            }
+            RLogger::warning("Skipping redundant linear constraint '%s'.\n",constraint.id.toUtf8().constData());
+            continue;
+        }
+
+        const double divisor = reduced.coefficients[pivot];
+        for (uint column=0;column<nPhysicalEquations;column++)
+        {
+            reduced.coefficients[column] /= divisor;
+        }
+        reduced.rhs /= divisor;
+        reduced.pivot = pivot;
+
+        for (ReducedEquation &basis : independent)
+        {
+            const double factor = basis.coefficients[pivot];
+            if (std::fabs(factor) <= 1.0e-12)
+            {
+                continue;
+            }
+            for (uint column=0;column<nPhysicalEquations;column++)
+            {
+                basis.coefficients[column] -= factor*reduced.coefficients[column];
+            }
+            basis.rhs -= factor*reduced.rhs;
+        }
+        independent.push_back(reduced);
+        std::sort(independent.begin(),independent.end(),[](const ReducedEquation &a, const ReducedEquation &b)
+        {
+            return a.pivot < b.pivot;
+        });
+    }
+
+    this->nLinearConstraintEquations = uint(independent.size());
+    const uint totalEquations = nPhysicalEquations + this->nLinearConstraintEquations;
+    double constraintScale = 1.0;
+    for (uint row=0;row<nPhysicalEquations;row++)
+    {
+        constraintScale = std::max(constraintScale,std::fabs(this->A.findValue(row,row)));
+    }
+    this->A.setNRows(totalEquations);
+    this->b.resize(totalEquations,0.0);
+    this->x.resize(totalEquations,0.0);
+    for (uint i=0;i<this->nLinearConstraintEquations;i++)
+    {
+        const uint multiplier = nPhysicalEquations+i;
+        for (uint column=0;column<nPhysicalEquations;column++)
+        {
+            const double coefficient = constraintScale*independent[i].coefficients[column];
+            if (std::fabs(coefficient) <= 1.0e-14)
+            {
+                continue;
+            }
+            this->A.addValue(multiplier,column,coefficient);
+            this->A.addValue(column,multiplier,coefficient);
+        }
+        this->b[multiplier] = constraintScale*independent[i].rhs;
     }
 }
 
