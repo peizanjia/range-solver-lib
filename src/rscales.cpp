@@ -278,6 +278,7 @@ void RScales::convert(RModel &model, bool invert) const
     double lengthScale = this->findScaleFactor(R_VARIABLE_LENGTH);
     double areaScale = this->findScaleFactor(R_VARIABLE_AREA);
     double volumeScale = this->findScaleFactor(R_VARIABLE_VOLUME);
+    double sectionModulusScale = std::pow(lengthScale,3);
     double fourthMomentScale = std::pow(lengthScale,4);
 
     if (invert)
@@ -285,6 +286,7 @@ void RScales::convert(RModel &model, bool invert) const
         lengthScale = 1.0/lengthScale;
         areaScale = 1.0/areaScale;
         volumeScale = 1.0/volumeScale;
+        sectionModulusScale = 1.0/sectionModulusScale;
         fourthMomentScale = 1.0/fourthMomentScale;
     }
 
@@ -351,6 +353,9 @@ void RScales::convert(RModel &model, bool invert) const
             rLine.setSecondMomentY(rLine.getSecondMomentY()*fourthMomentScale);
             rLine.setSecondMomentZ(rLine.getSecondMomentZ()*fourthMomentScale);
             rLine.setTorsionalConstant(rLine.getTorsionalConstant()*fourthMomentScale);
+            rLine.setSectionModulusY(rLine.getSectionModulusY()*sectionModulusScale);
+            rLine.setSectionModulusZ(rLine.getSectionModulusZ()*sectionModulusScale);
+            rLine.setTorsionalSectionModulus(rLine.getTorsionalSectionModulus()*sectionModulusScale);
         }
 #pragma omp for
         for (int64_t i=0;i<int64_t(model.getNSurfaces());i++)

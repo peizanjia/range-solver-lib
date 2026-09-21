@@ -1535,6 +1535,16 @@ void RSolverStress::process()
                 R_ERROR_ASSERT(R_ELEMENT_TYPE_IS_LINE(element.getType()));
                 if (element.getType() == R_ELEMENT_BEAM1)
                 {
+                    const double sectionModulusY = line.getSectionModulusY();
+                    const double sectionModulusZ = line.getSectionModulusZ();
+                    const double torsionalSectionModulus = line.getTorsionalSectionModulus();
+                    if (sectionModulusY <= 0.0 || sectionModulusZ <= 0.0 ||
+                        torsionalSectionModulus <= 0.0)
+                    {
+                        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                     "BEAM1 stress recovery requires positive Wy, Wz and Wt on line '%s'.",
+                                     line.getName().toUtf8().constData());
+                    }
                     RRMatrix Me,Ke;
                     RRVector thermalForce;
                     buildBeamElement(line,element,this->pModel->getNodes(),
@@ -1580,14 +1590,31 @@ void RSolverStress::process()
                     transformationT.transpose(transformation);
                     RRVector localDisplacement;
                     RRMatrix::mlt(transformationT,xe,localDisplacement);
+                    RRVector localEndForce;
+                    RRMatrix::mlt(transformationT,internalForce,localEndForce);
                     const double axialStress = this->elementElasticityModulus[elementID]
                                              * ((localDisplacement[6]-localDisplacement[0])/length
                                                 - this->elementThermalExpansion[elementID]
                                                 * (this->elementTemperature[elementID]-this->elementEnvironmentTemperature[elementID]));
+                    const double bendingMomentY = std::max(std::fabs(localEndForce[4]),
+                                                           std::fabs(localEndForce[10]));
+                    const double bendingMomentZ = std::max(std::fabs(localEndForce[5]),
+                                                           std::fabs(localEndForce[11]));
+                    const double torsionalMoment = std::max(std::fabs(localEndForce[3]),
+                                                            std::fabs(localEndForce[9]));
+                    // The section moduli define the extreme-fibre envelope. With
+                    // both bending axes active, the worst section corner reaches
+                    // the sum of the absolute axis contributions.
+                    const double maximumNormalStress = std::fabs(axialStress)
+                                                     + bendingMomentY/sectionModulusY
+                                                     + bendingMomentZ/sectionModulusZ;
+                    const double maximumTorsionalShear = torsionalMoment/torsionalSectionModulus;
+                    const double shearInvariant = std::sqrt(3.0)*maximumTorsionalShear;
                     this->elementStress[0][elementID] = axialStress;
-                    this->elementNormalStress[elementID] = axialStress;
-                    this->elementShearStress[elementID] = 0.0;
-                    this->elementVonMisses[elementID] = std::fabs(axialStress);
+                    this->elementNormalStress[elementID] = maximumNormalStress;
+                    this->elementShearStress[elementID] = shearInvariant;
+                    this->elementVonMisses[elementID] = std::sqrt(maximumNormalStress*maximumNormalStress
+                                                                  + shearInvariant*shearInvariant);
                     continue;
                 }
                 if (element.getType() != R_ELEMENT_TRUSS1)

@@ -380,6 +380,9 @@ RModel buildBeam(double tipForceY, double tipForceZ)
     line.setSecondMomentY(iy);
     line.setSecondMomentZ(iz);
     line.setTorsionalConstant(iy+iz);
+    line.setSectionModulusY(4.0e-4);
+    line.setSectionModulusZ(5.0e-4);
+    line.setTorsionalSectionModulus(6.0e-4);
     line.setLocalYDirection(RR3Vector(0.0,1.0,0.0));
     line.setMaterial(material);
     REnvironmentCondition gravity(R_ENVIRONMENT_CONDITION_G_ACCELERATION);
@@ -856,6 +859,7 @@ private slots:
     void staticBeamBending();
     void staticBeamRotatedFrame();
     void staticBeamEndMoment();
+    void staticBeamTorsion();
     void prescribedBeamTipRotation();
     void modalBeamBending_data();
     void modalBeamBending();
@@ -1540,6 +1544,54 @@ void TestSolverStress::staticBeamEndMoment()
             < 1.0e-5*endMoment);
     QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_MOMENT,2,beamSlices)-endMoment)
             < 1.0e-5*endMoment);
+    const double expectedBendingStress = endMoment/model.getLine(0).getSectionModulusZ();
+    for (uint i=0;i<beamSlices;i++)
+    {
+        QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_NORMAL,i)-expectedBendingStress)
+                < 1.0e-5*expectedBendingStress);
+        QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_VON_MISES,i)-expectedBendingStress)
+                < 1.0e-5*expectedBendingStress);
+    }
+}
+
+//! Pure torsion verifies the torsional section modulus and the line-element
+//! stress-invariant convention used by the generic result variables.
+void TestSolverStress::staticBeamTorsion()
+{
+    constexpr uint beamSlices = 6;
+    constexpr double torque = 600.0;
+    RModel model = buildBeam(0.0,0.0);
+
+    RBoundaryCondition fixedRotation(R_BOUNDARY_CONDITION_ROTATION);
+    fixedRotation.getComponent(fixedRotation.findComponentPosition(R_VARIABLE_ROTATION_X)).add(0.0,0.0);
+    fixedRotation.getComponent(fixedRotation.findComponentPosition(R_VARIABLE_ROTATION_Y)).add(0.0,0.0);
+    fixedRotation.getComponent(fixedRotation.findComponentPosition(R_VARIABLE_ROTATION_Z)).add(0.0,0.0);
+    model.getPoint(0).addBoundaryCondition(fixedRotation);
+
+    RBoundaryCondition moment(R_BOUNDARY_CONDITION_MOMENT);
+    moment.getComponent(moment.findComponentPosition(R_VARIABLE_MOMENT_X)).add(0.0,torque);
+    moment.getComponent(moment.findComponentPosition(R_VARIABLE_MOMENT_Y)).add(0.0,0.0);
+    moment.getComponent(moment.findComponentPosition(R_VARIABLE_MOMENT_Z)).add(0.0,0.0);
+    model.getPoint(1).addBoundaryCondition(moment);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+
+    QString solverError;
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+    const RLine &line = model.getLine(0);
+    const double shearModulus = elasticityModulus/(2.0*(1.0+0.3));
+    const double expectedRotation = torque*barLength/(shearModulus*line.getTorsionalConstant());
+    const double expectedShearInvariant = std::sqrt(3.0)*torque/line.getTorsionalSectionModulus();
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_ROTATION,0,beamSlices)-expectedRotation)
+            < 1.0e-5*expectedRotation);
+    for (uint i=0;i<beamSlices;i++)
+    {
+        QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_NORMAL,i)) < 1.0e-5);
+        QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_SHEAR,i)-expectedShearInvariant)
+                < 1.0e-5*expectedShearInvariant);
+        QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_VON_MISES,i)-expectedShearInvariant)
+                < 1.0e-5*expectedShearInvariant);
+    }
 }
 
 //! Non-zero prescribed rotation exercises the elimination term, rather than

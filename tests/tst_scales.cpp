@@ -89,6 +89,9 @@ void TestScales::beamSectionScalesWithLength()
     line.setSecondMomentY(2.0e-5);
     line.setSecondMomentZ(3.0e-5);
     line.setTorsionalConstant(4.0e-5);
+    line.setSectionModulusY(5.0e-4);
+    line.setSectionModulusZ(6.0e-4);
+    line.setTorsionalSectionModulus(7.0e-4);
 
     RScales scales;
     scales.setMetre(0.5);
@@ -98,6 +101,9 @@ void TestScales::beamSectionScalesWithLength()
     QCOMPARE(line.getSecondMomentY(),1.25e-6);
     QCOMPARE(line.getSecondMomentZ(),1.875e-6);
     QCOMPARE(line.getTorsionalConstant(),2.5e-6);
+    QCOMPARE(line.getSectionModulusY(),6.25e-5);
+    QCOMPARE(line.getSectionModulusZ(),7.5e-5);
+    QCOMPARE(line.getTorsionalSectionModulus(),8.75e-5);
 
     scales.upscale(model);
     QCOMPARE(model.getNode(1).getX(),2.0);
@@ -105,6 +111,9 @@ void TestScales::beamSectionScalesWithLength()
     QCOMPARE(line.getSecondMomentY(),2.0e-5);
     QCOMPARE(line.getSecondMomentZ(),3.0e-5);
     QCOMPARE(line.getTorsionalConstant(),4.0e-5);
+    QCOMPARE(line.getSectionModulusY(),5.0e-4);
+    QCOMPARE(line.getSectionModulusZ(),6.0e-4);
+    QCOMPARE(line.getTorsionalSectionModulus(),7.0e-4);
 }
 
 QTEST_APPLESS_MAIN(TestScales)
