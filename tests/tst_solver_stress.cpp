@@ -339,6 +339,144 @@ RModel buildTruss(double tipForce)
     return model;
 }
 
+RModel buildQuadraticTruss(double tipForce)
+{
+    constexpr uint elements = 4;
+    RModel model;
+    model.setNNodes(2*elements+1);
+    for (uint i=0;i<=2*elements;i++)
+    {
+        model.getNode(i).set(barLength*double(i)/double(2*elements),0.0,0.0);
+    }
+    for (uint i=0;i<elements;i++)
+    {
+        RElement element(R_ELEMENT_TRUSS2);
+        element.setNodeId(0,2*i);
+        element.setNodeId(1,2*i+2);
+        element.setNodeId(2,2*i+1);
+        model.addElement(element,true,0);
+    }
+
+    RMaterial material(RMaterial::Solid);
+    RMaterialProperty modulus(RMaterialProperty::ModulusOfElasiticity);
+    modulus.add(293.15,elasticityModulus); material.add(modulus);
+    RMaterialProperty poisson(RMaterialProperty::PoissonRatio);
+    poisson.add(293.15,poissonRatio); material.add(poisson);
+    RMaterialProperty densityProperty(RMaterialProperty::Density);
+    densityProperty.add(293.15,density); material.add(densityProperty);
+    RMaterialProperty expansion(RMaterialProperty::ThermalExpansionCoefficient);
+    expansion.add(293.15,thermalExpansion); material.add(expansion);
+    RLine &line = model.getLine(0);
+    line.setCrossArea(barArea);
+    line.setMaterial(material);
+
+    RBoundaryCondition lateral(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).setEnabled(false);
+    lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+    lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+    line.addBoundaryCondition(lateral);
+
+    RElement fixed(R_ELEMENT_POINT); fixed.setNodeId(0,0); model.addElement(fixed,true,0);
+    RBoundaryCondition fixedBc(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    fixedBc.getComponent(fixedBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).add(0.0,0.0);
+    fixedBc.getComponent(fixedBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+    fixedBc.getComponent(fixedBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+    model.getPoint(0).addBoundaryCondition(fixedBc);
+
+    RElement loaded(R_ELEMENT_POINT); loaded.setNodeId(0,2*elements); model.addElement(loaded,true,1);
+    RBoundaryCondition force(R_BOUNDARY_CONDITION_FORCE);
+    force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_X)).add(0.0,tipForce);
+    force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_Y)).add(0.0,0.0);
+    force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_Z)).add(0.0,0.0);
+    model.getPoint(1).addBoundaryCondition(force);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setOutputFrequency(0);
+    model.getTimeSolver().setEnabled(false);
+    return model;
+}
+
+RModel buildQuadraticSurfacePatch(RElementType type, double axialStrain)
+{
+    RModel model;
+    if (type == R_ELEMENT_TRI2)
+    {
+        model.setNNodes(6);
+        const RNode nodes[6] = {RNode(0.0,0.0,0.0),RNode(1.0,0.0,0.0),RNode(0.0,1.0,0.0),
+                                RNode(0.5,0.0,0.0),RNode(0.5,0.5,0.0),RNode(0.0,0.5,0.0)};
+        for (uint i=0;i<6;i++) model.getNode(i) = nodes[i];
+    }
+    else
+    {
+        model.setNNodes(9);
+        const RNode nodes[9] = {RNode(0.0,0.0,0.0),RNode(1.0,0.0,0.0),RNode(1.0,1.0,0.0),
+                                RNode(0.0,1.0,0.0),RNode(0.5,0.0,0.0),RNode(1.0,0.5,0.0),
+                                RNode(0.5,1.0,0.0),RNode(0.0,0.5,0.0),RNode(0.5,0.5,0.0)};
+        for (uint i=0;i<9;i++) model.getNode(i) = nodes[i];
+    }
+    RElement element(type);
+    for (uint i=0;i<element.size();i++) element.setNodeId(i,i);
+    model.addElement(element,true,0);
+
+    RMaterial material(RMaterial::Solid);
+    RMaterialProperty modulus(RMaterialProperty::ModulusOfElasiticity);
+    modulus.add(293.15,elasticityModulus); material.add(modulus);
+    RMaterialProperty poisson(RMaterialProperty::PoissonRatio);
+    poisson.add(293.15,0.25); material.add(poisson);
+    RMaterialProperty densityProperty(RMaterialProperty::Density);
+    densityProperty.add(293.15,density); material.add(densityProperty);
+    RMaterialProperty expansion(RMaterialProperty::ThermalExpansionCoefficient);
+    expansion.add(293.15,0.0); material.add(expansion);
+    RSurface &surface = model.getSurface(0);
+    surface.setThickness(0.1);
+    surface.setStructuralFormulation(RElementFormulation::PlaneStress);
+    surface.setMaterial(material);
+
+    RBoundaryCondition transverse(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    transverse.getComponent(transverse.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).setEnabled(false);
+    transverse.getComponent(transverse.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+    transverse.getComponent(transverse.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+    surface.addBoundaryCondition(transverse);
+
+    const std::vector<uint> left = type == R_ELEMENT_TRI2
+                                 ? std::vector<uint>{0,2,5}
+                                 : std::vector<uint>{0,3,7};
+    const std::vector<uint> right = type == R_ELEMENT_TRI2
+                                  ? std::vector<uint>{1}
+                                  : std::vector<uint>{1,2,5};
+    const std::vector<uint> middle = type == R_ELEMENT_TRI2
+                                   ? std::vector<uint>{3,4}
+                                   : std::vector<uint>{4,6,8};
+    for (uint node : left)
+    {
+        RElement point(R_ELEMENT_POINT); point.setNodeId(0,node); model.addElement(point,true,0);
+    }
+    for (uint node : right)
+    {
+        RElement point(R_ELEMENT_POINT); point.setNodeId(0,node); model.addElement(point,true,1);
+    }
+    for (uint node : middle)
+    {
+        RElement point(R_ELEMENT_POINT); point.setNodeId(0,node); model.addElement(point,true,2);
+    }
+    RBoundaryCondition leftBc(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    leftBc.getComponent(leftBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).add(0.0,0.0);
+    leftBc.getComponent(leftBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).setEnabled(false);
+    leftBc.getComponent(leftBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).setEnabled(false);
+    model.getPoint(0).addBoundaryCondition(leftBc);
+    RBoundaryCondition rightBc(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    rightBc.getComponent(rightBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).add(0.0,axialStrain);
+    rightBc.getComponent(rightBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).setEnabled(false);
+    rightBc.getComponent(rightBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).setEnabled(false);
+    model.getPoint(1).addBoundaryCondition(rightBc);
+    RBoundaryCondition middleBc(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    middleBc.getComponent(middleBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).add(0.0,0.5*axialStrain);
+    middleBc.getComponent(middleBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).setEnabled(false);
+    middleBc.getComponent(middleBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).setEnabled(false);
+    model.getPoint(2).addBoundaryCondition(middleBc);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setOutputFrequency(0);
+    model.getTimeSolver().setEnabled(false);
+    return model;
+}
+
 //! Build a clamped-free 3D Euler-Bernoulli frame along global X.
 RModel buildBeam(double tipForceY, double tipForceZ)
 {
@@ -390,7 +528,6 @@ RModel buildBeam(double tipForceY, double tipForceZ)
     gravity.getComponent(gravity.findComponentPosition(R_VARIABLE_G_ACCELERATION_Y)).add(0.0,0.0);
     gravity.getComponent(gravity.findComponentPosition(R_VARIABLE_G_ACCELERATION_Z)).add(0.0,0.0);
     line.addEnvironmentCondition(gravity);
-
     RElement fixedElement(R_ELEMENT_POINT);
     fixedElement.setNodeId(0,0);
     model.addElement(fixedElement,true,0);
@@ -412,6 +549,67 @@ RModel buildBeam(double tipForceY, double tipForceZ)
     model.getMatrixSolverConf(RMatrixSolverConf::CG).setNInnerIterations(1000);
     model.getMatrixSolverConf(RMatrixSolverConf::CG).setNOuterIterations(10000);
     model.getMatrixSolverConf(RMatrixSolverConf::CG).setSolverCvgValue(1.0e-13);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setOutputFrequency(0);
+    model.getTimeSolver().setEnabled(false);
+    return model;
+}
+
+RModel buildQuadraticBeam(double tipForceY)
+{
+    RModel model;
+    model.setNNodes(3);
+    model.getNode(0).set(0.0,0.0,0.0);
+    model.getNode(1).set(0.5*barLength,0.0,0.0);
+    model.getNode(2).set(barLength,0.0,0.0);
+    RElement beam(R_ELEMENT_BEAM2);
+    beam.setNodeId(0,0);
+    beam.setNodeId(1,2);
+    beam.setNodeId(2,1);
+    model.addElement(beam,true,0);
+
+    RMaterial material(RMaterial::Solid);
+    RMaterialProperty modulus(RMaterialProperty::ModulusOfElasiticity);
+    modulus.add(293.15,elasticityModulus); material.add(modulus);
+    RMaterialProperty poisson(RMaterialProperty::PoissonRatio);
+    poisson.add(293.15,0.3); material.add(poisson);
+    RMaterialProperty densityProperty(RMaterialProperty::Density);
+    densityProperty.add(293.15,density); material.add(densityProperty);
+    RMaterialProperty expansion(RMaterialProperty::ThermalExpansionCoefficient);
+    expansion.add(293.15,thermalExpansion); material.add(expansion);
+    RLine &line = model.getLine(0);
+    line.setCrossArea(barArea);
+    line.setSecondMomentY(2.0e-5);
+    line.setSecondMomentZ(5.0e-5);
+    line.setTorsionalConstant(7.0e-5);
+    line.setSectionModulusY(4.0e-4);
+    line.setSectionModulusZ(5.0e-4);
+    line.setTorsionalSectionModulus(6.0e-4);
+    line.setLocalYDirection(RR3Vector(0.0,1.0,0.0));
+    line.setMaterial(material);
+    REnvironmentCondition quadraticGravity(R_ENVIRONMENT_CONDITION_G_ACCELERATION);
+    quadraticGravity.getComponent(quadraticGravity.findComponentPosition(R_VARIABLE_G_ACCELERATION_X)).add(0.0,0.0);
+    quadraticGravity.getComponent(quadraticGravity.findComponentPosition(R_VARIABLE_G_ACCELERATION_Y)).add(0.0,0.0);
+    quadraticGravity.getComponent(quadraticGravity.findComponentPosition(R_VARIABLE_G_ACCELERATION_Z)).add(0.0,0.0);
+    line.addEnvironmentCondition(quadraticGravity);
+
+    RElement fixed(R_ELEMENT_POINT); fixed.setNodeId(0,0); model.addElement(fixed,true,0);
+    RBoundaryCondition displacement(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    displacement.getComponent(displacement.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).add(0.0,0.0);
+    displacement.getComponent(displacement.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+    displacement.getComponent(displacement.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+    model.getPoint(0).addBoundaryCondition(displacement);
+    RBoundaryCondition rotation(R_BOUNDARY_CONDITION_ROTATION);
+    rotation.getComponent(rotation.findComponentPosition(R_VARIABLE_ROTATION_X)).add(0.0,0.0);
+    rotation.getComponent(rotation.findComponentPosition(R_VARIABLE_ROTATION_Y)).add(0.0,0.0);
+    rotation.getComponent(rotation.findComponentPosition(R_VARIABLE_ROTATION_Z)).add(0.0,0.0);
+    model.getPoint(0).addBoundaryCondition(rotation);
+
+    RElement loaded(R_ELEMENT_POINT); loaded.setNodeId(0,2); model.addElement(loaded,true,1);
+    RBoundaryCondition force(R_BOUNDARY_CONDITION_FORCE);
+    force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_X)).add(0.0,0.0);
+    force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_Y)).add(0.0,tipForceY);
+    force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_Z)).add(0.0,0.0);
+    model.getPoint(1).addBoundaryCondition(force);
     model.getMatrixSolverConf(RMatrixSolverConf::CG).setOutputFrequency(0);
     model.getTimeSolver().setEnabled(false);
     return model;
@@ -855,8 +1053,10 @@ private slots:
     void modalAxialBar_data();
     void modalAxialBar();
     void staticTrussBar();
+    void staticQuadraticTrussBar();
     void staticBeamBending_data();
     void staticBeamBending();
+    void staticQuadraticBeamBending();
     void staticBeamRotatedFrame();
     void staticBeamEndMoment();
     void staticBeamTorsion();
@@ -869,6 +1069,8 @@ private slots:
     void modalSurfaceMassMatrices();
     void staticSurfaceFormulations_data();
     void staticSurfaceFormulations();
+    void quadraticSurfacePatch_data();
+    void quadraticSurfacePatch();
     void thermalSurfaceExpansion_data();
     void thermalSurfaceExpansion();
     void axisymmetricThermalExpansion_data();
@@ -1425,6 +1627,63 @@ void TestSolverStress::modalTrussBar_data()
     QTest::newRow("lumped-mass") << int(RMassMatrixType::Lumped) << -1;
 }
 
+void TestSolverStress::staticQuadraticTrussBar()
+{
+    constexpr double tipForce = 1000.0;
+    RModel model = buildQuadraticTruss(tipForce);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+    QString solverError;
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+    const double expectedDisplacement = tipForce*barLength/(elasticityModulus*barArea);
+    const uint tipNode = model.getNNodes()-1;
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,tipNode)-expectedDisplacement)
+            < 1.0e-5*expectedDisplacement);
+    for (uint i=0;i<model.getNNodes();i++)
+    {
+        const double expected = expectedDisplacement*model.getNode(i).getX()/barLength;
+        QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,i)-expected)
+                < 1.0e-5*expectedDisplacement);
+    }
+    const double expectedStress = tipForce/barArea;
+    for (uint i=0;i<4;i++)
+    {
+        QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_NORMAL,i)-expectedStress)
+                < 1.0e-5*expectedStress);
+    }
+}
+
+void TestSolverStress::quadraticSurfacePatch_data()
+{
+    QTest::addColumn<int>("elementType");
+    QTest::newRow("tri6") << int(R_ELEMENT_TRI2);
+    QTest::newRow("quad9") << int(R_ELEMENT_QUAD2);
+}
+
+void TestSolverStress::quadraticSurfacePatch()
+{
+    QFETCH(int,elementType);
+    constexpr double strain = 1.0e-4;
+    RModel model = buildQuadraticSurfacePatch(static_cast<RElementType>(elementType),strain);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+    QString solverError;
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+    constexpr double v = 0.25;
+    const double expectedStressX = elasticityModulus*strain/(1.0-v*v);
+    const double expectedStressY = v*expectedStressX;
+    QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_X,0)-expectedStressX)
+            < 1.0e-8*expectedStressX);
+    QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_Y,0)-expectedStressY)
+            < 1.0e-8*expectedStressX);
+    for (uint node=0;node<model.getNNodes();node++)
+    {
+        const double expected = strain*model.getNode(node).getX();
+        QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,node)-expected)
+                < 1.0e-8*strain);
+    }
+}
+
 //! A tip-loaded Euler-Bernoulli cantilever follows the exact cubic deflection
 //! curve. Distinct Iy and Iz values verify the section-axis convention.
 void TestSolverStress::staticBeamBending_data()
@@ -1474,6 +1733,34 @@ void TestSolverStress::staticBeamBending()
     QVERIFY2(std::fabs(reaction+tipForce) < 1.0e-5*std::fabs(tipForce),
              qPrintable(QString("Beam root reaction = %1 N, expected %2 N")
                         .arg(reaction).arg(-tipForce)));
+}
+
+void TestSolverStress::staticQuadraticBeamBending()
+{
+    constexpr double tipForce = 1200.0;
+    constexpr double iz = 5.0e-5;
+    RModel model = buildQuadraticBeam(tipForce);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+    QString solverError;
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+    const double expectedTip = tipForce*std::pow(barLength,3)/(3.0*elasticityModulus*iz);
+    const double expectedMiddle = tipForce*std::pow(0.5*barLength,2)*(3.0*barLength-0.5*barLength)
+                                /(6.0*elasticityModulus*iz);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,1,2)-expectedTip)
+            < 1.0e-5*expectedTip);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,1,1)-expectedMiddle)
+            < 1.0e-5*expectedTip);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_FORCE,1,0)+tipForce) < 1.0e-5*tipForce);
+    const double expectedStress = tipForce*barLength/model.getLine(0).getSectionModulusZ();
+    const double recoveredStress = elementValue(model,R_VARIABLE_STRESS_NORMAL,0);
+    QVERIFY2(std::fabs(recoveredStress-expectedStress) < 1.0e-5*expectedStress,
+             qPrintable(QString("BEAM2 normal stress = %1 Pa, expected %2 Pa; root moment=%3, ux=%4, uy=%5, uz=%6")
+                        .arg(recoveredStress).arg(expectedStress)
+                        .arg(nodeValue(model,R_VARIABLE_MOMENT,2,0))
+                        .arg(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,2))
+                        .arg(nodeValue(model,R_VARIABLE_DISPLACEMENT,1,2))
+                        .arg(nodeValue(model,R_VARIABLE_DISPLACEMENT,2,2))));
 }
 
 //! A beam aligned with global Z exercises the local-to-global frame transform
