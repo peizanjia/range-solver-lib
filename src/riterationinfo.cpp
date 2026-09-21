@@ -97,10 +97,6 @@ bool RIterationInfo::hasConverged() const
     {
         return true;
     }
-    if (std::abs(this->trend) < std::pow(RConstants::eps,2))
-    {
-        return true;
-    }
     return false;
 }
 

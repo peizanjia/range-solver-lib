@@ -245,9 +245,7 @@ void RMatrixSolver::solveCG(const RSparseMatrix &A, const RRVector &b, RRVector 
     double beta = 0.0;
     double dot = 0.0;
     double alpha = 0.0;
-    double xn = 0.0;
     double rn = 0.0;
-    double An = matrix.norm;
     double bn = 0.0;
 
 #pragma omp parallel default(shared)
@@ -339,32 +337,27 @@ void RMatrixSolver::solveCG(const RSparseMatrix &A, const RRVector &b, RRVector 
 
                 alpha = ro0 / dot;
                 ro1 = ro0;
-                xn = 0.0;
                 rn = 0.0;
             }
 
 #pragma omp barrier
-#pragma omp for reduction(+:xn,rn)
+#pragma omp for reduction(+:rn)
             for (int64_t i=0;i<int64_t(m);i++)
             {
                 x[uint(i)] += alpha * p[uint(i)];
                 r[uint(i)] -= alpha * q[uint(i)];
-                xn += x[uint(i)]*x[uint(i)];
                 rn += r[uint(i)]*r[uint(i)];
             }
 
 #pragma omp master
             {
-                xn = std::sqrt(xn);
                 rn = std::sqrt(rn);
 
-                double norm = An * xn + bn;
-                if (std::abs(norm) < RConstants::eps)
-                {
-                    norm = RConstants::eps;;
-                }
-
-                this->iterationInfo.setError(rn / norm);
+                // A backward-error denominator (||A||*||x||+||b||) can
+                // accept a large force residual in badly scaled systems.
+                // Track the conventional relative residual instead.
+                const double residualScale = std::max(bn,RConstants::eps);
+                this->iterationInfo.setError(rn/residualScale);
                 this->iterationInfo.printIteration();
             }
 
@@ -394,11 +387,9 @@ void RMatrixSolver::solveGMRES(const RSparseMatrix &A, const RRVector &b, RRVect
     RRMatrix z(ninner+1,mA,0.0);
     RRMatrix h(ninner+1,ninner,0.0);
 
-    double An = matrix.norm;
     double bn = RRVector::euclideanNorm(b);
 
     double beta = 0.0;
-    double xn = 0.0;
     double wNorm = 0.0;
     RRVector hValues(ninner+1,0.0);
 
@@ -418,29 +409,22 @@ void RMatrixSolver::solveGMRES(const RSparseMatrix &A, const RRVector &b, RRVect
 
                 // Compute initial residual ro and norm beta
                 beta = 0.0;
-                xn = 0.0;
             }
 #pragma omp barrier
-#pragma omp for reduction(+:xn,beta)
+#pragma omp for reduction(+:beta)
             for (int64_t i=0;i<int64_t(mA);i++)
             {
                 ro[uint(i)] = b[uint(i)] - multiplyRow(matrix,uint(i),x);
-                xn += x[uint(i)]*x[uint(i)];
                 beta += ro[uint(i)]*ro[uint(i)];
             }
 
 #pragma omp master
             {
-                xn = std::sqrt(xn);
                 beta = std::sqrt(beta);
 
                 // Check convergence
-                double norm = An * xn + bn;
-                if (std::fabs(norm) < RConstants::eps)
-                {
-                    norm = RConstants::eps;
-                }
-                this->iterationInfo.setError(beta / norm);
+                const double residualScale = std::max(bn,RConstants::eps);
+                this->iterationInfo.setError(beta/residualScale);
                 this->iterationInfo.printIteration();
             }
 #pragma omp barrier

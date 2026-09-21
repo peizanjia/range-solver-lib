@@ -339,6 +339,81 @@ RModel buildTruss(double tipForce)
     return model;
 }
 
+//! Build a clamped-free 3D Euler-Bernoulli frame along global X.
+RModel buildBeam(double tipForceY, double tipForceZ)
+{
+    constexpr uint beamSlices = 6;
+    constexpr double iy = 2.0e-5;
+    constexpr double iz = 5.0e-5;
+
+    RModel model;
+    model.setNNodes(beamSlices+1);
+    for (uint i=0;i<=beamSlices;i++)
+    {
+        model.getNode(i).set(barLength*double(i)/double(beamSlices),0.0,0.0);
+    }
+    for (uint i=0;i<beamSlices;i++)
+    {
+        RElement element(R_ELEMENT_BEAM1);
+        element.setNodeId(0,i);
+        element.setNodeId(1,i+1);
+        model.addElement(element,true,0);
+    }
+
+    RMaterial material(RMaterial::Solid);
+    RMaterialProperty modulusProperty(RMaterialProperty::ModulusOfElasiticity);
+    modulusProperty.add(293.15,elasticityModulus);
+    material.add(modulusProperty);
+    RMaterialProperty poissonProperty(RMaterialProperty::PoissonRatio);
+    poissonProperty.add(293.15,0.3);
+    material.add(poissonProperty);
+    RMaterialProperty densityProperty(RMaterialProperty::Density);
+    densityProperty.add(293.15,density);
+    material.add(densityProperty);
+    RMaterialProperty expansionProperty(RMaterialProperty::ThermalExpansionCoefficient);
+    expansionProperty.add(293.15,thermalExpansion);
+    material.add(expansionProperty);
+
+    RLine &line = model.getLine(0);
+    line.setName("Frame");
+    line.setCrossArea(barArea);
+    line.setSecondMomentY(iy);
+    line.setSecondMomentZ(iz);
+    line.setTorsionalConstant(iy+iz);
+    line.setLocalYDirection(RR3Vector(0.0,1.0,0.0));
+    line.setMaterial(material);
+    REnvironmentCondition gravity(R_ENVIRONMENT_CONDITION_G_ACCELERATION);
+    gravity.getComponent(gravity.findComponentPosition(R_VARIABLE_G_ACCELERATION_X)).add(0.0,0.0);
+    gravity.getComponent(gravity.findComponentPosition(R_VARIABLE_G_ACCELERATION_Y)).add(0.0,0.0);
+    gravity.getComponent(gravity.findComponentPosition(R_VARIABLE_G_ACCELERATION_Z)).add(0.0,0.0);
+    line.addEnvironmentCondition(gravity);
+
+    RElement fixedElement(R_ELEMENT_POINT);
+    fixedElement.setNodeId(0,0);
+    model.addElement(fixedElement,true,0);
+    RBoundaryCondition fixed(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    fixed.getComponent(fixed.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).add(0.0,0.0);
+    fixed.getComponent(fixed.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+    fixed.getComponent(fixed.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+    model.getPoint(0).addBoundaryCondition(fixed);
+
+    RElement loadedElement(R_ELEMENT_POINT);
+    loadedElement.setNodeId(0,beamSlices);
+    model.addElement(loadedElement,true,1);
+    RBoundaryCondition load(R_BOUNDARY_CONDITION_FORCE);
+    load.getComponent(load.findComponentPosition(R_VARIABLE_FORCE_X)).add(0.0,0.0);
+    load.getComponent(load.findComponentPosition(R_VARIABLE_FORCE_Y)).add(0.0,tipForceY);
+    load.getComponent(load.findComponentPosition(R_VARIABLE_FORCE_Z)).add(0.0,tipForceZ);
+    model.getPoint(1).addBoundaryCondition(load);
+
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setNInnerIterations(1000);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setNOuterIterations(10000);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setSolverCvgValue(1.0e-13);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setOutputFrequency(0);
+    model.getTimeSolver().setEnabled(false);
+    return model;
+}
+
 //! Build a membrane strip in the XY plane. Its transverse in-plane strain and
 //! out-of-plane displacement are restrained so the two constitutive contracts
 //! have distinct closed-form axial stiffness and transverse stress values.
@@ -777,6 +852,11 @@ private slots:
     void modalAxialBar_data();
     void modalAxialBar();
     void staticTrussBar();
+    void staticBeamBending_data();
+    void staticBeamBending();
+    void staticBeamRotatedFrame();
+    void modalBeamBending_data();
+    void modalBeamBending();
     void modalTrussBar_data();
     void modalTrussBar();
     void modalSurfaceMassMatrices_data();
@@ -1337,6 +1417,125 @@ void TestSolverStress::modalTrussBar_data()
     QTest::addColumn<int>("expectedBias");
     QTest::newRow("consistent-mass") << int(RMassMatrixType::Consistent) << 1;
     QTest::newRow("lumped-mass") << int(RMassMatrixType::Lumped) << -1;
+}
+
+//! A tip-loaded Euler-Bernoulli cantilever follows the exact cubic deflection
+//! curve. Distinct Iy and Iz values verify the section-axis convention.
+void TestSolverStress::staticBeamBending_data()
+{
+    QTest::addColumn<int>("component");
+    QTest::addColumn<double>("tipForce");
+    QTest::addColumn<double>("secondMoment");
+    QTest::newRow("local-y-bending-about-z") << 1 << 1200.0 << 5.0e-5;
+    QTest::newRow("local-z-bending-about-y") << 2 << -900.0 << 2.0e-5;
+}
+
+void TestSolverStress::staticBeamBending()
+{
+    QFETCH(int,component);
+    QFETCH(double,tipForce);
+    QFETCH(double,secondMoment);
+    RModel model = buildBeam(component == 1 ? tipForce : 0.0,
+                             component == 2 ? tipForce : 0.0);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+
+    QString solverError;
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+    const uint beamSlices = 6;
+    const double expectedTip = tipForce*barLength*barLength*barLength
+                             /(3.0*elasticityModulus*secondMoment);
+    const double computedTip = nodeValue(model,R_VARIABLE_DISPLACEMENT,uint(component),beamSlices);
+    QVERIFY2(std::fabs(computedTip-expectedTip) < 1.0e-5*std::fabs(expectedTip),
+             qPrintable(QString("Beam tip displacement = %1 m, expected %2 m")
+                        .arg(computedTip).arg(expectedTip)));
+
+    for (uint i=0;i<=beamSlices;i++)
+    {
+        const double x = barLength*double(i)/double(beamSlices);
+        const double expected = tipForce*x*x*(3.0*barLength-x)
+                              /(6.0*elasticityModulus*secondMoment);
+        const double value = nodeValue(model,R_VARIABLE_DISPLACEMENT,uint(component),i);
+        QVERIFY2(std::fabs(value-expected) < 1.0e-5*std::fabs(expectedTip),
+                 qPrintable(QString("Beam node %1 displacement = %2 m, expected %3 m")
+                            .arg(i).arg(value).arg(expected)));
+        QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,i)) < 1.0e-12);
+        const uint other = component == 1 ? 2u : 1u;
+        QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,other,i)) < 1.0e-12);
+    }
+
+    const double reaction = nodeValue(model,R_VARIABLE_FORCE,uint(component),0);
+    QVERIFY2(std::fabs(reaction+tipForce) < 1.0e-5*std::fabs(tipForce),
+             qPrintable(QString("Beam root reaction = %1 N, expected %2 N")
+                        .arg(reaction).arg(-tipForce)));
+}
+
+//! A beam aligned with global Z exercises the local-to-global frame transform
+//! while retaining the same local-Y bending reference solution.
+void TestSolverStress::staticBeamRotatedFrame()
+{
+    constexpr uint beamSlices = 6;
+    constexpr double tipForce = 1200.0;
+    constexpr double iz = 5.0e-5;
+    RModel model = buildBeam(tipForce,0.0);
+    for (uint i=0;i<=beamSlices;i++)
+    {
+        model.getNode(i).set(0.0,0.0,barLength*double(i)/double(beamSlices));
+    }
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+
+    QString solverError;
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+    const double expectedTip = tipForce*std::pow(barLength,3)
+                             /(3.0*elasticityModulus*iz);
+    const double computedTip = nodeValue(model,R_VARIABLE_DISPLACEMENT,1,beamSlices);
+    QVERIFY2(std::fabs(computedTip-expectedTip) < 1.0e-5*expectedTip,
+             qPrintable(QString("Rotated beam tip displacement = %1 m, expected %2 m")
+                        .arg(computedTip).arg(expectedTip)));
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,beamSlices)) < 1.0e-12);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,2,beamSlices)) < 1.0e-12);
+    QVERIFY2(std::fabs(nodeValue(model,R_VARIABLE_FORCE,1,0)+tipForce) < 1.0e-5*tipForce,
+             "Rotated beam root reaction does not balance the tip load");
+}
+
+//! The first cantilever mode checks the BEAM1 mass matrix together with the
+//! rotational DOFs. The weaker Iy axis must govern the fundamental frequency.
+void TestSolverStress::modalBeamBending_data()
+{
+    QTest::addColumn<int>("massMatrixType");
+    QTest::newRow("consistent-mass") << int(RMassMatrixType::Consistent);
+    QTest::newRow("lumped-mass") << int(RMassMatrixType::Lumped);
+}
+
+void TestSolverStress::modalBeamBending()
+{
+    QFETCH(int,massMatrixType);
+    RModel model = buildBeam(0.0,0.0);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS_MODAL));
+    model.getProblemSetup().setMassMatrixType(
+        static_cast<RMassMatrixType>(massMatrixType));
+
+    RModalSetup &modalSetup = model.getProblemSetup().getModalSetup();
+    modalSetup.setMethod(R_MODAL_MULTIPLE_MODES);
+    modalSetup.setNModesToExtract(4);
+    modalSetup.setNIterations(400);
+    modalSetup.setConvergenceValue(1.0e-11);
+
+    QString solverError;
+    QVERIFY2(runSolver(model,solverError),qPrintable(solverError));
+
+    constexpr double beta1 = 1.875104068711961;
+    constexpr double weakSecondMoment = 2.0e-5;
+    const double expectedFrequency = beta1*beta1/(2.0*std::acos(-1.0))
+                                   * std::sqrt(elasticityModulus*weakSecondMoment
+                                               /(density*barArea*std::pow(barLength,4)));
+    const double frequency = modalSetup.getFrequency();
+    QVERIFY2(std::isfinite(frequency) && frequency > 0.0,
+             qPrintable(QString("Beam frequency = %1 Hz is not usable").arg(frequency)));
+    QVERIFY2(std::fabs(frequency-expectedFrequency) < 0.04*expectedFrequency,
+             qPrintable(QString("Beam fundamental frequency = %1 Hz, expected %2 Hz")
+                        .arg(frequency).arg(expectedFrequency)));
 }
 
 void TestSolverStress::modalTrussBar()

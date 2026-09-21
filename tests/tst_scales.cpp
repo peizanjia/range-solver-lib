@@ -11,6 +11,7 @@ private slots:
     void defaultsAreUnity();
     void settersAndGetters();
     void copyAndAssignment();
+    void beamSectionScalesWithLength();
 };
 
 void TestScales::defaultsAreUnity()
@@ -57,6 +58,39 @@ void TestScales::copyAndAssignment()
     // Modifying the original must not affect the copy.
     scales.setMetre(9.0);
     QCOMPARE(copy.getMetre(), 2.5);
+}
+
+void TestScales::beamSectionScalesWithLength()
+{
+    RModel model;
+    model.setNNodes(2);
+    model.getNode(1).set(2.0,0.0,0.0);
+    RElement element(R_ELEMENT_BEAM1);
+    element.setNodeId(0,0);
+    element.setNodeId(1,1);
+    model.addElement(element,true,0);
+
+    RLine &line = model.getLine(0);
+    line.setCrossArea(0.02);
+    line.setSecondMomentY(2.0e-5);
+    line.setSecondMomentZ(3.0e-5);
+    line.setTorsionalConstant(4.0e-5);
+
+    RScales scales;
+    scales.setMetre(0.5);
+    scales.downscale(model);
+    QCOMPARE(model.getNode(1).getX(),1.0);
+    QCOMPARE(line.getCrossArea(),0.005);
+    QCOMPARE(line.getSecondMomentY(),1.25e-6);
+    QCOMPARE(line.getSecondMomentZ(),1.875e-6);
+    QCOMPARE(line.getTorsionalConstant(),2.5e-6);
+
+    scales.upscale(model);
+    QCOMPARE(model.getNode(1).getX(),2.0);
+    QCOMPARE(line.getCrossArea(),0.02);
+    QCOMPARE(line.getSecondMomentY(),2.0e-5);
+    QCOMPARE(line.getSecondMomentZ(),3.0e-5);
+    QCOMPARE(line.getTorsionalConstant(),4.0e-5);
 }
 
 QTEST_APPLESS_MAIN(TestScales)

@@ -30,6 +30,8 @@ class RSolverStress : public RSolverGeneric
         RRMatrix nodePrescribedDisplacement;
         //! Node displacement vector.
         RSolverCartesianVector<RRVector> nodeDisplacement;
+        //! Node rotation vector used by frame elements.
+        RSolverCartesianVector<RRVector> nodeRotation;
         //! Node initial displacement vector.
         RSolverCartesianVector<RRVector> nodeInitialDisplacement;
         //! Node force vector.

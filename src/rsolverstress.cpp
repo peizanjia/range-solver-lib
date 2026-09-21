@@ -31,6 +31,229 @@ bool findTranslationComponent(RDofType dof, uint &component)
     }
 }
 
+bool findRotationComponent(RDofType dof, uint &component)
+{
+    switch (dof)
+    {
+        case RDofType::RX: component = 0; return true;
+        case RDofType::RY: component = 1; return true;
+        case RDofType::RZ: component = 2; return true;
+        default: return false;
+    }
+}
+
+void addSymmetric(RRMatrix &matrix, uint row, uint column, double value)
+{
+    matrix[row][column] += value;
+    if (row != column)
+    {
+        matrix[column][row] += value;
+    }
+}
+
+//! Build a right-handed frame transformation. T maps local frame DOFs to
+//! global DOFs and uses [u,v,w,rx,ry,rz] at each of the two nodes.
+double buildBeamTransformation(const RLine &line,
+                               const RElement &element,
+                               const std::vector<RNode> &nodes,
+                               RRMatrix &rotation,
+                               RRMatrix &transformation)
+{
+    R_ERROR_ASSERT(element.getType() == R_ELEMENT_BEAM1 && element.size() == 2);
+    const RR3Vector p0(nodes[element.getNodeId(0)].toVector());
+    const RR3Vector p1(nodes[element.getNodeId(1)].toVector());
+    RR3Vector ex;
+    RR3Vector::subtract(p1,p0,ex);
+    const double length = ex.normalize();
+    if (length <= RConstants::eps)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,"Beam element %u has zero length.",element.getNodeId(0));
+    }
+
+    RR3Vector ey(line.getLocalYDirection());
+    const double projection = RRVector::dot(ey,ex);
+    for (uint i=0;i<3;i++)
+    {
+        ey[i] -= projection*ex[i];
+    }
+    if (ey.normalize() <= 1.0e-12)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Beam section local Y direction is parallel to element axis.");
+    }
+    RR3Vector ez;
+    RR3Vector::cross(ex,ey,ez);
+    ez.normalize();
+    RR3Vector::cross(ez,ex,ey);
+    ey.normalize();
+
+    rotation.resize(3,3,0.0);
+    for (uint i=0;i<3;i++)
+    {
+        rotation[i][0] = ex[i];
+        rotation[i][1] = ey[i];
+        rotation[i][2] = ez[i];
+    }
+
+    transformation.setIdentity(12);
+    for (uint node=0;node<2;node++)
+    {
+        transformation.setBlock(rotation,6*node,6*node);
+        transformation.setBlock(rotation,6*node+3,6*node+3);
+    }
+    return length;
+}
+
+//! Build a two-node 3D Euler-Bernoulli frame element in global coordinates.
+void buildBeamElement(const RLine &line,
+                      const RElement &element,
+                      const std::vector<RNode> &nodes,
+                      double elasticity,
+                      double poissonRatio,
+                      double density,
+                      double thermalExpansion,
+                      double temperatureChange,
+                      const RR3Vector &distributedForce,
+                      bool needsMass,
+                      bool lumpedMass,
+                      RRMatrix &mass,
+                      RRMatrix &stiffness,
+                      RRVector &force)
+{
+    const double area = line.getCrossArea();
+    const double iy = line.getSecondMomentY();
+    const double iz = line.getSecondMomentZ();
+    const double torsion = line.getTorsionalConstant();
+    if (area <= 0.0 || iy <= 0.0 || iz <= 0.0 || torsion <= 0.0)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "BEAM1 requires positive A, Iy, Iz and J on line '%s'.",
+                     line.getName().toUtf8().constData());
+    }
+    if (poissonRatio <= -1.0)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,"Beam Poisson ratio must be greater than -1.");
+    }
+
+    RRMatrix rotation,transformation;
+    const double length = buildBeamTransformation(line,element,nodes,rotation,transformation);
+    const double length2 = length*length;
+    const double length3 = length2*length;
+    const double shearModulus = elasticity/(2.0*(1.0+poissonRatio));
+
+    RRMatrix localK(12,12,0.0);
+    const double axial = elasticity*area/length;
+    addSymmetric(localK,0,0,axial);
+    addSymmetric(localK,6,6,axial);
+    addSymmetric(localK,0,6,-axial);
+
+    const double torsional = shearModulus*torsion/length;
+    addSymmetric(localK,3,3,torsional);
+    addSymmetric(localK,9,9,torsional);
+    addSymmetric(localK,3,9,-torsional);
+
+    const double bz = elasticity*iz/length3;
+    localK[1][1] += 12.0*bz; localK[5][5] += 4.0*length2*bz;
+    localK[7][7] += 12.0*bz; localK[11][11] += 4.0*length2*bz;
+    addSymmetric(localK,1,5,6.0*length*bz);
+    addSymmetric(localK,1,7,-12.0*bz);
+    addSymmetric(localK,1,11,6.0*length*bz);
+    addSymmetric(localK,5,7,-6.0*length*bz);
+    addSymmetric(localK,5,11,2.0*length2*bz);
+    addSymmetric(localK,7,11,-6.0*length*bz);
+
+    const double by = elasticity*iy/length3;
+    localK[2][2] += 12.0*by; localK[4][4] += 4.0*length2*by;
+    localK[8][8] += 12.0*by; localK[10][10] += 4.0*length2*by;
+    addSymmetric(localK,2,4,-6.0*length*by);
+    addSymmetric(localK,2,8,-12.0*by);
+    addSymmetric(localK,2,10,-6.0*length*by);
+    addSymmetric(localK,4,8,6.0*length*by);
+    addSymmetric(localK,4,10,2.0*length2*by);
+    addSymmetric(localK,8,10,6.0*length*by);
+
+    RRMatrix transformationT;
+    transformationT.transpose(transformation);
+    RRMatrix temporary;
+    RRMatrix::mlt(transformation,localK,temporary);
+    RRMatrix::mlt(temporary,transformationT,stiffness);
+
+    RRVector localForce(12,0.0);
+    localForce[0] -= elasticity*area*thermalExpansion*temperatureChange;
+    localForce[6] += elasticity*area*thermalExpansion*temperatureChange;
+
+    RRMatrix rotationT;
+    rotationT.transpose(rotation);
+    RR3Vector localDistributedForce;
+    RRMatrix::mlt(rotationT,distributedForce,localDistributedForce);
+    localForce[0] += localDistributedForce[0]*length/2.0;
+    localForce[6] += localDistributedForce[0]*length/2.0;
+    localForce[1] += localDistributedForce[1]*length/2.0;
+    localForce[7] += localDistributedForce[1]*length/2.0;
+    localForce[5] += localDistributedForce[1]*length2/12.0;
+    localForce[11] -= localDistributedForce[1]*length2/12.0;
+    localForce[2] += localDistributedForce[2]*length/2.0;
+    localForce[8] += localDistributedForce[2]*length/2.0;
+    localForce[4] -= localDistributedForce[2]*length2/12.0;
+    localForce[10] += localDistributedForce[2]*length2/12.0;
+    RRMatrix::mlt(transformation,localForce,force);
+
+    mass.resize(12,12,0.0);
+    if (!needsMass)
+    {
+        return;
+    }
+
+    RRMatrix localMass(12,12,0.0);
+    if (lumpedMass)
+    {
+        const double nodalMass = density*area*length/2.0;
+        for (uint node=0;node<2;node++)
+        {
+            localMass[6*node+0][6*node+0] = nodalMass;
+            localMass[6*node+1][6*node+1] = nodalMass;
+            localMass[6*node+2][6*node+2] = nodalMass;
+            localMass[6*node+3][6*node+3] = density*(iy+iz)*length/2.0;
+            localMass[6*node+4][6*node+4] = density*iy*length/2.0;
+            localMass[6*node+5][6*node+5] = density*iz*length/2.0;
+        }
+    }
+    else
+    {
+        const double axialMass = density*area*length/6.0;
+        localMass[0][0] += 2.0*axialMass; localMass[6][6] += 2.0*axialMass;
+        addSymmetric(localMass,0,6,axialMass);
+
+        const double torsionalMass = density*(iy+iz)*length/6.0;
+        localMass[3][3] += 2.0*torsionalMass; localMass[9][9] += 2.0*torsionalMass;
+        addSymmetric(localMass,3,9,torsionalMass);
+
+        const double bendingMass = density*area*length/420.0;
+        const uint v[4] = {1,5,7,11};
+        const double mv[4][4] = {
+            {156.0,22.0*length,54.0,-13.0*length},
+            {22.0*length,4.0*length2,13.0*length,-3.0*length2},
+            {54.0,13.0*length,156.0,-22.0*length},
+            {-13.0*length,-3.0*length2,-22.0*length,4.0*length2}};
+        const uint w[4] = {2,4,8,10};
+        const double mw[4][4] = {
+            {156.0,-22.0*length,54.0,13.0*length},
+            {-22.0*length,4.0*length2,-13.0*length,-3.0*length2},
+            {54.0,-13.0*length,156.0,22.0*length},
+            {13.0*length,-3.0*length2,22.0*length,4.0*length2}};
+        for (uint i=0;i<4;i++)
+        {
+            for (uint j=0;j<4;j++)
+            {
+                localMass[v[i]][v[j]] += bendingMass*mv[i][j];
+                localMass[w[i]][w[j]] += bendingMass*mw[i][j];
+            }
+        }
+    }
+    RRMatrix::mlt(transformation,localMass,temporary);
+    RRMatrix::mlt(temporary,transformationT,mass);
+}
+
 void lumpMassMatrix(RRMatrix &matrix)
 {
     R_ERROR_ASSERT(matrix.getNRows() == matrix.getNColumns());
@@ -258,6 +481,10 @@ void RSolverStress::recover()
     this->recoverVariable(R_VARIABLE_FORCE,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),2,this->nodeForce.z,0.0);
     this->recoverVariable(R_VARIABLE_PRESSURE,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),0,this->nodePressure,0.0);
 
+    this->nodeRotation.x.resize(this->pModel->getNNodes(),0.0);
+    this->nodeRotation.y.resize(this->pModel->getNNodes(),0.0);
+    this->nodeRotation.z.resize(this->pModel->getNNodes(),0.0);
+
 //    this->syncShared("node-displacement-x",this->nodeDisplacement.x);
 //    this->syncShared("node-displacement-y",this->nodeDisplacement.y);
 //    this->syncShared("node-displacement-z",this->nodeDisplacement.z);
@@ -475,6 +702,46 @@ void RSolverStress::prepare()
 
                 const RElement &element = this->pModel->getElement(elementID);
                 R_ERROR_ASSERT(R_ELEMENT_TYPE_IS_LINE(element.getType()));
+
+                double lineLength = 0.0;
+                element.findLength(this->pModel->getNodes(),lineLength);
+                if (element.getType() == R_ELEMENT_BEAM1)
+                {
+                    if (lineLength <= RConstants::eps)
+                    {
+                        throw RError(RError::Type::InvalidInput,R_ERROR_REF,"BEAM1 element has zero length.");
+                    }
+                    RRMatrix Me,Ke;
+                    RRVector fe;
+                    RR3Vector distributedForce(
+                        elementForce.x[elementID]/lineLength
+                            + elementWeight[elementID]*elementGravity.x[elementID]/lineLength
+                            + elementGravity.x[elementID]*this->elementDensity[elementID]*lineCrossArea,
+                        elementForce.y[elementID]/lineLength
+                            + elementWeight[elementID]*elementGravity.y[elementID]/lineLength
+                            + elementGravity.y[elementID]*this->elementDensity[elementID]*lineCrossArea,
+                        elementForce.z[elementID]/lineLength
+                            + elementWeight[elementID]*elementGravity.z[elementID]/lineLength
+                            + elementGravity.z[elementID]*this->elementDensity[elementID]*lineCrossArea);
+                    buildBeamElement(line,element,this->pModel->getNodes(),
+                                     this->elementElasticityModulus[elementID],
+                                     this->elementPoissonRatio[elementID],
+                                     this->elementDensity[elementID],
+                                     this->elementThermalExpansion[elementID],
+                                     this->elementTemperature[elementID]-this->elementEnvironmentTemperature[elementID],
+                                     distributedForce,needsMass,lumpedMass,Me,Ke,fe);
+                    this->assemblyMatrix(elementID,Me,Ke,fe,
+                                         Ap[uint(omp_get_thread_num())],
+                                         bp[uint(omp_get_thread_num())],
+                                         Mp[uint(omp_get_thread_num())]);
+                    continue;
+                }
+                if (element.getType() != R_ELEMENT_TRUSS1)
+                {
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Line element type '%s' is not implemented by the structural solver.",
+                                 RElement::getName(element.getType()).toUtf8().constData());
+                }
                 uint nInp = RElement::getNIntegrationPoints(element.getType());
                 RRMatrix Me(element.size()*3,element.size()*3,0.0);
                 RRMatrix Ke(element.size()*3,element.size()*3,0.0);
@@ -484,9 +751,6 @@ void RSolverStress::prepare()
                 RRMatrix BeT(1,3*element.size());
                 RRMatrix Met(element.size(),element.size(),0.0);
                 RRMatrix MeRt(element.size()*3,element.size(),0.0);
-
-                double lineLength = 0.0;
-                element.findLength(this->pModel->getNodes(),lineLength);
 
                 double E = this->elementElasticityModulus[elementID];
                 double De = E * lineCrossArea;
@@ -1083,6 +1347,7 @@ void RSolverStress::setDisplacement(const RRVector &v)
     {
         uint position;
         RR3Vector du(0.0,0.0,0.0);
+        RR3Vector dr(0.0,0.0,0.0);
 
         for (uint c=0;c<3;c++)
         {
@@ -1098,9 +1363,21 @@ void RSolverStress::setDisplacement(const RRVector &v)
             }
         }
 
+        for (uint c=0;c<3;c++)
+        {
+            const RDofType dof = c == 0 ? RDofType::RX
+                                : c == 1 ? RDofType::RY
+                                         : RDofType::RZ;
+            if (this->equationBook.getValue(i,dof,position))
+            {
+                dr[c] = v[position];
+            }
+        }
+
         if (this->localRotations[i].isActive())
         {
             this->localRotations[i].rotateResultsVector(du);
+            this->localRotations[i].rotateResultsVector(dr);
         }
 
         if (this->problemType == R_PROBLEM_STRESS_MODAL)
@@ -1113,6 +1390,9 @@ void RSolverStress::setDisplacement(const RRVector &v)
         this->nodeDisplacement.x[i] = du[0];
         this->nodeDisplacement.y[i] = du[1];
         this->nodeDisplacement.z[i] = du[2];
+        this->nodeRotation.x[i] = dr[0];
+        this->nodeRotation.y[i] = dr[1];
+        this->nodeRotation.z[i] = dr[2];
     }
 }
 
@@ -1198,6 +1478,66 @@ void RSolverStress::process()
 
                 const RElement &element = this->pModel->getElement(elementID);
                 R_ERROR_ASSERT(R_ELEMENT_TYPE_IS_LINE(element.getType()));
+                if (element.getType() == R_ELEMENT_BEAM1)
+                {
+                    RRMatrix Me,Ke;
+                    RRVector thermalForce;
+                    buildBeamElement(line,element,this->pModel->getNodes(),
+                                     this->elementElasticityModulus[elementID],
+                                     this->elementPoissonRatio[elementID],
+                                     this->elementDensity[elementID],
+                                     this->elementThermalExpansion[elementID],
+                                     this->elementTemperature[elementID]-this->elementEnvironmentTemperature[elementID],
+                                     RR3Vector(0.0,0.0,0.0),false,false,Me,Ke,thermalForce);
+                    RRVector xe(12,0.0);
+                    for (uint node=0;node<2;node++)
+                    {
+                        const uint nodeId = element.getNodeId(node);
+                        xe[6*node+0] = this->nodeDisplacement.x[nodeId];
+                        xe[6*node+1] = this->nodeDisplacement.y[nodeId];
+                        xe[6*node+2] = this->nodeDisplacement.z[nodeId];
+                        xe[6*node+3] = this->nodeRotation.x[nodeId];
+                        xe[6*node+4] = this->nodeRotation.y[nodeId];
+                        xe[6*node+5] = this->nodeRotation.z[nodeId];
+                    }
+                    RRVector internalForce;
+                    RRMatrix::mlt(Ke,xe,internalForce);
+                    for (uint dof=0;dof<internalForce.size();dof++)
+                    {
+                        internalForce[dof] -= thermalForce[dof];
+                    }
+                    #pragma omp critical
+                    {
+                        for (uint node=0;node<2;node++)
+                        {
+                            const uint nodeId = element.getNodeId(node);
+                            this->nodeForce.x[nodeId] += internalForce[6*node+0];
+                            this->nodeForce.y[nodeId] += internalForce[6*node+1];
+                            this->nodeForce.z[nodeId] += internalForce[6*node+2];
+                        }
+                    }
+
+                    RRMatrix rotation,transformation,transformationT;
+                    const double length = buildBeamTransformation(line,element,this->pModel->getNodes(),rotation,transformation);
+                    transformationT.transpose(transformation);
+                    RRVector localDisplacement;
+                    RRMatrix::mlt(transformationT,xe,localDisplacement);
+                    const double axialStress = this->elementElasticityModulus[elementID]
+                                             * ((localDisplacement[6]-localDisplacement[0])/length
+                                                - this->elementThermalExpansion[elementID]
+                                                * (this->elementTemperature[elementID]-this->elementEnvironmentTemperature[elementID]));
+                    this->elementStress[0][elementID] = axialStress;
+                    this->elementNormalStress[elementID] = axialStress;
+                    this->elementShearStress[elementID] = 0.0;
+                    this->elementVonMisses[elementID] = std::fabs(axialStress);
+                    continue;
+                }
+                if (element.getType() != R_ELEMENT_TRUSS1)
+                {
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Line element type '%s' is not implemented by result recovery.",
+                                 RElement::getName(element.getType()).toUtf8().constData());
+                }
                 uint nInp = RElement::getNIntegrationPoints(element.getType());
                 RRMatrix Ke(element.size()*3,element.size()*3,0.0);
                 RRVector fe(element.size()*3,0.0);
@@ -2399,6 +2739,15 @@ void RSolverStress::generateEquationBook()
         {
             this->equationBook.disable(i,translationDof(j));
         }
+        // Until explicit rotational boundary-condition components are added,
+        // a node fixed in all three translations represents a clamped frame
+        // node. Partial translational constraints do not suppress rotations.
+        if (this->nodeConstrainedDirections[i] == 3)
+        {
+            this->equationBook.disable(i,RDofType::RX);
+            this->equationBook.disable(i,RDofType::RY);
+            this->equationBook.disable(i,RDofType::RZ);
+        }
     }
 }
 
@@ -2447,6 +2796,13 @@ void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRM
                             oldValue = component == 0 ? this->nodeDisplacement.x[nodeId]
                                      : component == 1 ? this->nodeDisplacement.y[nodeId]
                                                       : this->nodeDisplacement.z[nodeId];
+                        }
+                        else if (findRotationComponent(elementDofs[j],component))
+                        {
+                            const uint nodeId = rElement.getNodeId(n);
+                            oldValue = component == 0 ? this->nodeRotation.x[nodeId]
+                                     : component == 1 ? this->nodeRotation.y[nodeId]
+                                                      : this->nodeRotation.z[nodeId];
                         }
                         be[row] += (Me[row][column] - (1.0-alpha)*dt*Ke[row][column])*oldValue;
                     }

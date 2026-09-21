@@ -268,12 +268,14 @@ void RScales::convert(RModel &model, bool invert) const
     double lengthScale = this->findScaleFactor(R_VARIABLE_LENGTH);
     double areaScale = this->findScaleFactor(R_VARIABLE_AREA);
     double volumeScale = this->findScaleFactor(R_VARIABLE_VOLUME);
+    double fourthMomentScale = std::pow(lengthScale,4);
 
     if (invert)
     {
         lengthScale = 1.0/lengthScale;
         areaScale = 1.0/areaScale;
         volumeScale = 1.0/volumeScale;
+        fourthMomentScale = 1.0/fourthMomentScale;
     }
 
     // Collect condition components once - the list is shared read-only by
@@ -336,6 +338,9 @@ void RScales::convert(RModel &model, bool invert) const
         {
             RLine &rLine = model.getLine(i);
             rLine.setCrossArea(rLine.getCrossArea()*areaScale);
+            rLine.setSecondMomentY(rLine.getSecondMomentY()*fourthMomentScale);
+            rLine.setSecondMomentZ(rLine.getSecondMomentZ()*fourthMomentScale);
+            rLine.setTorsionalConstant(rLine.getTorsionalConstant()*fourthMomentScale);
         }
 #pragma omp for
         for (int64_t i=0;i<int64_t(model.getNSurfaces());i++)
