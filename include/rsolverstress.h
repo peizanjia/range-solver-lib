@@ -94,6 +94,14 @@ class RSolverStress : public RSolverGeneric
         //! Linear dynamics reuses matrices; reject unsupported time variation.
         RSparseMatrix dynamicMassReference;
         RSparseMatrix dynamicStiffnessReference;
+        //! Free-to-prescribed support blocks (rows are free equations).
+        RSparseMatrix motionStiffness;
+        RSparseMatrix motionMass;
+        RSparseMatrix dynamicMotionStiffnessReference;
+        RSparseMatrix dynamicMotionMassReference;
+        std::vector<RStructuralPrescribedMotion> prescribedMotions;
+        std::vector<int> motionIndexByNodeDof;
+        QString dynamicMotionDefinitionReference;
         RRMatrix dynamicConstraintNullspaceReference;
         RRVector dynamicConstraintParticularReference;
         std::vector<double> dynamicBoundaryReference;
@@ -197,6 +205,11 @@ class RSolverStress : public RSolverGeneric
 
         //! Stable digest of the reduced operator, constraint map and held supports.
         QString dynamicSystemFingerprint() const;
+        QString motionDefinitionFingerprint() const;
+        void preparePrescribedMotions();
+        RStructuralMotionState scaledMotionState(const RStructuralPrescribedMotion &motion, double time) const;
+        void motionEffectiveForce(double time, RRVector &force) const;
+        void setPrescribedMotionResults(double time);
 
         //! Return true if given component of the boundary condition is present
         //! and switched on.
@@ -207,7 +220,7 @@ class RSolverStress : public RSolverGeneric
         double findComponentValue(const RBoundaryCondition &bc, RVariableType variableType) const;
 
         //! Assembly matrix
-        void assemblyMatrix(unsigned int elementID, const RRMatrix &Me, const RRMatrix &Ke, const RRVector &fe, RSparseMatrix &Ap, RRVector &bp, RSparseMatrix &Mp);
+        void assemblyMatrix(unsigned int elementID, const RRMatrix &Me, const RRMatrix &Ke, const RRVector &fe, RSparseMatrix &Ap, RRVector &bp, RSparseMatrix &Mp, RSparseMatrix &Kfc, RSparseMatrix &Mfc);
 
         //! Apply local rotations to matrix.
         void applyLocalRotations(unsigned int elementID, RRMatrix &Ae);

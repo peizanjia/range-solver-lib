@@ -96,6 +96,21 @@ RModel makeTruss(uint steps)
     return model;
 }
 
+void addMovingSupport(RModel &model)
+{
+    RStructuralPrescribedMotion motion;
+    motion.id = "restart-base-motion";
+    motion.target = {0,RDofType::UX};
+    const double endTime = (firstSegmentSteps+secondSegmentSteps)*stepSize;
+    // Nontrivial 17-digit data detects lossy ASCII serialization and a
+    // fingerprint that rounds control trajectories like material operators.
+    motion.knots = {{0.0,0.0,0.031415926535897932,1012.345678901234},
+                    {endTime,0.000023456789012345678,0.11728182845904524,
+                     -345.6789012345678}};
+    model.getProblemSetup().getStructuralInteractionSetup()
+         .getPrescribedMotions().push_back(motion);
+}
+
 bool solve(RModel &model, QString &error)
 {
     error.clear();
@@ -169,6 +184,9 @@ class TestStructuralDynamicsRestartIO : public QObject
 private slots:
     void diskRestartMatchesUninterrupted_data();
     void diskRestartMatchesUninterrupted();
+    void movingSupportDiskRestartMatchesUninterrupted_data();
+    void movingSupportDiskRestartMatchesUninterrupted();
+    void movingSupportRejectsChangedKnot();
     void rejectsTamperedCheckpoint();
     void rejectsChangedMesh();
 };
@@ -260,6 +278,87 @@ void TestStructuralDynamicsRestartIO::diskRestartMatchesUninterrupted()
                  qPrintable(QString("Disk restart mismatch for variable %1").arg(int(type))));
     }
     QVERIFY(close(mechanicalEnergy(resumed),mechanicalEnergy(uninterrupted),1.0e-10));
+}
+
+void TestStructuralDynamicsRestartIO::movingSupportDiskRestartMatchesUninterrupted_data()
+{
+    QTest::addColumn<bool>("binary");
+    QTest::newRow("ascii-ram") << false;
+    QTest::newRow("binary-rbm") << true;
+}
+
+void TestStructuralDynamicsRestartIO::movingSupportDiskRestartMatchesUninterrupted()
+{
+    QFETCH(bool,binary);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    RModel uninterrupted = makeTruss(firstSegmentSteps+secondSegmentSteps);
+    RModel firstSegment = makeTruss(firstSegmentSteps);
+    addMovingSupport(uninterrupted);
+    addMovingSupport(firstSegment);
+    QString error;
+    QVERIFY2(solve(uninterrupted,error),qPrintable(error));
+    QVERIFY2(solve(firstSegment,error),qPrintable(error));
+    const auto &savedMotion = firstSegment.getProblemSetup()
+        .getStructuralInteractionSetup().getPrescribedMotions().front();
+    const QString path = directory.filePath(binary ? "motion-accepted.rbm" : "motion-accepted.ram");
+    QCOMPARE(firstSegment.write(path,false),path);
+    RModel resumed;
+    QVERIFY2(load(resumed,path,error),qPrintable(error));
+    const auto &loadedMotions = resumed.getProblemSetup()
+        .getStructuralInteractionSetup().getPrescribedMotions();
+    QCOMPARE(loadedMotions.size(),std::size_t(1));
+    QCOMPARE(loadedMotions.front().knots.size(),savedMotion.knots.size());
+    QCOMPARE(loadedMotions.front().knots.back().acceleration,
+             savedMotion.knots.back().acceleration);
+    QCOMPARE(loadedMotions.front().knots.front().velocity,
+             savedMotion.knots.front().velocity);
+
+    resumed.getProblemSetup().setRestart(true);
+    resumed.getProblemSetup().getStructuralDynamicsSetup().setNSteps(secondSegmentSteps);
+    resumed.getProblemSetup().getStructuralDynamicsSetup().setOutputFrequency(secondSegmentSteps);
+    QVERIFY2(solve(resumed,error),qPrintable(error));
+    const auto &expected = uninterrupted.getProblemSetup().getStructuralDynamicsRestartData();
+    const auto &actual = resumed.getProblemSetup().getStructuralDynamicsRestartData();
+    QCOMPARE(actual.completedSteps,firstSegmentSteps+secondSegmentSteps);
+    QCOMPARE(actual.systemFingerprint,expected.systemFingerprint);
+    for (std::size_t i=0;i<expected.q.size();++i)
+    {
+        QVERIFY(close(actual.q[i],expected.q[i],1.0e-11));
+        QVERIFY(close(actual.v[i],expected.v[i],1.0e-11));
+        QVERIFY(close(actual.a[i],expected.a[i],1.0e-8));
+        QVERIFY(close(actual.externalForce[i],expected.externalForce[i],1.0e-8));
+    }
+    for (RVariableType type : {R_VARIABLE_DISPLACEMENT,R_VARIABLE_VELOCITY,
+                               R_VARIABLE_ACCELERATION})
+    {
+        QVERIFY2(close(value(resumed,type),value(uninterrupted,type),1.0e-9),
+                 qPrintable(QString("Moving support restart mismatch in %1").arg(int(type))));
+        const uint index = resumed.findVariable(type);
+        QVERIFY(index != RConstants::eod);
+        QVERIFY(close(resumed.getVariable(index).getValue(0,0),
+                      uninterrupted.getVariable(index).getValue(0,0),1.0e-9));
+    }
+}
+
+void TestStructuralDynamicsRestartIO::movingSupportRejectsChangedKnot()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    RModel firstSegment = makeTruss(firstSegmentSteps);
+    addMovingSupport(firstSegment);
+    QString error;
+    QVERIFY2(solve(firstSegment,error),qPrintable(error));
+    const QString path = directory.filePath("motion-checkpoint.ram");
+    QCOMPARE(firstSegment.write(path,false),path);
+    RModel altered;
+    QVERIFY2(load(altered,path,error),qPrintable(error));
+    altered.getProblemSetup().getStructuralInteractionSetup()
+           .getPrescribedMotions().front().knots.back().acceleration += 1.0e-6;
+    altered.getProblemSetup().setRestart(true);
+    altered.getProblemSetup().getStructuralDynamicsSetup().setNSteps(secondSegmentSteps);
+    QVERIFY2(!solve(altered,error),"A modified control knot was accepted by restart.");
+    QVERIFY2(error.contains("checkpoint",Qt::CaseInsensitive),qPrintable(error));
 }
 
 void TestStructuralDynamicsRestartIO::rejectsTamperedCheckpoint()

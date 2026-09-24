@@ -522,6 +522,13 @@ struct RSolverStress::DynamicsStepSnapshot
     bool preparingInitialForce = false;
     RSparseMatrix massReference;
     RSparseMatrix stiffnessReference;
+    RSparseMatrix motionStiffness;
+    RSparseMatrix motionMass;
+    RSparseMatrix motionStiffnessReference;
+    RSparseMatrix motionMassReference;
+    std::vector<RStructuralPrescribedMotion> prescribedMotions;
+    std::vector<int> motionIndexByNodeDof;
+    QString motionDefinitionReference;
     RRMatrix constraintNullspaceReference;
     RRVector constraintParticularReference;
     std::vector<double> boundaryReference;
@@ -556,6 +563,13 @@ void RSolverStress::beginStepTransaction()
     snapshot->preparingInitialForce = this->preparingInitialForce;
     snapshot->massReference = this->dynamicMassReference;
     snapshot->stiffnessReference = this->dynamicStiffnessReference;
+    snapshot->motionStiffness = this->motionStiffness;
+    snapshot->motionMass = this->motionMass;
+    snapshot->motionStiffnessReference = this->dynamicMotionStiffnessReference;
+    snapshot->motionMassReference = this->dynamicMotionMassReference;
+    snapshot->prescribedMotions = this->prescribedMotions;
+    snapshot->motionIndexByNodeDof = this->motionIndexByNodeDof;
+    snapshot->motionDefinitionReference = this->dynamicMotionDefinitionReference;
     snapshot->constraintNullspaceReference = this->dynamicConstraintNullspaceReference;
     snapshot->constraintParticularReference = this->dynamicConstraintParticularReference;
     snapshot->boundaryReference = this->dynamicBoundaryReference;
@@ -586,6 +600,13 @@ void RSolverStress::rollbackStepTransaction()
     this->preparingInitialForce = snapshot.preparingInitialForce;
     this->dynamicMassReference = snapshot.massReference;
     this->dynamicStiffnessReference = snapshot.stiffnessReference;
+    this->motionStiffness = snapshot.motionStiffness;
+    this->motionMass = snapshot.motionMass;
+    this->dynamicMotionStiffnessReference = snapshot.motionStiffnessReference;
+    this->dynamicMotionMassReference = snapshot.motionMassReference;
+    this->prescribedMotions = snapshot.prescribedMotions;
+    this->motionIndexByNodeDof = snapshot.motionIndexByNodeDof;
+    this->dynamicMotionDefinitionReference = snapshot.motionDefinitionReference;
     this->dynamicConstraintNullspaceReference = snapshot.constraintNullspaceReference;
     this->dynamicConstraintParticularReference = snapshot.constraintParticularReference;
     this->dynamicBoundaryReference = snapshot.boundaryReference;
@@ -749,6 +770,8 @@ void RSolverStress::prepare()
             this->initialDynamicForce = this->b;
             this->dynamicMassReference = this->M;
             this->dynamicStiffnessReference = this->A;
+            this->dynamicMotionMassReference = this->motionMass;
+            this->dynamicMotionStiffnessReference = this->motionStiffness;
             this->dynamicConstraintNullspaceReference = this->constraintNullspace;
             this->dynamicConstraintParticularReference = this->constraintParticular;
         }
@@ -821,6 +844,10 @@ void RSolverStress::prepare()
                          diagnostic.message.toUtf8().constData());
         }
     }
+    if (structuralDynamics)
+    {
+        this->preparePrescribedMotions();
+    }
     this->generateVariableVector(R_VARIABLE_FORCE_X,elementForce.x,forceSetValues.x,true,this->firstRun,this->firstRun);
     this->generateVariableVector(R_VARIABLE_FORCE_Y,elementForce.y,forceSetValues.y,true,this->firstRun,this->firstRun);
     this->generateVariableVector(R_VARIABLE_FORCE_Z,elementForce.z,forceSetValues.z,true,this->firstRun,this->firstRun);
@@ -848,6 +875,14 @@ void RSolverStress::prepare()
     this->M.setNRows(this->b.size());
     this->A.clear();
     this->A.setNRows(this->b.size());
+    this->motionStiffness.clear();
+    this->motionMass.clear();
+    const bool hasPrescribedMotion = structuralDynamics && !this->prescribedMotions.empty();
+    if (hasPrescribedMotion)
+    {
+        this->motionStiffness.setNRows(this->b.size());
+        this->motionMass.setNRows(this->b.size());
+    }
     this->b.fill(0.0);
     this->x.fill(0.0);
 
@@ -856,11 +891,18 @@ void RSolverStress::prepare()
     int np = omp_get_max_threads();
     std::vector<RSparseMatrix> Ap(np);
     std::vector<RSparseMatrix> Mp(np);
+    std::vector<RSparseMatrix> Kfcp(np);
+    std::vector<RSparseMatrix> Mfcp(np);
     std::vector<RRVector> bp(np);
     for (int t=0;t<np;t++)
     {
         Ap[t].setNRows(this->b.size());
         Mp[t].setNRows(this->b.size());
+        if (hasPrescribedMotion)
+        {
+            Kfcp[t].setNRows(this->b.size());
+            Mfcp[t].setNRows(this->b.size());
+        }
         bp[t].resize(this->b.size());
         bp[t].fill(0.0);
     }
@@ -961,7 +1003,7 @@ void RSolverStress::prepare()
                     Me *= this->elementDensity[elementID] * pointVolume;
                 }
 
-                this->assemblyMatrix(elementID,Me,Ke,fe,Ap[uint(omp_get_thread_num())],bp[uint(omp_get_thread_num())],Mp[uint(omp_get_thread_num())]);
+                this->assemblyMatrix(elementID,Me,Ke,fe,Ap[uint(omp_get_thread_num())],bp[uint(omp_get_thread_num())],Mp[uint(omp_get_thread_num())],Kfcp[uint(omp_get_thread_num())],Mfcp[uint(omp_get_thread_num())]);
 
                 if (this->problemType != R_PROBLEM_STRESS_MODAL)
                 {
@@ -1064,7 +1106,9 @@ void RSolverStress::prepare()
                     this->assemblyMatrix(elementID,Me,Ke,fe,
                                          Ap[uint(omp_get_thread_num())],
                                          bp[uint(omp_get_thread_num())],
-                                         Mp[uint(omp_get_thread_num())]);
+                                         Mp[uint(omp_get_thread_num())],
+                                         Kfcp[uint(omp_get_thread_num())],
+                                         Mfcp[uint(omp_get_thread_num())]);
                     continue;
                 }
                 if (element.getType() != R_ELEMENT_TRUSS1 && element.getType() != R_ELEMENT_TRUSS2)
@@ -1171,7 +1215,7 @@ void RSolverStress::prepare()
 
                     }
                 }
-                this->assemblyMatrix(elementID,Me,Ke,fe,Ap[uint(omp_get_thread_num())],bp[uint(omp_get_thread_num())],Mp[uint(omp_get_thread_num())]);
+                this->assemblyMatrix(elementID,Me,Ke,fe,Ap[uint(omp_get_thread_num())],bp[uint(omp_get_thread_num())],Mp[uint(omp_get_thread_num())],Kfcp[uint(omp_get_thread_num())],Mfcp[uint(omp_get_thread_num())]);
             }
             catch (const RError &rError)
             {
@@ -1416,7 +1460,7 @@ void RSolverStress::prepare()
                         Ke.fill(0.0);
                     }
                 }
-                this->assemblyMatrix(elementID,Me,Ke,fe,Ap[uint(omp_get_thread_num())],bp[uint(omp_get_thread_num())],Mp[uint(omp_get_thread_num())]);
+                this->assemblyMatrix(elementID,Me,Ke,fe,Ap[uint(omp_get_thread_num())],bp[uint(omp_get_thread_num())],Mp[uint(omp_get_thread_num())],Kfcp[uint(omp_get_thread_num())],Mfcp[uint(omp_get_thread_num())]);
             }
             catch (const RError &rError)
             {
@@ -1559,7 +1603,7 @@ void RSolverStress::prepare()
                 {
                     lumpMassMatrix(Me);
                 }
-                this->assemblyMatrix(elementID,Me,Ke,fe,Ap[uint(omp_get_thread_num())],bp[uint(omp_get_thread_num())],Mp[uint(omp_get_thread_num())]);
+                this->assemblyMatrix(elementID,Me,Ke,fe,Ap[uint(omp_get_thread_num())],bp[uint(omp_get_thread_num())],Mp[uint(omp_get_thread_num())],Kfcp[uint(omp_get_thread_num())],Mfcp[uint(omp_get_thread_num())]);
             }
             catch (const RError &rError)
             {
@@ -1584,6 +1628,11 @@ void RSolverStress::prepare()
         {
             this->A.getVector(uint(i)).addVector(Ap[t].getVector(uint(i)));
             this->M.getVector(uint(i)).addVector(Mp[t].getVector(uint(i)));
+            if (hasPrescribedMotion)
+            {
+                this->motionStiffness.getVector(uint(i)).addVector(Kfcp[t].getVector(uint(i)));
+                this->motionMass.getVector(uint(i)).addVector(Mfcp[t].getVector(uint(i)));
+            }
             this->b[uint(i)] += bp[t][uint(i)];
         }
     }
@@ -1808,6 +1857,234 @@ std::vector<RStructuralDofRef> RSolverStress::orderedPhysicalDofs() const
     return ordered;
 }
 
+QString RSolverStress::motionDefinitionFingerprint() const
+{
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    const auto &motions = this->pModel->getProblemSetup().getStructuralInteractionSetup()
+        .getPrescribedMotions();
+    hash.addData("range-fea/dynamics/motion/v1;");
+    auto appendInteger = [&hash](quint64 value)
+    {
+        hash.addData(QByteArray::number(value));
+        hash.addData(";",1);
+    };
+    auto appendReal = [&hash](double value)
+    {
+        hash.addData(QByteArray::number(value == 0.0 ? 0.0 : value,'g',17));
+        hash.addData(";",1);
+    };
+    appendInteger(motions.size());
+    for (const RStructuralPrescribedMotion &motion : motions)
+    {
+        const QByteArray id = motion.id.toUtf8();
+        appendInteger(id.size());
+        hash.addData(id);
+        appendInteger(motion.target.nodeId);
+        appendInteger(static_cast<uint>(motion.target.dof));
+        appendInteger(motion.knots.size());
+        for (const RStructuralMotionKnot &knot : motion.knots)
+        {
+            appendReal(knot.time);
+            appendReal(knot.displacement);
+            appendReal(knot.velocity);
+            appendReal(knot.acceleration);
+        }
+    }
+    return QString::fromLatin1(hash.result().toHex());
+}
+
+void RSolverStress::preparePrescribedMotions()
+{
+    const auto &interaction = this->pModel->getProblemSetup().getStructuralInteractionSetup();
+    const QString fingerprint = this->motionDefinitionFingerprint();
+    if (!this->dynamicMotionDefinitionReference.isEmpty() &&
+        this->dynamicMotionDefinitionReference != fingerprint)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Prescribed support motion changed during fixed-matrix dynamics.");
+    }
+    this->dynamicMotionDefinitionReference = fingerprint;
+    this->prescribedMotions = interaction.getPrescribedMotions();
+    this->motionIndexByNodeDof.assign(3*this->pModel->getNNodes(),-1);
+    if (this->prescribedMotions.empty())
+    {
+        return;
+    }
+    if (!interaction.getLinearConstraints().empty() || !interaction.getCouplings().empty())
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Prescribed support motion with MPC/coupling is not supported by the first FE implementation.");
+    }
+    const RTimeSolver &time = this->pModel->getTimeSolver();
+    // The t0 force prepass temporarily replaces times[0] with t0; asking
+    // getPreviousTime() there would fabricate t0-dt outside the knot domain.
+    const double firstPhysicalTime = (this->preparingInitialForce
+        ? time.getCurrentTime() : time.getPreviousTime())/this->scales.getSecond();
+    const double lastPhysicalTime = time.getTimes().back()/this->scales.getSecond();
+    for (uint index=0;index<this->prescribedMotions.size();index++)
+    {
+        const RStructuralPrescribedMotion &motion = this->prescribedMotions[index];
+        uint component = 0;
+        if (!findTranslationComponent(motion.target.dof,component))
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Prescribed support motion '%s' must target a global translational DOF.",
+                         motion.id.toUtf8().constData());
+        }
+        const uint node = motion.target.nodeId;
+        if (this->localRotations[node].isActive() ||
+            this->rotationLocalRotations[node].isActive())
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Prescribed support motion '%s' cannot use a local node frame.",
+                         motion.id.toUtf8().constData());
+        }
+        uint equation = 0;
+        if (this->equationBook.getValue(node,motion.target.dof,equation) ||
+            component >= this->nodeConstrainedDirections[node])
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Prescribed support motion '%s' requires an existing held displacement DOF.",
+                         motion.id.toUtf8().constData());
+        }
+        if (std::fabs(this->nodePrescribedDisplacement[node][component]) > 1.0e-12)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Prescribed support motion '%s' requires a zero-valued baseline displacement BC.",
+                         motion.id.toUtf8().constData());
+        }
+        // The ordinary BC supplies a held-DOF mask only. Reject a delayed
+        // nonzero BC knot now, before accepting any time step from two sources.
+        const RVariableType displacementTypes[3] =
+            {R_VARIABLE_DISPLACEMENT_X,R_VARIABLE_DISPLACEMENT_Y,R_VARIABLE_DISPLACEMENT_Z};
+        bool hasGlobalMask = false;
+        for (uint groupId=0;groupId<this->pModel->getNElementGroups();groupId++)
+        {
+            const RElementGroup *group = this->pModel->getElementGroupPtr(groupId);
+            if (!group)
+            {
+                continue;
+            }
+            bool containsNode = false;
+            for (uint elementPosition=0;elementPosition<group->size() && !containsNode;elementPosition++)
+            {
+                const RElement &element = this->pModel->getElement(group->get(elementPosition));
+                for (uint localNode=0;localNode<element.size();localNode++)
+                {
+                    containsNode = containsNode || element.getNodeId(localNode) == node;
+                }
+            }
+            if (!containsNode)
+            {
+                continue;
+            }
+            for (uint bcIndex=0;bcIndex<group->getNBoundaryConditions();bcIndex++)
+            {
+                const RBoundaryCondition &bc = group->getBoundaryCondition(bcIndex);
+                if (bc.getType() != R_BOUNDARY_CONDITION_DISPLACEMENT ||
+                    !RSolverStress::isComponentEnabled(bc,displacementTypes[component]))
+                {
+                    continue;
+                }
+                const RConditionComponent &mask =
+                    bc.getComponent(bc.findComponentPosition(displacementTypes[component]));
+                if (bc.getHasLocalDirection())
+                {
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Prescribed support motion '%s' cannot use a local displacement BC.",
+                                 motion.id.toUtf8().constData());
+                }
+                hasGlobalMask = true;
+                for (uint valueIndex=0;valueIndex<mask.size();valueIndex++)
+                {
+                    if (std::fabs(mask.getValue(valueIndex)) > 1.0e-12)
+                    {
+                        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                     "Prescribed support motion '%s' requires every baseline BC knot to be zero.",
+                                     motion.id.toUtf8().constData());
+                    }
+                }
+            }
+        }
+        if (!hasGlobalMask)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Prescribed support motion '%s' cannot use a local-frame BC; an explicit global displacement BC mask is required.",
+                         motion.id.toUtf8().constData());
+        }
+        // Use the model evaluator itself for the endpoint contract. Its
+        // 16-ulp rounding tolerance is narrower than an absolute 1e-12 s;
+        // a looser preflight could accept early steps then fail at the end.
+        motion.evaluate(firstPhysicalTime);
+        motion.evaluate(lastPhysicalTime);
+        this->motionIndexByNodeDof[3*node+component] = int(index);
+    }
+}
+
+RStructuralMotionState RSolverStress::scaledMotionState(
+    const RStructuralPrescribedMotion &motion, double time) const
+{
+    RStructuralMotionState state = motion.evaluate(time/this->scales.getSecond());
+    state.displacement *= this->scales.findScaleFactor(R_VARIABLE_DISPLACEMENT_X);
+    state.velocity *= this->scales.findScaleFactor(R_VARIABLE_VELOCITY_X);
+    state.acceleration *= this->scales.findScaleFactor(R_VARIABLE_ACCELERATION_X);
+    return state;
+}
+
+void RSolverStress::motionEffectiveForce(double time, RRVector &force) const
+{
+    force.resize(this->A.getNRows());
+    force.fill(0.0);
+    if (this->prescribedMotions.empty())
+    {
+        return;
+    }
+    std::vector<RStructuralMotionState> states;
+    states.reserve(this->prescribedMotions.size());
+    for (const RStructuralPrescribedMotion &motion : this->prescribedMotions)
+    {
+        states.push_back(this->scaledMotionState(motion,time));
+    }
+    const RStructuralDynamicsSetup &setup = this->pModel->getProblemSetup()
+        .getStructuralDynamicsSetup();
+    // M_ff qdd + C_ff qd + K_ff q = f_f - M_fc ucdd - C_fc ucd - K_fc uc.
+    // These are sparse free/support blocks; no dense identity transform is built.
+    for (uint row=0;row<force.size();row++)
+    {
+        for (uint p=0;p<this->motionStiffness.getNColumns(row);p++)
+        {
+            const uint column = this->motionStiffness.getVector(row).getIndex(p);
+            const double value = this->motionStiffness.getValue(row,p);
+            force[row] -= value*(states[column].displacement+
+                                 setup.getRayleighBeta()*states[column].velocity);
+        }
+        for (uint p=0;p<this->motionMass.getNColumns(row);p++)
+        {
+            const uint column = this->motionMass.getVector(row).getIndex(p);
+            const double value = this->motionMass.getValue(row,p);
+            force[row] -= value*(states[column].acceleration+
+                                 setup.getRayleighAlpha()*states[column].velocity);
+        }
+    }
+}
+
+void RSolverStress::setPrescribedMotionResults(double time)
+{
+    for (const RStructuralPrescribedMotion &motion : this->prescribedMotions)
+    {
+        uint component = 0;
+        findTranslationComponent(motion.target.dof,component);
+        const RStructuralMotionState state = this->scaledMotionState(motion,time);
+        const uint node = motion.target.nodeId;
+        RRVector *displacement[3] = {&this->nodeDisplacement.x,&this->nodeDisplacement.y,&this->nodeDisplacement.z};
+        RRVector *velocity[3] = {&this->nodeVelocity.x,&this->nodeVelocity.y,&this->nodeVelocity.z};
+        RRVector *acceleration[3] = {&this->nodeAcceleration.x,&this->nodeAcceleration.y,&this->nodeAcceleration.z};
+        (*displacement[component])[node] = state.displacement;
+        (*velocity[component])[node] = state.velocity;
+        (*acceleration[component])[node] = state.acceleration;
+    }
+}
+
 QString RSolverStress::dynamicSystemFingerprint() const
 {
     QCryptographicHash hash(QCryptographicHash::Sha256);
@@ -1821,6 +2098,13 @@ QString RSolverStress::dynamicSystemFingerprint() const
         // Ordinary model ASCII files use six significant digits for material
         // values. A five-digit operator signature survives their round trip.
         hash.addData(QByteArray::number(value == 0.0 ? 0.0 : value,'g',5));
+        hash.addData(";",1);
+    };
+    auto appendMotionReal = [&hash](double value)
+    {
+        // Motion knots use 17-digit ASCII serialization. Keep their restart
+        // signature exact while preserving the legacy operator tolerance.
+        hash.addData(QByteArray::number(value == 0.0 ? 0.0 : value,'g',17));
         hash.addData(";",1);
     };
     auto appendSparse = [&](const RSparseMatrix &matrix)
@@ -1873,6 +2157,31 @@ QString RSolverStress::dynamicSystemFingerprint() const
             appendReal(this->nodePrescribedDisplacement[node][component]);
             appendReal(this->nodePrescribedRotation[node][component]);
         }
+    }
+    const auto &motions = this->pModel->getProblemSetup().getStructuralInteractionSetup()
+        .getPrescribedMotions();
+    if (!motions.empty())
+    {
+        hash.addData("prescribed-motion/v1;");
+        appendInt(motions.size());
+        for (const RStructuralPrescribedMotion &motion : motions)
+        {
+            const QByteArray id = motion.id.toUtf8();
+            appendInt(id.size());
+            hash.addData(id);
+            appendInt(motion.target.nodeId);
+            appendInt(static_cast<uint>(motion.target.dof));
+            appendInt(motion.knots.size());
+            for (const RStructuralMotionKnot &knot : motion.knots)
+            {
+                appendMotionReal(knot.time);
+                appendMotionReal(knot.displacement);
+                appendMotionReal(knot.velocity);
+                appendMotionReal(knot.acceleration);
+            }
+        }
+        appendSparse(this->motionStiffness);
+        appendSparse(this->motionMass);
     }
     return QString::fromLatin1(hash.result().toHex());
 }
@@ -1933,7 +2242,9 @@ void RSolverStress::solveStructuralDynamics()
         return rowsMatch(reference,current) && rowsMatch(current,reference);
     };
     if (!sameMatrix(this->dynamicMassReference,this->M) ||
-        !sameMatrix(this->dynamicStiffnessReference,this->A))
+        !sameMatrix(this->dynamicStiffnessReference,this->A) ||
+        !sameMatrix(this->dynamicMotionMassReference,this->motionMass) ||
+        !sameMatrix(this->dynamicMotionStiffnessReference,this->motionStiffness))
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                      "Structural M/K changed during fixed-matrix dynamics; time-varying material or geometry needs matrix refresh.");
@@ -1987,9 +2298,19 @@ void RSolverStress::solveStructuralDynamics()
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                          "Structural equation count changed between the initial and first time point.");
         }
+        this->previousDynamicTime = this->pModel->getTimeSolver().getPreviousTime();
         this->previousDynamicForce = this->pModel->getProblemSetup().getRestart()
             ? RRVector(restartData.externalForce) : this->initialDynamicForce;
-        this->previousDynamicTime = this->pModel->getTimeSolver().getPreviousTime();
+        if (this->pModel->getProblemSetup().getRestart() && !this->prescribedMotions.empty())
+        {
+            RRVector supportForce;
+            this->motionEffectiveForce(this->previousDynamicTime,supportForce);
+            for (uint row=0;row<this->previousDynamicForce.size();row++)
+            {
+                // Checkpoint force is effective; interpolation stores bare f_f.
+                this->previousDynamicForce[row] -= supportForce[row];
+            }
+        }
         RSparseMatrix damping;
         damping.setNRows(this->M.getNRows());
         for (uint row=0;row<this->M.getNRows();row++)
@@ -2018,6 +2339,15 @@ void RSolverStress::solveStructuralDynamics()
                 for (uint i=0;i<values.size();i++)
                 {
                     values[i] = (1.0-weight)*this->previousDynamicForce[i]+weight*values[i];
+                }
+            }
+            if (!this->prescribedMotions.empty())
+            {
+                RRVector supportForce;
+                this->motionEffectiveForce(time,supportForce);
+                for (uint row=0;row<values.size();row++)
+                {
+                    values[row] += supportForce[row];
                 }
             }
         };
@@ -2074,9 +2404,12 @@ void RSolverStress::solveStructuralDynamics()
                             this->nodeVelocity,this->nodeAngularVelocity);
     this->scatterNodalState(this->expandReducedSolution(state.a,false),
                             this->nodeAcceleration,this->nodeAngularAcceleration);
+    this->setPrescribedMotionResults(state.time);
     this->previousDynamicForce = this->currentDynamicForce;
     this->previousDynamicTime = this->currentDynamicTime;
-    RLogger::info("Structural dynamics: kinetic=%g strain=%g energy residual=%g (solver units)\n",
+    // The integrator ledger accounts for free-DOF effective-force work, not
+    // full-system support reactions, support kinetic energy or support work.
+    RLogger::info("Structural dynamics: reduced kinetic=%g strain=%g energy residual=%g (solver units)\n",
                   state.kineticEnergy,state.strainEnergy,state.energyBalanceResidual);
 }
 
@@ -4111,7 +4444,7 @@ RRVector RSolverStress::projectPhysicalState(const RRVector &physical, bool subt
     return reduced;
 }
 
-void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRMatrix &Ke, const RRVector &fe, RSparseMatrix &Ap, RRVector &bp, RSparseMatrix &Mp)
+void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRMatrix &Ke, const RRVector &fe, RSparseMatrix &Ap, RRVector &bp, RSparseMatrix &Mp, RSparseMatrix &Kfc, RSparseMatrix &Mfc)
 {
     double alpha = this->pModel->getTimeSolver().getTimeMarchApproximationCoefficient();
     double dt = this->pModel->getTimeSolver().getCurrentTimeStepSize();
@@ -4249,6 +4582,20 @@ void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRM
                             {
                                 // Be carries the mass in the node frames.
                                 Mp.addValue(mp,np,Be[nDofs*m+i][nDofs*n+j]);
+                            }
+                        }
+                        else if (structuralDynamics && !this->prescribedMotions.empty())
+                        {
+                            uint component = 0;
+                            if (findTranslationComponent(elementDofs[j],component))
+                            {
+                                const uint node = rElement.getNodeId(n);
+                                const int motion = this->motionIndexByNodeDof[3*node+component];
+                                if (motion >= 0)
+                                {
+                                    Kfc.addValue(mp,uint(motion),Ae[nDofs*m+i][nDofs*n+j]);
+                                    Mfc.addValue(mp,uint(motion),Be[nDofs*m+i][nDofs*n+j]);
+                                }
                             }
                         }
                     }

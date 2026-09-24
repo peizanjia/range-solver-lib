@@ -161,6 +161,9 @@ class TestStructuralDynamicsFE : public QObject
 private slots:
     void freeVibrationMatchesAnalyticAfterManySteps();
     void rayleighDampingMatchesAnalyticAfterManySteps();
+    void movingSupportMatchesConsistentMassAnalytic();
+    void movingSupportRayleighMassDampingMatchesAnalytic();
+    void unsupportedMovingSupportInputsFailBeforeFirstStep();
     void tiedNodesStayTiedDuringDynamics();
     void fixedThreadCountsProduceSameState();
     void restartMatchesUninterruptedRun();
@@ -203,6 +206,151 @@ void TestStructuralDynamicsFE::rayleighDampingMatchesAnalyticAfterManySteps()
     QVERIFY(std::isfinite(actual));
     QVERIFY2(std::abs(actual-expected) < 3.0e-4*initialDisplacement,
              qPrintable(QString("Damped FE q=%1, analytic q=%2").arg(actual).arg(expected)));
+}
+
+void TestStructuralDynamicsFE::movingSupportMatchesConsistentMassAnalytic()
+{
+    constexpr double baseAcceleration = 1000.0;
+    RModel model = makeTruss(1);
+    model.getPoint(1).removeAllInitialConditions();
+    const RStructuralDynamicsSetup &setup = model.getProblemSetup().getStructuralDynamicsSetup();
+    const double duration = setup.getNSteps()*setup.getTimeStep();
+    RStructuralPrescribedMotion motion;
+    motion.id = "quadratic-base";
+    motion.target = {0,RDofType::UX};
+    motion.knots = {{0.0,0.0,0.0,baseAcceleration},
+                    {duration,0.5*baseAcceleration*duration*duration,
+                     baseAcceleration*duration,baseAcceleration}};
+    model.getProblemSetup().getStructuralInteractionSetup()
+         .getPrescribedMotions().push_back(motion);
+
+    QString error;
+    QVERIFY2(runSolver(model,error),qPrintable(error));
+    const double omega = singleElementFrequency();
+    const double stiffness = youngModulus*crossArea/length;
+    const double freeMass = massDensity*crossArea*length/3.0;
+    const double couplingMass = massDensity*crossArea*length/6.0;
+    const double phase = omega*duration;
+    const double expectedQ = 0.5*baseAcceleration*duration*duration
+        -(freeMass+couplingMass)*baseAcceleration/stiffness*(1.0-std::cos(phase));
+    const double expectedV = baseAcceleration*duration
+        -(freeMass+couplingMass)*baseAcceleration/stiffness*omega*std::sin(phase);
+    const double expectedA = baseAcceleration
+        -(freeMass+couplingMass)*baseAcceleration/freeMass*std::cos(phase);
+    const double q = nodalValue(model,R_VARIABLE_DISPLACEMENT,1);
+    const double v = nodalValue(model,R_VARIABLE_VELOCITY,1);
+    const double a = nodalValue(model,R_VARIABLE_ACCELERATION,1);
+    QVERIFY2(std::abs(q-expectedQ) < 4.0e-8,
+             qPrintable(QString("moving support q=%1 exact=%2").arg(q,0,'g',16).arg(expectedQ,0,'g',16)));
+    QVERIFY2(std::abs(v-expectedV) < 2.0e-4,
+             qPrintable(QString("moving support v=%1 exact=%2").arg(v,0,'g',16).arg(expectedV,0,'g',16)));
+    QVERIFY2(std::abs(a-expectedA) < 0.5,
+             qPrintable(QString("moving support a=%1 exact=%2").arg(a,0,'g',16).arg(expectedA,0,'g',16)));
+    QVERIFY(std::abs(nodalValue(model,R_VARIABLE_DISPLACEMENT,0)
+                     -0.5*baseAcceleration*duration*duration) < 1.0e-11);
+    QVERIFY(std::abs(nodalValue(model,R_VARIABLE_VELOCITY,0)
+                     -baseAcceleration*duration) < 1.0e-9);
+    QVERIFY(std::abs(nodalValue(model,R_VARIABLE_ACCELERATION,0)
+                     -baseAcceleration) < 1.0e-6);
+}
+
+void TestStructuralDynamicsFE::movingSupportRayleighMassDampingMatchesAnalytic()
+{
+    constexpr double baseVelocity = 1.0;
+    RModel model = makeTruss(1);
+    model.getPoint(1).removeAllInitialConditions();
+    RStructuralDynamicsSetup &setup = model.getProblemSetup().getStructuralDynamicsSetup();
+    const double omega = singleElementFrequency();
+    const double alpha = 0.1*omega;
+    setup.setRayleighAlpha(alpha);
+    const double duration = setup.getNSteps()*setup.getTimeStep();
+    RStructuralPrescribedMotion motion;
+    motion.id = "linear-base-with-mass-damping";
+    motion.target = {0,RDofType::UX};
+    motion.knots = {{0.0,0.0,baseVelocity,0.0},
+                    {duration,baseVelocity*duration,baseVelocity,0.0}};
+    model.getProblemSetup().getStructuralInteractionSetup()
+         .getPrescribedMotions().push_back(motion);
+
+    QString error;
+    QVERIFY2(runSolver(model,error),qPrintable(error));
+    const double freeMass = massDensity*crossArea*length/3.0;
+    const double couplingMass = massDensity*crossArea*length/6.0;
+    const double stiffness = youngModulus*crossArea/length;
+    const double zeta = alpha/(2.0*omega);
+    const double dampedOmega = omega*std::sqrt(1.0-zeta*zeta);
+    const double relativeSteady = -alpha*baseVelocity*(freeMass+couplingMass)/stiffness;
+    const double cosine = -relativeSteady;
+    const double sine = (-baseVelocity+zeta*omega*cosine)/dampedOmega;
+    const double expected = baseVelocity*duration+relativeSteady
+        +std::exp(-zeta*omega*duration)
+         *(cosine*std::cos(dampedOmega*duration)+sine*std::sin(dampedOmega*duration));
+    const double actual = nodalValue(model,R_VARIABLE_DISPLACEMENT,1);
+    QVERIFY2(std::abs(actual-expected) < 4.0e-8,
+             qPrintable(QString("damped moving support q=%1 exact=%2")
+                        .arg(actual,0,'g',16).arg(expected,0,'g',16)));
+}
+
+void TestStructuralDynamicsFE::unsupportedMovingSupportInputsFailBeforeFirstStep()
+{
+    auto addZeroMotion = [](RModel &model)
+    {
+        const auto &dynamics = model.getProblemSetup().getStructuralDynamicsSetup();
+        const double duration = dynamics.getNSteps()*dynamics.getTimeStep();
+        RStructuralPrescribedMotion motion;
+        motion.id = "unsupported-base";
+        motion.target = {0,RDofType::UX};
+        motion.knots = {{0.0,0.0,0.0,0.0},{duration,0.0,0.0,0.0}};
+        model.getProblemSetup().getStructuralInteractionSetup()
+             .getPrescribedMotions().push_back(motion);
+    };
+    QString error;
+    RModel withMpc = makeTruss(2,true);
+    addZeroMotion(withMpc);
+    QVERIFY2(!runSolver(withMpc,error),"MPC and moving support were silently combined.");
+    QVERIFY2(error.contains("MPC/coupling",Qt::CaseInsensitive),qPrintable(error));
+
+    RModel delayedBoundary = makeTruss(1);
+    addZeroMotion(delayedBoundary);
+    const double duration = delayedBoundary.getProblemSetup()
+        .getStructuralDynamicsSetup().getNSteps()*delayedBoundary.getProblemSetup()
+        .getStructuralDynamicsSetup().getTimeStep();
+    auto &component = delayedBoundary.getPoint(0).getBoundaryCondition(0).getComponent(
+        delayedBoundary.getPoint(0).getBoundaryCondition(0)
+            .findComponentPosition(R_VARIABLE_DISPLACEMENT_X));
+    component.add(duration/2.0,0.0);
+    component.add(duration,1.0e-5);
+    QVERIFY2(!runSolver(delayedBoundary,error),"A delayed nonzero baseline BC was accepted.");
+    QVERIFY2(error.contains("baseline BC knot",Qt::CaseInsensitive),qPrintable(error));
+
+    RModel shortDomain = makeTruss(1);
+    addZeroMotion(shortDomain);
+    shortDomain.getProblemSetup().getStructuralInteractionSetup()
+        .getPrescribedMotions().front().knots.back().time = duration/2.0;
+    QVERIFY2(!runSolver(shortDomain,error),"A motion knot domain shorter than the solve was accepted.");
+    QVERIFY2(error.contains("outside its time domain",Qt::CaseInsensitive),qPrintable(error));
+
+    RModel nearEndDomain = makeTruss(1);
+    addZeroMotion(nearEndDomain);
+    // 1e-13 s is inside the old solver's 1e-12 preflight window but far
+    // outside the model evaluator's 16-ulp endpoint rounding tolerance.
+    nearEndDomain.getProblemSetup().getStructuralInteractionSetup()
+        .getPrescribedMotions().front().knots.back().time = duration-1.0e-13;
+    QVERIFY2(!runSolver(nearEndDomain,error),
+             "A slightly short motion domain advanced until the final step.");
+    QVERIFY2(error.contains("outside its time domain",Qt::CaseInsensitive),qPrintable(error));
+    QVERIFY2(!nearEndDomain.getProblemSetup().getStructuralDynamicsRestartData().available,
+             "A motion domain failure must happen before accepting the first step.");
+
+    RModel localFrame = makeTruss(1);
+    addZeroMotion(localFrame);
+    localFrame.getPoint(0).removeAllBoundaryConditions();
+    RBoundaryCondition normal(R_BOUNDARY_CONDITION_DISPLACEMENT_NORMAL);
+    normal.setLocalDirection(RR3Vector(1.0,0.0,0.0));
+    normal.getComponent(normal.findComponentPosition(R_VARIABLE_DISPLACEMENT)).add(0.0,0.0);
+    localFrame.getPoint(0).addBoundaryCondition(normal);
+    QVERIFY2(!runSolver(localFrame,error),"A local-frame motion was accepted.");
+    QVERIFY2(error.contains("local",Qt::CaseInsensitive),qPrintable(error));
 }
 
 void TestStructuralDynamicsFE::tiedNodesStayTiedDuringDynamics()
