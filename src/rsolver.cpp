@@ -184,6 +184,37 @@ std::vector<RStructuralSupportSample> RSolver::getStructuralSupportSamples() con
                                      : static_cast<const RSolverStress*>(it.value())->getAcceptedSupportSamples();
 }
 
+void RSolver::setStructuralControlCallback(const QString &controllerId,
+                                           const QString &controllerRevision,
+                                           StructuralControlCallback callback)
+{
+    this->structuralControllerId = controllerId;
+    this->structuralControllerRevision = controllerRevision;
+    this->structuralControlCallback = std::move(callback);
+    auto it = this->solvers.find(R_PROBLEM_STRESS);
+    if (it != this->solvers.end())
+        static_cast<RSolverStress*>(it.value())->setControlCallback(
+            controllerId,controllerRevision,this->structuralControlCallback);
+}
+
+void RSolver::setStructuralControlStepObserver(StructuralControlStepObserver observer)
+{
+    this->structuralControlStepObserver = std::move(observer);
+    auto it = this->solvers.find(R_PROBLEM_STRESS);
+    if (it != this->solvers.end())
+        static_cast<RSolverStress*>(it.value())->setControlStepObserver(this->structuralControlStepObserver);
+}
+
+std::vector<RStructuralControlChannelSample> RSolver::getStructuralControlSamples() const
+{
+    if (!this->structuralControlCallback)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural control samples require a registered controller.");
+    auto it = this->solvers.constFind(R_PROBLEM_STRESS);
+    return it == this->solvers.cend() ? std::vector<RStructuralControlChannelSample>()
+                                     : static_cast<const RSolverStress*>(it.value())->getAcceptedControlSamples();
+}
+
 void RSolver::run()
 {
     RParallelExecutionContext parallelContext(this->pModel->getProblemSetup().getParallelExecutionConfig());
@@ -201,6 +232,16 @@ void RSolver::run()
     }
     RTimeSolver &timeSolver = this->pModel->getTimeSolver();
     const RStructuralDynamicsSetup &dynamics = this->pModel->getProblemSetup().getStructuralDynamicsSetup();
+    const RStructuralControlSetup &control = this->pModel->getProblemSetup().getStructuralControlSetup();
+    control.validate();
+    if (control.enabled && (!dynamics.getEnabled() || !this->structuralControlCallback ||
+                            this->structuralControllerId != control.controllerId ||
+                            this->structuralControllerRevision.isEmpty()))
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Enabled structural control requires dynamics, matching controller ID and nonempty revision fingerprint.");
+    if (!control.enabled && this->structuralControlCallback)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Registered structural controller requires enabled model control setup.");
     if (dynamics.getEnabled())
     {
         dynamics.validate();
@@ -209,6 +250,9 @@ void RSolver::run()
         if (this->pModel->getProblemSetup().getRestart())
         {
             checkpoint.validate();
+            if (checkpoint.controlAvailable != control.enabled)
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Structural restart control enablement differs from its accepted checkpoint.");
             if (!checkpoint.available || checkpoint.meshNodeCount != this->pModel->getNNodes() ||
                 checkpoint.meshElementCount != this->pModel->getNElements() ||
                 checkpoint.meshFingerprint != RStructuralDynamicsRestartData::computeMeshFingerprint(*this->pModel) ||
@@ -284,6 +328,15 @@ void RSolver::run()
             RLogger::indent();
             this->runSingle();
             RLogger::unindent();
+            if (control.enabled)
+            {
+                const auto *stress = static_cast<const RSolverStress*>(this->solvers.value(R_PROBLEM_STRESS));
+                const QString failure = stress->getPendingControlObserverFailure();
+                if (!failure.isEmpty())
+                    throw RError(RError::Type::Application,R_ERROR_REF,
+                                 "Control audit observer failed after committed time step: %s",
+                                 failure.toUtf8().constData());
+            }
 
             if (RApplicationState::getInstance().getStateType() == R_APPLICATION_STATE_STOP)
             {

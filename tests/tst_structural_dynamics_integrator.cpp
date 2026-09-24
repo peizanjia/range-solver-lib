@@ -1,6 +1,7 @@
 #include <QtTest>
 
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 #include <omp.h>
@@ -67,6 +68,7 @@ private slots:
     void centralDifferenceStabilityGuard();
     void trialRejectAndCheckpoint();
     void acceptedPowerLedgerIsCommittedAndRestored();
+    void heldControlJumpRefreshesBoundaryAcceleration();
     void invalidStepAndForce();
 };
 
@@ -231,6 +233,34 @@ void TestStructuralDynamicsIntegrator::acceptedPowerLedgerIsCommittedAndRestored
     QCOMPARE(restored.cumulativeEffectiveWork,accepted.cumulativeEffectiveWork);
     QCOMPARE(restored.cumulativeDampingDissipation,accepted.cumulativeDampingDissipation);
     QCOMPARE(restored.energyBalanceResidual,accepted.energyBalanceResidual);
+}
+
+void TestStructuralDynamicsIntegrator::heldControlJumpRefreshesBoundaryAcceleration()
+{
+    double command = 0.0;
+    Integrator integrator(scalarMatrix(1.0),scalarMatrix(0.0),scalarMatrix(4.0),
+                          solverConf(),{},
+                          [&command](double, const RStructuralDynamicsState &, RRVector &force)
+                          { force[0] = command; });
+    integrator.initialize(RRVector(1,0.0),RRVector(1,0.0));
+    QCOMPARE(integrator.acceptedState().a[0],0.0);
+    command = 1.0;
+    integrator.refreshAcceptedForce();
+    QCOMPARE(integrator.acceptedState().a[0],1.0);
+    QCOMPARE(integrator.acceptedState().externalForce[0],1.0);
+    // Average-acceleration Newmark under constant force has the refreshed
+    // a(t0+)=1 predictor term plus the solved a1 contribution.
+    integrator.trialStep(0.1);
+    QVERIFY(std::abs(integrator.candidateState().q[0]-0.005/1.01) < 1.0e-12);
+    QVERIFY(std::abs(integrator.candidateState().externalWork-
+                     integrator.candidateState().q[0]) < 1.0e-12);
+    QVERIFY_EXCEPTION_THROWN(integrator.refreshAcceptedForce(),std::logic_error);
+    integrator.rejectStep();
+    const auto checkpoint = integrator.checkpoint();
+    command = std::numeric_limits<double>::quiet_NaN();
+    QVERIFY_EXCEPTION_THROWN(integrator.refreshAcceptedForce(),std::invalid_argument);
+    QCOMPARE(integrator.acceptedState().a[0],checkpoint.state.a[0]);
+    QCOMPARE(integrator.acceptedState().externalForce[0],checkpoint.state.externalForce[0]);
 }
 
 void TestStructuralDynamicsIntegrator::invalidStepAndForce()

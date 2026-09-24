@@ -8,6 +8,7 @@
 
 #include "rsolvergeneric.h"
 #include "rstructural_support_response.h"
+#include "rstructural_control_protocol.h"
 #include "rsolvershareddata.h"
 
 struct RParallelExecutionReport;
@@ -21,6 +22,10 @@ class RSolver
             std::function<void(const RParallelExecutionReport &)>;
         using StructuralSupportResponseObserver =
             std::function<void(const std::vector<RStructuralSupportSample> &)>;
+        using StructuralControlCallback =
+            std::function<RStructuralControlDecision(const RStructuralControlObservation &)>;
+        using StructuralControlStepObserver =
+            std::function<void(const RStructuralControlStepRecord &)>;
 
         enum class ExecutionPolicy
         {
@@ -47,6 +52,10 @@ class RSolver
         //! Optional synchronous observation of the run's scoped OpenMP report.
         ParallelExecutionReportObserver parallelExecutionReportObserver;
         StructuralSupportResponseObserver structuralSupportResponseObserver;
+        QString structuralControllerId;
+        QString structuralControllerRevision;
+        StructuralControlCallback structuralControlCallback;
+        StructuralControlStepObserver structuralControlStepObserver;
 
     private:
 
@@ -87,6 +96,18 @@ class RSolver
         //! Requires setStructuralSupportResponseObserver() before run(); an
         //! unsubscribed solve does not assemble constrained dynamic rows.
         std::vector<RStructuralSupportSample> getStructuralSupportSamples() const;
+
+        //! Register a pure, replayable in-process controller before run().
+        //! It is sampled once from each accepted state, never during assembly
+        //! or an iterative linear solve. The ID must match model control setup.
+        void setStructuralControlCallback(const QString &controllerId,
+                                          const QString &controllerRevision,
+                                          StructuralControlCallback callback);
+        //! Notification after successful result write. An observer failure
+        //! stops subsequent steps and is reported by run(), without undoing
+        //! the already committed model artifact.
+        void setStructuralControlStepObserver(StructuralControlStepObserver observer);
+        std::vector<RStructuralControlChannelSample> getStructuralControlSamples() const;
 
     protected:
 

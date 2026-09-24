@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <map>
 
 #include <QCryptographicHash>
 #include <omp.h>
@@ -10,6 +11,7 @@
 #include "rmodal_damping.h"
 #include "reigenvaluesolver.h"
 #include "rstructural_dynamics_integrator.h"
+#include "rstructural_control_force_map.h"
 
 namespace
 {
@@ -547,6 +549,15 @@ struct RSolverStress::DynamicsStepSnapshot
     std::vector<bool> pointSupportMask;
     std::vector<RStructuralSupportSample> acceptedSupportSamples;
     std::vector<RStructuralSupportSample> trialSupportSamples;
+    bool hadControlMap = false;
+    QString cachedControlFingerprint;
+    std::vector<RStructuralControlChannelSample> controlLedgerSamples;
+    std::vector<RStructuralControlCommand> activeControlCommands;
+    RRVector activeControlForce;
+    QByteArray acceptedControllerState;
+    QByteArray candidateControllerState;
+    RStructuralControlStepRecord trialControlRecord;
+    std::vector<ControlSensorMap> controlSensors;
 };
 
 RSolverStress::RSolverStress(RModel *pModel, const QString &modelFileName, const QString &convergenceFileName, RSolverSharedData &sharedData, bool modalAnalysis)
@@ -563,6 +574,10 @@ RSolverStress::~RSolverStress()
 
 void RSolverStress::beginStepTransaction()
 {
+    if (!this->pendingControlObserverFailure.isEmpty())
+        throw RError(RError::Type::Application,R_ERROR_REF,
+                     "Control step observer failed after a prior committed result: %s",
+                     this->pendingControlObserverFailure.toUtf8().constData());
     std::unique_ptr<DynamicsStepSnapshot> snapshot(new DynamicsStepSnapshot);
     snapshot->hadIntegrator = bool(this->dynamicsIntegrator);
     if (snapshot->hadIntegrator)
@@ -599,6 +614,16 @@ void RSolverStress::beginStepTransaction()
     snapshot->pointSupportMask = this->pointSupportMask;
     snapshot->acceptedSupportSamples = this->acceptedSupportSamples;
     snapshot->trialSupportSamples = this->trialSupportSamples;
+    snapshot->hadControlMap = bool(this->controlForceMap);
+    snapshot->cachedControlFingerprint = this->cachedControlFingerprint;
+    if (this->controlLedger)
+        snapshot->controlLedgerSamples = this->controlLedger->accepted();
+    snapshot->activeControlCommands = this->activeControlCommands;
+    snapshot->activeControlForce = this->activeControlForce;
+    snapshot->acceptedControllerState = this->acceptedControllerState;
+    snapshot->candidateControllerState = this->candidateControllerState;
+    snapshot->trialControlRecord = this->trialControlRecord;
+    snapshot->controlSensors = this->controlSensors;
     this->dynamicsStepSnapshot = std::move(snapshot);
 }
 
@@ -647,11 +672,32 @@ void RSolverStress::rollbackStepTransaction()
     this->pointSupportMask = snapshot.pointSupportMask;
     this->acceptedSupportSamples = snapshot.acceptedSupportSamples;
     this->trialSupportSamples = snapshot.trialSupportSamples;
+    if (!snapshot.hadControlMap)
+    {
+        this->controlForceMap.reset();
+        this->controlLedger.reset();
+    }
+    else if (this->controlLedger)
+    {
+        this->controlLedger->restore(snapshot.controlLedgerSamples);
+    }
+    this->activeControlCommands = snapshot.activeControlCommands;
+    this->cachedControlFingerprint = snapshot.cachedControlFingerprint;
+    this->activeControlForce = snapshot.activeControlForce;
+    this->acceptedControllerState = snapshot.acceptedControllerState;
+    this->candidateControllerState = snapshot.candidateControllerState;
+    this->trialControlRecord = snapshot.trialControlRecord;
+    this->controlSensors = snapshot.controlSensors;
     this->dynamicsStepSnapshot.reset();
 }
 
 void RSolverStress::commitStepTransaction()
 {
+    if (this->controlLedger)
+    {
+        this->controlLedger->accept();
+        this->acceptedControllerState = std::move(this->candidateControllerState);
+    }
     this->acceptedSupportSamples = std::move(this->trialSupportSamples);
     this->trialSupportSamples.clear();
     this->dynamicsStepSnapshot.reset();
@@ -673,6 +719,46 @@ void RSolverStress::commitStepTransaction()
             RLogger::warning("Support-response observer failed after commit.\n");
         }
     }
+    if (this->controlStepObserver && this->controlLedger)
+    {
+        try { this->controlStepObserver(this->trialControlRecord); }
+        catch (const std::exception &error)
+        {
+            this->pendingControlObserverFailure = QString::fromUtf8(error.what());
+            RLogger::warning("Control observer failed after committed result: %s\n",error.what());
+        }
+        catch (...)
+        {
+            this->pendingControlObserverFailure = "Unknown control observer failure";
+            RLogger::warning("Control observer failed after committed result.\n");
+        }
+    }
+}
+
+void RSolverStress::setControlCallback(
+    const QString &id, const QString &revision,
+    std::function<RStructuralControlDecision(const RStructuralControlObservation &)> callback)
+{
+    this->controllerId = id;
+    this->controllerRevision = revision;
+    this->controlCallback = std::move(callback);
+}
+
+void RSolverStress::setControlStepObserver(
+    std::function<void(const RStructuralControlStepRecord &)> observer)
+{
+    this->controlStepObserver = std::move(observer);
+}
+
+std::vector<RStructuralControlChannelSample> RSolverStress::getAcceptedControlSamples() const
+{
+    return this->controlLedger ? this->controlLedger->accepted()
+                               : std::vector<RStructuralControlChannelSample>();
+}
+
+QString RSolverStress::getPendingControlObserverFailure() const
+{
+    return this->pendingControlObserverFailure;
 }
 
 void RSolverStress::setSupportResponseObserver(
@@ -1953,6 +2039,229 @@ std::vector<RStructuralDofRef> RSolverStress::orderedPhysicalDofs() const
     return ordered;
 }
 
+void RSolverStress::prepareControlMapping()
+{
+    if (this->controlForceMap) return;
+    const auto &catalog = this->pModel->getProblemSetup().getStructuralInteractionSetup();
+    const auto &actuators = catalog.getActuators();
+    const auto &sensors = catalog.getSensors();
+    if (actuators.empty())
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Enabled structural control needs at least one nodal actuator.");
+    const uint n = this->A.getNRows();
+    auto equationDirection = [this](uint node, const RR3Vector &global,
+                                     const QString &id) -> RR3Vector
+    {
+        if (node >= this->pModel->getNNodes())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Control target '%s' references a missing node.",id.toUtf8().constData());
+        if (!this->localRotations[node].isActive()) return global;
+        const RRMatrix &rotation = this->localRotations[node].getR();
+        RR3Vector local(0.0,0.0,0.0);
+        for (uint component=0;component<3;component++)
+            for (uint globalAxis=0;globalAxis<3;globalAxis++)
+                local[component] += rotation[globalAxis][component]*global[globalAxis];
+        return local;
+    };
+    auto weightsForNode = [this,n,&equationDirection](uint node, const RR3Vector &globalDirection,
+                                    const QString &id) -> std::vector<std::pair<uint,double>>
+    {
+        if (node >= this->pModel->getNNodes())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Control target '%s' references a missing node.",id.toUtf8().constData());
+        const RR3Vector direction = equationDirection(node,globalDirection,id);
+        std::map<uint,double> nonzero;
+        for (uint component=0;component<3;component++)
+        {
+            const double value = direction[component];
+            if (std::fabs(value) <= 1.0e-14) continue;
+            uint equation = 0;
+            if (!this->equationBook.getValue(node,translationDof(component),equation) ||
+                equation >= this->nPhysicalEquations)
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Control target '%s' includes a held or absent translation DOF.",
+                             id.toUtf8().constData());
+            if (this->constraintNullspace.getNRows() == 0)
+                nonzero[equation] += value;
+            else
+                for (uint reduced=0;reduced<n;reduced++)
+                    if (std::fabs(this->constraintNullspace[equation][reduced]) > 1.0e-14)
+                        nonzero[reduced] += value*this->constraintNullspace[equation][reduced];
+        }
+        std::vector<std::pair<uint,double>> result;
+        for (const auto &entry : nonzero)
+            if (std::fabs(entry.second) > 1.0e-14)
+                result.push_back(entry);
+        if (result.empty())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Control target '%s' has no independent reduced DOF.",
+                         id.toUtf8().constData());
+        return result;
+    };
+    auto unitDirection = [](const RR3Vector &input, const QString &id) -> RR3Vector
+    {
+        const double norm = input.length();
+        if (!std::isfinite(norm) || norm <= 1.0e-12)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Control target '%s' needs a finite nonzero global direction.",
+                         id.toUtf8().constData());
+        return RR3Vector(input[0]/norm,input[1]/norm,input[2]/norm);
+    };
+    std::vector<RStructuralControlChannelMap> channels;
+    channels.reserve(actuators.size());
+    for (const auto &actuator : actuators)
+    {
+        if (actuator.type != RStructuralActuatorType::NodalForce ||
+            actuator.target.scope != RStructuralTargetScope::Node ||
+            actuator.frame != RStructuralFrame::Global)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Control actuator '%s' needs point-node global NodalForce v1.",
+                         actuator.id.toUtf8().constData());
+        RR3Vector direction = actuator.direction;
+        switch (actuator.variable)
+        {
+            case R_VARIABLE_FORCE_X: direction = RR3Vector(1.0,0.0,0.0); break;
+            case R_VARIABLE_FORCE_Y: direction = RR3Vector(0.0,1.0,0.0); break;
+            case R_VARIABLE_FORCE_Z: direction = RR3Vector(0.0,0.0,1.0); break;
+            case R_VARIABLE_FORCE: direction = unitDirection(direction,actuator.id); break;
+            default:
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Control actuator '%s' has unsupported command variable.",
+                             actuator.id.toUtf8().constData());
+        }
+        channels.push_back({actuator.id,weightsForNode(actuator.target.nodeId,direction,actuator.id)});
+    }
+    this->controlSensors.clear();
+    this->controlSensors.reserve(sensors.size());
+    for (const auto &sensor : sensors)
+    {
+        if (sensor.target.scope != RStructuralTargetScope::Node ||
+            sensor.frame != RStructuralFrame::Global ||
+            (sensor.quantity != RStructuralSensorQuantity::Displacement &&
+             sensor.quantity != RStructuralSensorQuantity::Velocity &&
+             sensor.quantity != RStructuralSensorQuantity::Acceleration))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Control sensor '%s' needs point-node global displacement, velocity or acceleration v1.",
+                         sensor.id.toUtf8().constData());
+        const RR3Vector direction = unitDirection(sensor.direction,sensor.id);
+        const RR3Vector localDirection = equationDirection(sensor.target.nodeId,direction,sensor.id);
+        double particular = 0.0;
+        if (this->constraintNullspace.getNRows() != 0 &&
+            sensor.quantity == RStructuralSensorQuantity::Displacement)
+        {
+            for (uint component=0;component<3;component++)
+            {
+                if (std::fabs(localDirection[component]) <= 1.0e-14) continue;
+                uint equation = 0;
+                if (!this->equationBook.getValue(sensor.target.nodeId,
+                                                 translationDof(component),equation))
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Control sensor '%s' includes a held DOF.",
+                                 sensor.id.toUtf8().constData());
+                particular += localDirection[component]*this->constraintParticular[equation];
+            }
+        }
+        this->controlSensors.push_back({sensor.id,sensor.quantity,sensor.unit,
+            weightsForNode(sensor.target.nodeId,direction,sensor.id),particular});
+    }
+    this->controlForceMap.reset(new RStructuralControlForceMap(
+        n,this->scales.findScaleFactor(R_VARIABLE_FORCE_X),
+        this->scales.findScaleFactor(R_VARIABLE_VELOCITY_X),std::move(channels)));
+    this->controlLedger.reset(new RStructuralControlLedger(*this->controlForceMap));
+    this->activeControlCommands.clear();
+    for (const auto &channel : this->controlForceMap->getChannels())
+        this->activeControlCommands.push_back({channel.actuatorId,0.0});
+    this->activeControlForce.resize(n,0.0);
+    this->cachedControlFingerprint = this->controlMappingFingerprint();
+}
+
+QString RSolverStress::controlMappingFingerprint() const
+{
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    hash.addData("range-fea/control-map/v1;");
+    const auto &setup = this->pModel->getProblemSetup().getStructuralControlSetup();
+    hash.addData(setup.controllerId.toUtf8()); hash.addData(";");
+    hash.addData(this->controllerRevision.toUtf8()); hash.addData(";");
+    hash.addData(QByteArray::number(setup.deterministicSeed)); hash.addData(";");
+    hash.addData(this->dynamicSystemFingerprint().toUtf8()); hash.addData(";");
+    const auto &actuators = this->pModel->getProblemSetup().getStructuralInteractionSetup().getActuators();
+    for (size_t i=0;i<actuators.size();i++)
+    {
+        const auto &a = actuators[i];
+        hash.addData(a.id.toUtf8()); hash.addData(";");
+        hash.addData(QByteArray::number(int(a.type))); hash.addData(";");
+        hash.addData(QByteArray::number(int(a.variable))); hash.addData(";");
+        hash.addData(QByteArray::number(int(a.frame))); hash.addData(";");
+        hash.addData(QByteArray::number(a.target.nodeId)); hash.addData(";");
+        hash.addData(a.unit.toUtf8()); hash.addData(";");
+        for (uint axis=0;axis<3;axis++)
+        {
+            hash.addData(QByteArray::number(a.direction[axis],'g',17)); hash.addData(";");
+        }
+        for (double limit : {a.minimum,a.maximum,a.rateLimit})
+        {
+            hash.addData(QByteArray::number(limit,'g',17)); hash.addData(";");
+        }
+        for (const auto &weight : this->controlForceMap->getChannels()[i].reducedWeights)
+        {
+            hash.addData(QByteArray::number(weight.first)); hash.addData(":");
+            hash.addData(QByteArray::number(weight.second,'g',17)); hash.addData(";");
+        }
+    }
+    const auto &sensorCatalog = this->pModel->getProblemSetup().getStructuralInteractionSetup().getSensors();
+    for (size_t i=0;i<this->controlSensors.size();i++)
+    {
+        const auto &sensor = this->controlSensors[i];
+        const auto &definition = sensorCatalog[i];
+        hash.addData(sensor.id.toUtf8()); hash.addData(":");
+        hash.addData(QByteArray::number(int(sensor.quantity))); hash.addData(":");
+        hash.addData(QByteArray::number(int(definition.frame))); hash.addData(":");
+        hash.addData(QByteArray::number(definition.target.nodeId)); hash.addData(":");
+        hash.addData(sensor.unit.toUtf8()); hash.addData(":");
+        for (uint axis=0;axis<3;axis++)
+        {
+            hash.addData(QByteArray::number(definition.direction[axis],'g',17)); hash.addData(";");
+        }
+        hash.addData(QByteArray::number(sensor.displacementOffset,'g',17)); hash.addData(";");
+        for (const auto &weight : sensor.weights)
+        {
+            hash.addData(QByteArray::number(weight.first)); hash.addData(":");
+            hash.addData(QByteArray::number(weight.second,'g',17)); hash.addData(";");
+        }
+    }
+    return QString::fromLatin1(hash.result().toHex());
+}
+
+std::vector<RStructuralControlSensorSample> RSolverStress::sampleControlSensors(
+    const RStructuralDynamicsState &state) const
+{
+    std::vector<RStructuralControlSensorSample> samples;
+    samples.reserve(this->controlSensors.size());
+    for (const auto &sensor : this->controlSensors)
+    {
+        const RRVector *source = nullptr;
+        RVariableType scaleType = R_VARIABLE_DISPLACEMENT_X;
+        if (sensor.quantity == RStructuralSensorQuantity::Displacement)
+            source = &state.q;
+        else if (sensor.quantity == RStructuralSensorQuantity::Velocity)
+        {
+            source = &state.v; scaleType = R_VARIABLE_VELOCITY_X;
+        }
+        else
+        {
+            source = &state.a; scaleType = R_VARIABLE_ACCELERATION_X;
+        }
+        double value = 0.0;
+        for (const auto &weight : sensor.weights)
+            value += weight.second*(*source)[weight.first];
+        if (sensor.quantity == RStructuralSensorQuantity::Displacement)
+            value += sensor.displacementOffset;
+        value /= this->scales.findScaleFactor(scaleType);
+        samples.push_back({sensor.id,value,sensor.unit});
+    }
+    return samples;
+}
+
 QString RSolverStress::motionDefinitionFingerprint() const
 {
     QCryptographicHash hash(QCryptographicHash::Sha256);
@@ -2508,6 +2817,10 @@ QString RSolverStress::supportResponseFingerprint() const
 void RSolverStress::solveStructuralDynamics()
 {
     const RStructuralDynamicsSetup &setup = this->pModel->getProblemSetup().getStructuralDynamicsSetup();
+    const RStructuralControlSetup &controlSetup = this->pModel->getProblemSetup().getStructuralControlSetup();
+    if (controlSetup.enabled && !this->controlCallback)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Enabled structural control has no registered provider.");
     const bool useModalDamping = !setup.getModalDampingRatios().empty();
     if (useModalDamping &&
         (setup.getRayleighAlpha() != 0.0 || setup.getRayleighBeta() != 0.0))
@@ -2607,6 +2920,8 @@ void RSolverStress::solveStructuralDynamics()
     }
     this->currentDynamicForce = this->b;
     this->currentDynamicTime = this->pModel->getTimeSolver().getCurrentTime();
+    if (controlSetup.enabled && !this->controlForceMap)
+        this->prepareControlMapping();
     if (!this->dynamicsIntegrator)
     {
         const RStructuralDynamicsRestartData &restartData =
@@ -2634,6 +2949,32 @@ void RSolverStress::solveStructuralDynamics()
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                          "Support-work restart constrained operator or support identity changed.");
         }
+        if (controlSetup.enabled && this->pModel->getProblemSetup().getRestart())
+        {
+            if (!restartData.controlAvailable ||
+                restartData.controlProtocolVersion != controlSetup.controlProtocolVersion ||
+                restartData.controlDeterministicSeed != controlSetup.deterministicSeed ||
+                restartData.controlFingerprint != this->cachedControlFingerprint ||
+                restartData.controlChannelIds.size() != this->activeControlCommands.size())
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Structural control restart protocol, seed, actuator map or ledger does not match.");
+            std::vector<RStructuralControlChannelSample> samples;
+            for (size_t i=0;i<this->activeControlCommands.size();i++)
+            {
+                if (restartData.controlChannelIds[i] != this->activeControlCommands[i].actuatorId)
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Structural control restart actuator order changed.");
+                samples.push_back({restartData.controlChannelIds[i],
+                                   restartData.controlLastCommands[i],
+                                   restartData.controlPowers[i],
+                                   restartData.cumulativeControlWork[i]});
+                this->activeControlCommands[i].value = restartData.controlLastCommands[i];
+            }
+            this->controlLedger->restore(samples);
+            this->acceptedControllerState = restartData.controlControllerState;
+            this->activeControlForce.fill(0.0);
+            this->controlForceMap->addForce(this->activeControlCommands,this->activeControlForce);
+        }
         if (this->initialDynamicForce.size() != this->currentDynamicForce.size())
         {
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
@@ -2651,6 +2992,11 @@ void RSolverStress::solveStructuralDynamics()
                 // Checkpoint force is effective; interpolation stores bare f_f.
                 this->previousDynamicForce[row] -= supportForce[row];
             }
+        }
+        if (controlSetup.enabled && this->pModel->getProblemSetup().getRestart())
+        {
+            for (uint row=0;row<this->previousDynamicForce.size();row++)
+                this->previousDynamicForce[row] -= this->activeControlForce[row];
         }
         RSparseMatrix damping;
         if (useModalDamping)
@@ -2682,7 +3028,8 @@ void RSolverStress::solveStructuralDynamics()
                 }
             }
         }
-        auto force = [this](double time, const RStructuralDynamicsState &, RRVector &values)
+        auto force = [this, controlEnabled=controlSetup.enabled](
+            double time, const RStructuralDynamicsState &, RRVector &values)
         {
             values = this->currentDynamicForce;
             const double span = this->currentDynamicTime-this->previousDynamicTime;
@@ -2702,6 +3049,11 @@ void RSolverStress::solveStructuralDynamics()
                 {
                     values[row] += supportForce[row];
                 }
+            }
+            if (controlEnabled)
+            {
+                for (uint row=0;row<values.size();row++)
+                    values[row] += this->activeControlForce[row];
             }
         };
         this->dynamicsIntegrator.reset(new RStructuralDynamicsIntegrator(
@@ -2777,9 +3129,78 @@ void RSolverStress::solveStructuralDynamics()
                      this->pModel->getTimeSolver().getPreviousTime(),
                      this->pModel->getTimeSolver().getInputTimeStepSize());
     }
+    RRVector controlStartingVelocity;
+    if (controlSetup.enabled)
+    {
+        const RStructuralDynamicsState &accepted = this->dynamicsIntegrator->acceptedState();
+        controlStartingVelocity = accepted.v;
+        RStructuralControlObservation observation;
+        observation.acceptedTime = accepted.time/this->scales.getSecond();
+        observation.nextTime = (accepted.time+dt)/this->scales.getSecond();
+        observation.deterministicSeed = controlSetup.deterministicSeed;
+        observation.sensors = this->sampleControlSensors(accepted);
+        observation.priorControllerState = this->acceptedControllerState;
+        const RStructuralControlDecision decision = this->controlCallback(observation);
+        if (decision.requestedCommands.size() != this->activeControlCommands.size() ||
+            decision.nextControllerState.size() > 1024*1024)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Control provider returned wrong channel count or oversized controller state.");
+        std::vector<RStructuralControlCommand> applied;
+        applied.reserve(decision.requestedCommands.size());
+        const auto &actuators = this->pModel->getProblemSetup().getStructuralInteractionSetup().getActuators();
+        bool changed = false;
+        for (size_t i=0;i<decision.requestedCommands.size();i++)
+        {
+            const auto &request = decision.requestedCommands[i];
+            const auto &actuator = actuators[i];
+            if (request.actuatorId != this->activeControlCommands[i].actuatorId ||
+                !std::isfinite(request.value) || std::isnan(actuator.minimum) ||
+                std::isnan(actuator.maximum) || std::isnan(actuator.rateLimit) ||
+                actuator.minimum > actuator.maximum || actuator.rateLimit < 0.0)
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Control provider command or actuator bounds are invalid for '%s'.",
+                             actuator.id.toUtf8().constData());
+            const double previous = this->controlLedger->accepted()[i].command;
+            const double maxDelta = actuator.rateLimit*(dt/this->scales.getSecond());
+            const double lower = std::max(actuator.minimum,previous-maxDelta);
+            const double upper = std::min(actuator.maximum,previous+maxDelta);
+            if (lower > upper)
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Control actuator '%s' has incompatible magnitude and rate limits.",
+                             actuator.id.toUtf8().constData());
+            const double value = std::clamp(request.value,lower,upper);
+            changed = changed || value != this->activeControlCommands[i].value;
+            applied.push_back({request.actuatorId,value});
+        }
+        if (changed)
+        {
+            RRVector force(this->A.getNRows(),0.0);
+            this->controlForceMap->addForce(applied,force);
+            this->activeControlForce = std::move(force);
+            this->activeControlCommands = applied;
+            // A command jump is a force discontinuity at t_n. Refresh a_n
+            // before Newmark predicts, otherwise the first interval looks
+            // like a ramp and the held-command work ledger is inconsistent.
+            this->dynamicsIntegrator->refreshAcceptedForce();
+        }
+        this->candidateControllerState = decision.nextControllerState;
+        this->trialControlRecord = {};
+        this->trialControlRecord.acceptedTime = observation.acceptedTime;
+        this->trialControlRecord.nextTime = observation.nextTime;
+        this->trialControlRecord.sensors = observation.sensors;
+        this->trialControlRecord.requestedCommands = decision.requestedCommands;
+        this->trialControlRecord.controllerStateSha256 =
+            QCryptographicHash::hash(decision.nextControllerState,QCryptographicHash::Sha256).toHex();
+    }
     this->dynamicsIntegrator->trialStep(dt);
     this->dynamicsIntegrator->acceptStep();
     const RStructuralDynamicsState &state = this->dynamicsIntegrator->acceptedState();
+    if (controlSetup.enabled)
+    {
+        this->controlLedger->trial(*this->controlForceMap,this->activeControlCommands,
+                                   controlStartingVelocity,state.v,dt/this->scales.getSecond());
+        this->trialControlRecord.appliedChannels = this->controlLedger->candidate();
+    }
     if (this->supportResponseObserver)
     {
         this->trialSupportSamples = this->computeSupportSamples(state,this->supportForce);
@@ -3768,6 +4189,28 @@ void RSolverStress::store()
                 restart.supportReactions.push_back(sample.reaction);
                 restart.supportPowers.push_back(sample.power);
                 restart.cumulativeSupportWork.push_back(sample.cumulativeWork);
+            }
+            restart.controlAvailable = bool(this->controlForceMap);
+            restart.controlProtocolVersion = 1;
+            restart.controlFingerprint = this->controlForceMap
+                ? this->cachedControlFingerprint : QString();
+            restart.controlChannelIds.clear();
+            restart.controlLastCommands.clear();
+            restart.controlPowers.clear();
+            restart.cumulativeControlWork.clear();
+            restart.controlControllerState = this->controlForceMap
+                ? this->candidateControllerState : QByteArray();
+            restart.controlDeterministicSeed = this->controlForceMap
+                ? this->pModel->getProblemSetup().getStructuralControlSetup().deterministicSeed : 0;
+            if (this->controlForceMap)
+            {
+                for (const auto &sample : this->controlLedger->candidate())
+                {
+                    restart.controlChannelIds.push_back(sample.actuatorId);
+                    restart.controlLastCommands.push_back(sample.command);
+                    restart.controlPowers.push_back(sample.endpointPower);
+                    restart.cumulativeControlWork.push_back(sample.cumulativeWork);
+                }
             }
             restart.available = true;
             if (restart.q.size() != restart.v.size() ||

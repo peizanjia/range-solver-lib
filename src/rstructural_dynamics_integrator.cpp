@@ -121,6 +121,39 @@ RRVector RStructuralDynamicsIntegrator::evaluateForce(double time) const
     return result;
 }
 
+const RSparseMatrix &RStructuralDynamicsIntegrator::operatorForStep(double dt)
+{
+    if (this->stepOperatorDt == dt)
+    {
+        return this->stepOperator;
+    }
+    RSparseMatrix assembled;
+    assembled.setNRows(this->mass.getNRows());
+    if (this->options.method == Method::CentralDifference)
+    {
+        addScaled(assembled,this->mass,1.0);
+        addScaled(assembled,this->damping,0.5*dt);
+    }
+    else
+    {
+        double alphaM = 0.0, alphaF = 0.0;
+        if (this->options.method == Method::GeneralizedAlpha)
+        {
+            const double rho = this->options.rhoInfinity;
+            alphaM = (2.0*rho-1.0)/(rho+1.0);
+            alphaF = rho/(rho+1.0);
+        }
+        const double gamma = 0.5-alphaM+alphaF;
+        const double beta = 0.25*std::pow(1.0-alphaM+alphaF,2.0);
+        addScaled(assembled,this->mass,1.0-alphaM);
+        addScaled(assembled,this->damping,(1.0-alphaF)*gamma*dt);
+        addScaled(assembled,this->stiffness,(1.0-alphaF)*beta*dt*dt);
+    }
+    this->stepOperator = std::move(assembled);
+    this->stepOperatorDt = dt;
+    return this->stepOperator;
+}
+
 RRVector RStructuralDynamicsIntegrator::solve(const RSparseMatrix &matrix, const RRVector &rhs) const
 {
     RMatrixSolver linearSolver(this->solverConf);
@@ -159,6 +192,20 @@ void RStructuralDynamicsIntegrator::initialize(const RRVector &q0, const RRVecto
     this->initialized = true;
 }
 
+void RStructuralDynamicsIntegrator::refreshAcceptedForce()
+{
+    if (!this->initialized) throw std::logic_error("Dynamics integrator is not initialized");
+    if (this->candidateReady)
+        throw std::logic_error("Cannot refresh accepted force while a trial step is pending");
+    RRVector refreshed = this->evaluateForce(this->accepted.time);
+    RRVector rhs = refreshed;
+    addScaled(rhs,product(this->damping,this->accepted.v),-1.0);
+    addScaled(rhs,product(this->stiffness,this->accepted.q),-1.0);
+    RRVector acceleration = this->solve(this->mass,rhs);
+    this->accepted.externalForce = std::move(refreshed);
+    this->accepted.a = std::move(acceleration);
+}
+
 const RStructuralDynamicsState &RStructuralDynamicsIntegrator::trialStep(double dt)
 {
     if (!this->initialized) throw std::logic_error("Dynamics integrator is not initialized");
@@ -184,10 +231,7 @@ const RStructuralDynamicsState &RStructuralDynamicsIntegrator::trialStep(double 
         addScaled(rhs,product(this->damping,previousHalf),-0.5*dt);
         addScaled(rhs,this->accepted.externalForce,dt);
         addScaled(rhs,product(this->stiffness,this->accepted.q),-dt);
-        RSparseMatrix halfMatrix;
-        halfMatrix.setNRows(this->mass.getNRows());
-        addScaled(halfMatrix,this->mass,1.0);
-        addScaled(halfMatrix,this->damping,0.5*dt);
+        const RSparseMatrix &halfMatrix = this->operatorForStep(dt);
         RRVector nextHalf = this->solve(halfMatrix,rhs);
         next.q = this->accepted.q;
         addScaled(next.q,nextHalf,dt);
@@ -229,12 +273,7 @@ const RStructuralDynamicsState &RStructuralDynamicsIntegrator::trialStep(double 
         addScaled(weightedDisplacement,this->accepted.q,alphaF);
         addScaled(rhs,product(this->stiffness,weightedDisplacement),-1.0);
 
-        RSparseMatrix effective;
-        effective.setNRows(this->mass.getNRows());
-        addScaled(effective,this->mass,1.0-alphaM);
-        addScaled(effective,this->damping,(1.0-alphaF)*gamma*dt);
-        addScaled(effective,this->stiffness,(1.0-alphaF)*beta*dt*dt);
-        next.a = this->solve(effective,rhs);
+        next.a = this->solve(this->operatorForStep(dt),rhs);
         next.q = qPredictor;
         addScaled(next.q,next.a,beta*dt*dt);
         next.v = vPredictor;

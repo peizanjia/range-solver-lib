@@ -30,6 +30,8 @@ qt_add_library(range-solver-lib
         src/rsolvershareddata.cpp
         src/rsolverstress.cpp
         src/rstructural_dynamics_integrator.cpp
+        src/rstructural_control_force_map.cpp
+        src/rstructural_control_conditioner.cpp
         src/rstructural_dynamics_support.cpp
         src/rsolverwave.cpp
 
@@ -62,6 +64,9 @@ qt_add_library(range-solver-lib
         include/rsolvershareddata.h
         include/rsolverstress.h
         include/rstructural_dynamics_integrator.h
+        include/rstructural_control_force_map.h
+        include/rstructural_control_conditioner.h
+        include/rstructural_control_protocol.h
         include/rstructural_dynamics_support.h
         include/rsolverwave.h
 )

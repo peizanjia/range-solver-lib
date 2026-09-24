@@ -5,9 +5,11 @@
 #include <rml_structural_interaction.h>
 #include <functional>
 #include <memory>
+#include <QString>
 
 #include "requationbook.h"
 #include "rstructural_support_response.h"
+#include "rstructural_control_protocol.h"
 #include "rsolvergeneric.h"
 
 class RStructuralDynamicsIntegrator;
@@ -116,6 +118,28 @@ class RSolverStress : public RSolverGeneric
         std::function<void(const std::vector<RStructuralSupportSample> &)> supportResponseObserver;
         std::vector<RStructuralSupportSample> acceptedSupportSamples;
         std::vector<RStructuralSupportSample> trialSupportSamples;
+        QString controllerId;
+        QString controllerRevision;
+        std::function<RStructuralControlDecision(const RStructuralControlObservation &)> controlCallback;
+        std::function<void(const RStructuralControlStepRecord &)> controlStepObserver;
+        std::unique_ptr<RStructuralControlForceMap> controlForceMap;
+        std::unique_ptr<RStructuralControlLedger> controlLedger;
+        QString cachedControlFingerprint;
+        std::vector<RStructuralControlCommand> activeControlCommands;
+        RRVector activeControlForce;
+        QByteArray acceptedControllerState;
+        QByteArray candidateControllerState;
+        RStructuralControlStepRecord trialControlRecord;
+        QString pendingControlObserverFailure;
+        struct ControlSensorMap
+        {
+            QString id;
+            RStructuralSensorQuantity quantity;
+            QString unit;
+            std::vector<std::pair<uint,double>> weights;
+            double displacementOffset = 0.0;
+        };
+        std::vector<ControlSensorMap> controlSensors;
         std::vector<RStructuralDofRef> heldDofs;
         std::vector<int> heldIndexByNodeDof;
         std::vector<bool> pointSupportMask;
@@ -145,6 +169,11 @@ class RSolverStress : public RSolverGeneric
 
         void setSupportResponseObserver(std::function<void(const std::vector<RStructuralSupportSample> &)> observer);
         std::vector<RStructuralSupportSample> getAcceptedSupportSamples() const;
+        void setControlCallback(const QString &id, const QString &revision,
+                                std::function<RStructuralControlDecision(const RStructuralControlObservation &)> callback);
+        void setControlStepObserver(std::function<void(const RStructuralControlStepRecord &)> observer);
+        std::vector<RStructuralControlChannelSample> getAcceptedControlSamples() const;
+        QString getPendingControlObserverFailure() const;
 
     protected:
 
@@ -233,6 +262,10 @@ class RSolverStress : public RSolverGeneric
         void motionEffectiveForce(double time, RRVector &force) const;
         void setPrescribedMotionResults(double time);
         void prepareSupportResponse();
+        void prepareControlMapping();
+        QString controlMappingFingerprint() const;
+        std::vector<RStructuralControlSensorSample> sampleControlSensors(
+            const RStructuralDynamicsState &state) const;
         std::vector<RStructuralSupportSample> computeSupportSamples(
             const RStructuralDynamicsState &state, const RRVector &heldForce,
             bool initialOperator = false) const;

@@ -75,6 +75,12 @@ class RStructuralDynamicsIntegrator
         //! Solves M a0=f(t0)-C v0-K q0.
         void initialize(const RRVector &q0, const RRVector &v0, double time0 = 0.0);
 
+        //! Re-evaluate a discontinuous, held control load at the accepted
+        //! boundary. Call before trialStep() when the controller changes its
+        //! command; failure leaves the accepted state unchanged. The caller
+        //! must restore its outer transaction if the trial is rejected.
+        void refreshAcceptedForce();
+
         //! Computes a candidate without changing the committed state. Once accepted, dt is fixed.
         const RStructuralDynamicsState &trialStep(double dt);
         void acceptStep();
@@ -101,10 +107,15 @@ class RStructuralDynamicsIntegrator
         double initialMechanicalEnergy = 0.0;
         //! Certified conservative limit from a strictly diagonally dominant mass matrix.
         double centralDifferenceStepLimit = 0.0;
+        //! Fixed-operator dynamics assembles the dt-dependent sparse system once.
+        //! Force/controller changes affect only the RHS, never this matrix.
+        RSparseMatrix stepOperator;
+        double stepOperatorDt = 0.0;
         bool initialized = false;
         bool candidateReady = false;
 
         RRVector evaluateForce(double time) const;
+        const RSparseMatrix &operatorForStep(double dt);
         RRVector solve(const RSparseMatrix &matrix, const RRVector &rhs) const;
         void updateEnergy(RStructuralDynamicsState &state, double dt) const;
 };
