@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include <rbl_application_state.h>
 #include <rbl_error.h>
@@ -155,10 +156,19 @@ RSolver::~RSolver()
     }
 }
 
+void RSolver::setParallelExecutionReportObserver(ParallelExecutionReportObserver observer)
+{
+    this->parallelExecutionReportObserver = std::move(observer);
+}
+
 void RSolver::run()
 {
     RParallelExecutionContext parallelContext(this->pModel->getProblemSetup().getParallelExecutionConfig());
     const RParallelExecutionReport &parallel = parallelContext.getReport();
+    if (this->parallelExecutionReportObserver)
+    {
+        this->parallelExecutionReportObserver(parallel);
+    }
     RLogger::info("Parallel execution: requested=%u applied=%u actual=%u backend=%s deterministic=%s\n",
                   parallel.requestedThreads,parallel.appliedThreads,parallel.actualThreads,
                   parallel.backend.toUtf8().constData(),parallel.deterministicReduction ? "yes" : "no");

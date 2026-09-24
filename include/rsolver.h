@@ -1,15 +1,22 @@
 #ifndef RSOLVER_H
 #define RSOLVER_H
 
+#include <functional>
+
 #include <rml_model.h>
 
 #include "rsolvergeneric.h"
 #include "rsolvershareddata.h"
 
+struct RParallelExecutionReport;
+
 class RSolver
 {
 
     public:
+
+        using ParallelExecutionReportObserver =
+            std::function<void(const RParallelExecutionReport &)>;
 
         enum class ExecutionPolicy
         {
@@ -33,6 +40,8 @@ class RSolver
         QMap<RProblemTypeMask,RSolverGeneric*> solvers;
         //! Map of sover type and execution count.
         QMap<RProblemType,uint> solversExecutionCount;
+        //! Optional synchronous observation of the run's scoped OpenMP report.
+        ParallelExecutionReportObserver parallelExecutionReportObserver;
 
     private:
 
@@ -58,6 +67,12 @@ class RSolver
 
         //! Run solver.
         void run();
+
+        //! Called once after the parallel context is created and before any
+        //! time step or result write. The report's actualThreads is a scope
+        //! probe, not a count measured separately in every kernel. An
+        //! exception aborts run() before solving.
+        void setParallelExecutionReportObserver(ParallelExecutionReportObserver observer);
 
     protected:
 

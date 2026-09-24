@@ -1,6 +1,10 @@
 #include <QtTest>
 
 #include <QElapsedTimer>
+#include <QFile>
+#include <QTemporaryDir>
+
+#include <omp.h>
 
 #include <algorithm>
 #include <array>
@@ -8,9 +12,11 @@
 #include <cstdio>
 #include <exception>
 #include <limits>
+#include <stdexcept>
 #include <vector>
 
 #include "rml_model.h"
+#include "rparallel_execution_context.h"
 #include "rsolver.h"
 
 namespace
@@ -33,6 +39,8 @@ struct RunResult
     std::vector<double> acceleration;
     RStructuralDynamicsRestartData checkpoint;
     double mechanicalEnergy = 0.0;
+    RParallelExecutionReport parallelReport;
+    uint reportCalls = 0;
 };
 
 struct Policy
@@ -177,8 +185,23 @@ RunResult runCase(const Policy &policy)
         QElapsedTimer timer;
         timer.start();
         RSolver solver(model,QString(),QString());
+        solver.setParallelExecutionReportObserver(
+            [&result](const RParallelExecutionReport &report)
+            {
+                result.parallelReport = report;
+                ++result.reportCalls;
+            });
         solver.run();
         result.elapsedMs = double(timer.nsecsElapsed())/1.0e6;
+
+        if (result.reportCalls != 1 || result.parallelReport.mode != policy.mode ||
+            result.parallelReport.backend != QStringLiteral("OpenMP") ||
+            result.parallelReport.actualThreads < 1 ||
+            result.parallelReport.actualThreads > result.parallelReport.appliedThreads)
+        {
+            result.error = "Solver did not report its scoped parallel context exactly once";
+            return result;
+        }
 
         if (!extractNodalValues(model,R_VARIABLE_DISPLACEMENT,result.displacement) ||
             !extractNodalValues(model,R_VARIABLE_VELOCITY,result.velocity) ||
@@ -327,6 +350,7 @@ class TestStructuralDynamicsParallelRepro : public QObject
 
 private slots:
     void policiesAgreeAcrossRepeatedRuns();
+    void observerFailureStopsBeforeTimeStepOrDiskWrite();
 };
 
 void TestStructuralDynamicsParallelRepro::policiesAgreeAcrossRepeatedRuns()
@@ -390,6 +414,48 @@ void TestStructuralDynamicsParallelRepro::policiesAgreeAcrossRepeatedRuns()
     }
     // Wall-clock numbers are diagnostic only: CI load and thread availability
     // vary, so this test intentionally has no minimum speedup assertion.
+}
+
+void TestStructuralDynamicsParallelRepro::observerFailureStopsBeforeTimeStepOrDiskWrite()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString output = directory.filePath(QStringLiteral("observer-abort.ram"));
+    const Policy policy{"serial",RParallelExecutionMode::SerialDeterministic,0};
+    RModel model = makeChain(policy);
+    RSolver solver(model,output,QString());
+    const uint stepBefore = model.getTimeSolver().getCurrentTimeStep();
+    const double computedTimeBefore = model.getTimeSolver().getComputedTime();
+    const bool timeEnabledBefore = model.getTimeSolver().getEnabled();
+    const int ompMaxBefore = omp_get_max_threads();
+    uint reportCalls = 0;
+    RParallelExecutionReport observed;
+    solver.setParallelExecutionReportObserver(
+        [&](const RParallelExecutionReport &report)
+        {
+            observed = report;
+            ++reportCalls;
+            throw std::runtime_error("observer refused run");
+        });
+    bool rejected = false;
+    try
+    {
+        solver.run();
+    }
+    catch (const std::runtime_error &error)
+    {
+        rejected = QString::fromUtf8(error.what()) == QStringLiteral("observer refused run");
+    }
+    QVERIFY(rejected);
+    QCOMPARE(reportCalls,1u);
+    QCOMPARE(observed.mode,RParallelExecutionMode::SerialDeterministic);
+    QCOMPARE(observed.actualThreads,1u);
+    QCOMPARE(omp_get_max_threads(),ompMaxBefore);
+    QCOMPARE(model.getTimeSolver().getCurrentTimeStep(),stepBefore);
+    QCOMPARE(model.getTimeSolver().getComputedTime(),computedTimeBefore);
+    QCOMPARE(model.getTimeSolver().getEnabled(),timeEnabledBefore);
+    QVERIFY(!model.getProblemSetup().getStructuralDynamicsRestartData().available);
+    QVERIFY(!QFile::exists(output));
 }
 
 QTEST_APPLESS_MAIN(TestStructuralDynamicsParallelRepro)
