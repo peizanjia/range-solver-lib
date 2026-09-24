@@ -66,6 +66,7 @@ private slots:
     void centralDifference();
     void centralDifferenceStabilityGuard();
     void trialRejectAndCheckpoint();
+    void acceptedPowerLedgerIsCommittedAndRestored();
     void invalidStepAndForce();
 };
 
@@ -180,6 +181,56 @@ void TestStructuralDynamicsIntegrator::trialRejectAndCheckpoint()
     QCOMPARE(integrator.acceptedState().time,0.02);
     QVERIFY(!integrator.hasCandidate());
     QCOMPARE(integrator.acceptedState().q[0],saved.state.q[0]);
+}
+
+void TestStructuralDynamicsIntegrator::acceptedPowerLedgerIsCommittedAndRestored()
+{
+    auto integrator = oscillator(0.4,Integrator::Method::NewmarkAverageAcceleration,1.0);
+    QVERIFY_EXCEPTION_THROWN(integrator.acceptedPowerSample(),std::logic_error);
+    integrator.initialize(RRVector(1,0.0),RRVector(1,2.0));
+    const auto initial = integrator.acceptedPowerSample();
+    QCOMPARE(initial.time,0.0);
+    QCOMPARE(initial.effectiveForcePower,2.0);
+    QCOMPARE(initial.viscousDissipationPower,1.6);
+    QCOMPARE(initial.cumulativeEffectiveWork,0.0);
+    QCOMPARE(initial.cumulativeDampingDissipation,0.0);
+
+    integrator.trialStep(0.01);
+    QCOMPARE(integrator.acceptedPowerSample().effectiveForcePower,initial.effectiveForcePower);
+    integrator.rejectStep();
+    const auto afterReject = integrator.acceptedPowerSample();
+    QCOMPARE(afterReject.time,initial.time);
+    QCOMPARE(afterReject.effectiveForcePower,initial.effectiveForcePower);
+    QCOMPARE(afterReject.viscousDissipationPower,initial.viscousDissipationPower);
+    QCOMPARE(afterReject.cumulativeEffectiveWork,initial.cumulativeEffectiveWork);
+    QCOMPARE(afterReject.cumulativeDampingDissipation,initial.cumulativeDampingDissipation);
+    QCOMPARE(afterReject.energyBalanceResidual,initial.energyBalanceResidual);
+
+    integrator.trialStep(0.01);
+    integrator.acceptStep();
+    const auto accepted = integrator.acceptedPowerSample();
+    const auto &state = integrator.acceptedState();
+    QVERIFY(std::abs(accepted.effectiveForcePower-state.v[0]) < 1.0e-12);
+    QVERIFY(std::abs(accepted.viscousDissipationPower-0.4*state.v[0]*state.v[0]) < 1.0e-12);
+    // The applied force is exactly one, so its physical work over this step
+    // is the displacement increment, independent of the ledger implementation.
+    QVERIFY(std::abs(accepted.cumulativeEffectiveWork-state.q[0]) < 1.0e-12);
+    const double expectedDissipation = 0.005*(1.6+0.4*state.v[0]*state.v[0]);
+    QVERIFY(std::abs(accepted.cumulativeDampingDissipation-expectedDissipation) < 1.0e-12);
+    QCOMPARE(accepted.cumulativeEffectiveWork,state.externalWork);
+    QCOMPARE(accepted.cumulativeDampingDissipation,state.dampingDissipation);
+    QCOMPARE(accepted.energyBalanceResidual,state.energyBalanceResidual);
+    const auto saved = integrator.checkpoint();
+    integrator.trialStep(0.01);
+    integrator.acceptStep();
+    integrator.restore(saved);
+    const auto restored = integrator.acceptedPowerSample();
+    QCOMPARE(restored.time,accepted.time);
+    QCOMPARE(restored.effectiveForcePower,accepted.effectiveForcePower);
+    QCOMPARE(restored.viscousDissipationPower,accepted.viscousDissipationPower);
+    QCOMPARE(restored.cumulativeEffectiveWork,accepted.cumulativeEffectiveWork);
+    QCOMPARE(restored.cumulativeDampingDissipation,accepted.cumulativeDampingDissipation);
+    QCOMPARE(restored.energyBalanceResidual,accepted.energyBalanceResidual);
 }
 
 void TestStructuralDynamicsIntegrator::invalidStepAndForce()

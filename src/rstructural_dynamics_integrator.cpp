@@ -293,6 +293,23 @@ const RStructuralDynamicsState &RStructuralDynamicsIntegrator::candidateState() 
     return this->candidate;
 }
 
+RStructuralDynamicsPowerSample RStructuralDynamicsIntegrator::acceptedPowerSample() const
+{
+    if (!this->initialized) throw std::logic_error("Dynamics integrator is not initialized");
+    RStructuralDynamicsPowerSample sample;
+    sample.time = this->accepted.time;
+    sample.effectiveForcePower = RRVector::dot(this->accepted.externalForce,this->accepted.v);
+    sample.viscousDissipationPower = RRVector::dot(
+        this->accepted.v,product(this->damping,this->accepted.v));
+    sample.cumulativeEffectiveWork = this->accepted.externalWork;
+    sample.cumulativeDampingDissipation = this->accepted.dampingDissipation;
+    sample.energyBalanceResidual = this->accepted.energyBalanceResidual;
+    if (!std::isfinite(sample.effectiveForcePower) ||
+        !std::isfinite(sample.viscousDissipationPower))
+        throw std::runtime_error("Dynamics power sample is non-finite");
+    return sample;
+}
+
 RStructuralDynamicsCheckpoint RStructuralDynamicsIntegrator::checkpoint() const
 {
     if (!this->initialized) throw std::logic_error("Dynamics integrator is not initialized");

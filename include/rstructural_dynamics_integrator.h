@@ -30,6 +30,23 @@ struct RStructuralDynamicsCheckpoint
     double initialMechanicalEnergy = 0.0;
 };
 
+//! Read-only power ledger for the accepted reduced free-DOF state.
+//! Both powers are endpoint rates, not step-average work/dt. Effective work
+//! accumulates 0.5*(f_n+f_n+1) dot (q_n+1-q_n); damping dissipation uses a
+//! trapezoid of endpoint v^T*C*v rates. Units follow the supplied matrices,
+//! coordinates and time (the FE caller currently uses scaled solver units).
+//! The force includes support-equivalent contributions, so neither rate is a
+//! controller-specific or whole moving-support physical power measurement.
+struct RStructuralDynamicsPowerSample
+{
+    double time = 0.0;
+    double effectiveForcePower = 0.0;
+    double viscousDissipationPower = 0.0;
+    double cumulativeEffectiveWork = 0.0;
+    double cumulativeDampingDissipation = 0.0;
+    double energyBalanceResidual = 0.0;
+};
+
 class RStructuralDynamicsIntegrator
 {
     public:
@@ -66,6 +83,8 @@ class RStructuralDynamicsIntegrator
         bool hasCandidate() const { return candidateReady; }
         const RStructuralDynamicsState &acceptedState() const;
         const RStructuralDynamicsState &candidateState() const;
+        //! Derived from accepted state and matrices; trial/reject never publishes it.
+        RStructuralDynamicsPowerSample acceptedPowerSample() const;
         RStructuralDynamicsCheckpoint checkpoint() const;
         void restore(const RStructuralDynamicsCheckpoint &checkpoint);
 
