@@ -323,6 +323,18 @@ void TestStructuralDynamicsFE::unsupportedMovingSupportInputsFailBeforeFirstStep
     QVERIFY2(!runSolver(delayedBoundary,error),"A delayed nonzero baseline BC was accepted.");
     QVERIFY2(error.contains("baseline BC knot",Qt::CaseInsensitive),qPrintable(error));
 
+    RModel nearZeroBoundary = makeTruss(1);
+    addZeroMotion(nearZeroBoundary);
+    auto &nearZeroComponent = nearZeroBoundary.getPoint(0).getBoundaryCondition(0).getComponent(
+        nearZeroBoundary.getPoint(0).getBoundaryCondition(0)
+            .findComponentPosition(R_VARIABLE_DISPLACEMENT_X));
+    nearZeroComponent.add(0.0,5.0e-13);
+    QVERIFY2(!runSolver(nearZeroBoundary,error),
+             "A small nonzero baseline BC was silently added to the moving support force.");
+    QVERIFY2(error.contains("baseline",Qt::CaseInsensitive),qPrintable(error));
+    QVERIFY2(!nearZeroBoundary.getProblemSetup().getStructuralDynamicsRestartData().available,
+             "A nonzero baseline BC must fail before accepting the first step.");
+
     RModel shortDomain = makeTruss(1);
     addZeroMotion(shortDomain);
     shortDomain.getProblemSetup().getStructuralInteractionSetup()

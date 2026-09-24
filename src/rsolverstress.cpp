@@ -1947,10 +1947,11 @@ void RSolverStress::preparePrescribedMotions()
                          "Prescribed support motion '%s' requires an existing held displacement DOF.",
                          motion.id.toUtf8().constData());
         }
-        if (std::fabs(this->nodePrescribedDisplacement[node][component]) > 1.0e-12)
+        const double baseline = this->nodePrescribedDisplacement[node][component];
+        if (!std::isfinite(baseline) || baseline != 0.0)
         {
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                         "Prescribed support motion '%s' requires a zero-valued baseline displacement BC.",
+                         "Prescribed support motion '%s' requires a finite, exactly zero baseline displacement BC.",
                          motion.id.toUtf8().constData());
         }
         // The ordinary BC supplies a held-DOF mask only. Reject a delayed
@@ -1997,10 +1998,11 @@ void RSolverStress::preparePrescribedMotions()
                 hasGlobalMask = true;
                 for (uint valueIndex=0;valueIndex<mask.size();valueIndex++)
                 {
-                    if (std::fabs(mask.getValue(valueIndex)) > 1.0e-12)
+                    const double value = mask.getValue(valueIndex);
+                    if (!std::isfinite(value) || value != 0.0)
                     {
                         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                                     "Prescribed support motion '%s' requires every baseline BC knot to be zero.",
+                                     "Prescribed support motion '%s' requires every baseline BC knot to be finite and exactly zero.",
                                      motion.id.toUtf8().constData());
                     }
                 }
