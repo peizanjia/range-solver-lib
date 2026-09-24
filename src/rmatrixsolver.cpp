@@ -1,5 +1,4 @@
 #include <cmath>
-#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -103,11 +102,13 @@ bool refreshSparseMatrixCache(const RSparseMatrix &A, SparseMatrixCache &cache)
 //! solve() right after the cache has been refreshed.
 const SparseMatrixCache &findSparseMatrixCache(const RSparseMatrix &A, bool allowRefresh = true)
 {
-    static std::mutex cachesMutex;
-    static std::unordered_map<const RSparseMatrix*,SparseMatrixCache> caches;
+    // A process-wide map is unsafe here: solve() retains a reference while
+    // another thread may replace/evict the same map entry. Thread ownership
+    // also removes a serial mutex from every fixed-matrix solve. A pointer is
+    // only a lookup hint, not an identity: every new solve refreshes all CSR
+    // values and verifies the index pattern, covering mutation/address reuse.
+    static thread_local std::unordered_map<const RSparseMatrix*,SparseMatrixCache> caches;
     static const size_t maxCachedMatrices = 16;
-
-    std::lock_guard<std::mutex> lock(cachesMutex);
 
     if (caches.find(&A) == caches.end() && caches.size() >= maxCachedMatrices)
     {
