@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -81,6 +82,34 @@ RStructuralDynamicsIntegrator::RStructuralDynamicsIntegrator(const RSparseMatrix
         throw std::invalid_argument("Dynamics force callback is required");
     if (solverConf.getType() != RMatrixSolverConf::CG && solverConf.getType() != RMatrixSolverConf::GMRES)
         throw std::invalid_argument("A linear solver configuration is required");
+    if (options.method == Method::CentralDifference)
+    {
+        double smallestMassMargin = std::numeric_limits<double>::infinity();
+        double largestStiffnessRow = 0.0;
+        for (uint row=0;row<n;row++)
+        {
+            double massMargin = this->mass.findValue(row,row);
+            double stiffnessRow = 0.0;
+            for (uint position=0;position<this->mass.getNColumns(row);position++)
+            {
+                if (this->mass.getVector(row).getIndex(position) != row)
+                {
+                    massMargin -= std::fabs(this->mass.getValue(row,position));
+                }
+            }
+            for (uint position=0;position<this->stiffness.getNColumns(row);position++)
+            {
+                stiffnessRow += std::fabs(this->stiffness.getValue(row,position));
+            }
+            smallestMassMargin = std::min(smallestMassMargin,massMargin);
+            largestStiffnessRow = std::max(largestStiffnessRow,stiffnessRow);
+        }
+        if (smallestMassMargin <= 0.0)
+            throw std::invalid_argument("Central difference needs a positive strictly diagonally dominant mass matrix for a certified time-step limit; select lumped mass or an implicit method");
+        this->centralDifferenceStepLimit = largestStiffnessRow > 0.0
+            ? 2.0*std::sqrt(smallestMassMargin/largestStiffnessRow)
+            : std::numeric_limits<double>::infinity();
+    }
 }
 
 RRVector RStructuralDynamicsIntegrator::evaluateForce(double time) const
@@ -135,6 +164,9 @@ const RStructuralDynamicsState &RStructuralDynamicsIntegrator::trialStep(double 
     if (!this->initialized) throw std::logic_error("Dynamics integrator is not initialized");
     if (!std::isfinite(dt) || dt <= 0.0)
         throw std::invalid_argument("Dynamics time step must be positive and finite");
+    if (this->options.method == Method::CentralDifference &&
+        dt >= 0.95*this->centralDifferenceStepLimit)
+        throw std::invalid_argument("Central difference time step exceeds the conservative stability limit");
     if (this->fixedStep > 0.0 && std::abs(dt-this->fixedStep) >
         1.0e-12*std::max(dt,this->fixedStep))
         throw std::invalid_argument("Dynamics integrator requires a fixed time step");
@@ -276,10 +308,17 @@ void RStructuralDynamicsIntegrator::restore(const RStructuralDynamicsCheckpoint 
         !finiteVector(checkpoint.state.q) || !finiteVector(checkpoint.state.v) ||
         !finiteVector(checkpoint.state.a) || !finiteVector(checkpoint.state.externalForce) ||
         !std::isfinite(checkpoint.state.time) ||
+        !std::isfinite(checkpoint.state.externalWork) ||
+        !std::isfinite(checkpoint.state.dampingDissipation) ||
         !std::isfinite(checkpoint.initialMechanicalEnergy) ||
         !std::isfinite(checkpoint.fixedStep) || checkpoint.fixedStep < 0.0)
         throw std::invalid_argument("Invalid dynamics checkpoint");
     this->accepted = checkpoint.state;
+    this->accepted.kineticEnergy = quadraticEnergy(this->mass,this->accepted.v);
+    this->accepted.strainEnergy = quadraticEnergy(this->stiffness,this->accepted.q);
+    this->accepted.energyBalanceResidual = this->accepted.kineticEnergy+
+        this->accepted.strainEnergy-checkpoint.initialMechanicalEnergy-
+        this->accepted.externalWork+this->accepted.dampingDissipation;
     this->fixedStep = checkpoint.fixedStep;
     this->initialMechanicalEnergy = checkpoint.initialMechanicalEnergy;
     this->candidate = {};

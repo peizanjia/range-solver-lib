@@ -80,6 +80,8 @@ class RStructuralDynamicsIntegrator
         RStructuralDynamicsState candidate;
         double fixedStep = 0.0;
         double initialMechanicalEnergy = 0.0;
+        //! Certified conservative limit from a strictly diagonally dominant mass matrix.
+        double centralDifferenceStepLimit = 0.0;
         bool initialized = false;
         bool candidateReady = false;
 

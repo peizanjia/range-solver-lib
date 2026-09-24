@@ -64,6 +64,7 @@ private slots:
     void dampedVibrationAndDissipation();
     void generalizedAlpha();
     void centralDifference();
+    void centralDifferenceStabilityGuard();
     void trialRejectAndCheckpoint();
     void invalidStepAndForce();
 };
@@ -145,6 +146,18 @@ void TestStructuralDynamicsIntegrator::centralDifference()
     QVERIFY(fineError < coarseError/3.8);
     QVERIFY(std::abs(fine.acceptedState().v[0]+2.0*std::sin(2.0)) < 0.001);
     QVERIFY(std::abs(fine.acceptedState().energyBalanceResidual) < 0.001);
+}
+
+void TestStructuralDynamicsIntegrator::centralDifferenceStabilityGuard()
+{
+    auto integrator = oscillator(0.0,Integrator::Method::CentralDifference);
+    integrator.initialize(RRVector(1,1.0),RRVector(1,0.0));
+    // For M=1 and K=4, omega=2 and the exact central-difference limit is dt=1.
+    QVERIFY_EXCEPTION_THROWN(integrator.trialStep(0.95),std::invalid_argument);
+    QVERIFY(!integrator.hasCandidate());
+    integrator.trialStep(0.5);
+    integrator.acceptStep();
+    QCOMPARE(integrator.acceptedState().time,0.5);
 }
 
 void TestStructuralDynamicsIntegrator::trialRejectAndCheckpoint()

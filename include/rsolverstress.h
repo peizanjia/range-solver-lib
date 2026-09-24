@@ -2,6 +2,7 @@
 #define RSOLVERSTRESS_H
 
 #include <rbl_rvector.h>
+#include <rml_structural_interaction.h>
 #include <memory>
 
 #include "requationbook.h"
@@ -99,6 +100,8 @@ class RSolverStress : public RSolverGeneric
         bool dynamicBoundaryReferenceReady = false;
         double previousDynamicTime = 0.0;
         double currentDynamicTime = 0.0;
+        struct DynamicsStepSnapshot;
+        std::unique_ptr<DynamicsStepSnapshot> dynamicsStepSnapshot;
 
     public:
 
@@ -118,6 +121,12 @@ class RSolverStress : public RSolverGeneric
 
         //! Initialize solver.
         void initialize() override;
+
+        //! Preserve/restore the committed integrator and force history while
+        //! RSolverGeneric transacts the externally visible RModel state.
+        void beginStepTransaction() override;
+        void rollbackStepTransaction() override;
+        void commitStepTransaction() override;
 
         //! Update scales.
         void updateScales() override;
@@ -182,6 +191,12 @@ class RSolverStress : public RSolverGeneric
 
         //! Project physical equation-book values to the independent coordinates.
         RRVector projectPhysicalState(const RRVector &physical, bool subtractParticular) const;
+
+        //! Physical equation order is part of the persisted dynamics checkpoint contract.
+        std::vector<RStructuralDofRef> orderedPhysicalDofs() const;
+
+        //! Stable digest of the reduced operator, constraint map and held supports.
+        QString dynamicSystemFingerprint() const;
 
         //! Return true if given component of the boundary condition is present
         //! and switched on.

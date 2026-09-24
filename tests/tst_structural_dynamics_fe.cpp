@@ -163,6 +163,9 @@ private slots:
     void rayleighDampingMatchesAnalyticAfterManySteps();
     void tiedNodesStayTiedDuringDynamics();
     void fixedThreadCountsProduceSameState();
+    void restartMatchesUninterruptedRun();
+    void restartRejectsChangedMeshAndTimeStep();
+    void restartRejectsChangedOperatorAndMpc();
 };
 
 void TestStructuralDynamicsFE::freeVibrationMatchesAnalyticAfterManySteps()
@@ -254,6 +257,80 @@ void TestStructuralDynamicsFE::fixedThreadCountsProduceSameState()
                                 .arg(node).arg(int(variable)).arg(oneThread).arg(twoThreads)));
         }
     }
+}
+
+void TestStructuralDynamicsFE::restartMatchesUninterruptedRun()
+{
+    RModel uninterrupted = makeTruss(2,true);
+    RModel resumed = makeTruss(2,true);
+    QString error;
+    QVERIFY2(runSolver(uninterrupted,error),qPrintable(error));
+    resumed.getProblemSetup().getStructuralDynamicsSetup().setNSteps(17);
+    QVERIFY2(runSolver(resumed,error),qPrintable(error));
+    const auto &saved = resumed.getProblemSetup().getStructuralDynamicsRestartData();
+    QVERIFY(saved.available);
+    QCOMPARE(saved.completedSteps,uint(17));
+    QCOMPARE(saved.q.size(),saved.v.size());
+    resumed.getProblemSetup().setRestart(true);
+    resumed.getProblemSetup().getStructuralDynamicsSetup().setNSteps(23);
+    error.clear();
+    QVERIFY2(runSolver(resumed,error),qPrintable(error));
+    QCOMPARE(resumed.getProblemSetup().getStructuralDynamicsRestartData().completedSteps,uint(40));
+    for (uint node=0;node<resumed.getNNodes();node++)
+    {
+        for (RVariableType variable : {R_VARIABLE_DISPLACEMENT,R_VARIABLE_VELOCITY,R_VARIABLE_ACCELERATION})
+        {
+            const double expected = nodalValue(uninterrupted,variable,node);
+            const double actual = nodalValue(resumed,variable,node);
+            const double scale = std::max({1.0e-10,std::fabs(expected),std::fabs(actual)});
+            QVERIFY2(std::fabs(actual-expected) < 1.0e-8*scale+1.0e-13,
+                     qPrintable(QString("Restart mismatch at node %1 variable %2: %3 vs %4")
+                                .arg(node).arg(int(variable)).arg(actual).arg(expected)));
+        }
+    }
+}
+
+void TestStructuralDynamicsFE::restartRejectsChangedMeshAndTimeStep()
+{
+    RModel model = makeTruss(1);
+    model.getProblemSetup().getStructuralDynamicsSetup().setNSteps(2);
+    QString error;
+    QVERIFY2(runSolver(model,error),qPrintable(error));
+    model.getProblemSetup().setRestart(true);
+    model.getProblemSetup().getStructuralDynamicsSetup().setNSteps(1);
+    const double oldStep = model.getProblemSetup().getStructuralDynamicsSetup().getTimeStep();
+    model.getProblemSetup().getStructuralDynamicsSetup().setTimeStep(oldStep*1.1);
+    QVERIFY2(!runSolver(model,error),"Restart with changed time step unexpectedly succeeded");
+    QVERIFY(error.contains("checkpoint",Qt::CaseInsensitive));
+    model.getProblemSetup().getStructuralDynamicsSetup().setTimeStep(oldStep);
+    model.getNode(1).set(length+0.01,0.0,0.0);
+    error.clear();
+    QVERIFY2(!runSolver(model,error),"Restart with changed mesh unexpectedly succeeded");
+    QVERIFY(error.contains("checkpoint",Qt::CaseInsensitive));
+}
+
+void TestStructuralDynamicsFE::restartRejectsChangedOperatorAndMpc()
+{
+    RModel saved = makeTruss(2,true);
+    saved.getProblemSetup().getStructuralDynamicsSetup().setNSteps(2);
+    QString error;
+    QVERIFY2(runSolver(saved,error),qPrintable(error));
+    RModel changedDamping(saved);
+    changedDamping.getProblemSetup().setRestart(true);
+    changedDamping.getProblemSetup().getStructuralDynamicsSetup().setNSteps(1);
+    changedDamping.getProblemSetup().getStructuralDynamicsSetup().setRayleighAlpha(1.0);
+    error.clear();
+    QVERIFY2(!runSolver(changedDamping,error),"Restart with changed damping unexpectedly succeeded");
+    QVERIFY(error.contains("operator",Qt::CaseInsensitive));
+
+    RModel changedMpc(saved);
+    changedMpc.getProblemSetup().setRestart(true);
+    changedMpc.getProblemSetup().getStructuralDynamicsSetup().setNSteps(1);
+    changedMpc.getProblemSetup().getStructuralInteractionSetup()
+              .getLinearConstraints()[0].terms[1].coefficient = -0.5;
+    error.clear();
+    QVERIFY2(!runSolver(changedMpc,error),"Restart with changed MPC unexpectedly succeeded");
+    QVERIFY(error.contains("operator",Qt::CaseInsensitive));
 }
 
 QTEST_APPLESS_MAIN(TestStructuralDynamicsFE)

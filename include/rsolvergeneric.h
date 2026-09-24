@@ -157,6 +157,13 @@ class RSolverGeneric
         //! Write results.
         void writeResults();
 
+        //! A structural-dynamics step is committed only after result output
+        //! succeeds. Derived solvers can preserve their private integrator
+        //! state alongside the model/shared-data transaction in run().
+        virtual void beginStepTransaction();
+        virtual void rollbackStepTransaction();
+        virtual void commitStepTransaction();
+
         //! Apply displacement if possible.
         void applyDisplacement();
 

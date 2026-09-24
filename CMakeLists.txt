@@ -29,6 +29,7 @@ qt_add_library(range-solver-lib
         src/rsolvershareddata.cpp
         src/rsolverstress.cpp
         src/rstructural_dynamics_integrator.cpp
+        src/rstructural_dynamics_support.cpp
         src/rsolverwave.cpp
 
         include/rconvection.h
@@ -59,6 +60,7 @@ qt_add_library(range-solver-lib
         include/rsolvershareddata.h
         include/rsolverstress.h
         include/rstructural_dynamics_integrator.h
+        include/rstructural_dynamics_support.h
         include/rsolverwave.h
 )
 

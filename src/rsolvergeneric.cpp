@@ -1,5 +1,7 @@
 #include <QFile>
 #include <cstdio>
+#include <exception>
+#include <memory>
 #include <omp.h>
 
 #include <rbl_application_state.h>
@@ -32,6 +34,10 @@ RSolverGeneric::~RSolverGeneric()
 {
 
 }
+
+void RSolverGeneric::beginStepTransaction() {}
+void RSolverGeneric::rollbackStepTransaction() {}
+void RSolverGeneric::commitStepTransaction() {}
 
 void RSolverGeneric::run(bool firstExecution, uint taskIteration)
 {
@@ -159,41 +165,124 @@ void RSolverGeneric::run(bool firstExecution, uint taskIteration)
     }
     else
     {
-        if (this->problemType != R_PROBLEM_STRESS && this->problemType != R_PROBLEM_STRESS_MODAL && this->problemType != R_PROBLEM_MESH)
+        const bool structuralDynamics = this->problemType == R_PROBLEM_STRESS &&
+            this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
+        // The time driver has already selected the trial time. Preserve the
+        // previously accepted physical fields and shared data before any
+        // solve/store mutation. Copying is deliberately conservative here;
+        // a result/setup journal should replace this O(model size) per-step
+        // copy after the rollback contract is established.
+        std::unique_ptr<RModel> acceptedModel;
+        std::unique_ptr<RSolverSharedData> acceptedSharedData;
+        if (structuralDynamics)
         {
-            this->applyDisplacement();
+            acceptedModel.reset(new RModel(*this->pModel));
+            acceptedSharedData.reset(new RSolverSharedData(*this->pSharedData));
         }
-
-        if (firstExecution || this->problemType == R_PROBLEM_MESH)
+        bool modelScaled = false;
+        bool transactionStarted = false;
+        try
         {
-            this->updateScales();
+            if (structuralDynamics)
+            {
+                this->beginStepTransaction();
+                transactionStarted = true;
+            }
+            if (this->problemType != R_PROBLEM_STRESS && this->problemType != R_PROBLEM_STRESS_MODAL && this->problemType != R_PROBLEM_MESH)
+            {
+                this->applyDisplacement();
+            }
+
+            if (firstExecution || this->problemType == R_PROBLEM_MESH)
+            {
+                this->updateScales();
+            }
+            if (this->problemType != R_PROBLEM_MESH)
+            {
+                this->scales.downscale(*this->pModel);
+                modelScaled = true;
+            }
+
+            this->initialize();
+            this->recoverSharedData();
+            this->recover();
+            this->prepare();
+            this->solve();
+            this->process();
+            this->store();
+            this->storeSharedData();
+
+            if (modelScaled)
+            {
+                this->scales.upscale(*this->pModel);
+                modelScaled = false;
+            }
+
+            if (this->problemType != R_PROBLEM_STRESS && this->problemType != R_PROBLEM_STRESS_MODAL)
+            {
+                this->removeDisplacement();
+            }
+
+            this->statistics();
+            this->writeResults();
+            if (transactionStarted)
+            {
+                this->commitStepTransaction();
+            }
         }
-        if (this->problemType != R_PROBLEM_MESH)
+        catch (...)
         {
-            this->scales.downscale(*this->pModel);
+            if (structuralDynamics)
+            {
+                const std::exception_ptr originalFailure = std::current_exception();
+                try
+                {
+                    // A late write failure is as much a rejected step as an
+                    // assembly/solve failure. Restore all in-memory state,
+                    // then return to the last accepted checkpoint time.
+                    *this->pModel = *acceptedModel;
+                    *this->pSharedData = *acceptedSharedData;
+                    RTimeSolver &time = this->pModel->getTimeSolver();
+                    const auto &accepted = this->pModel->getProblemSetup()
+                        .getStructuralDynamicsRestartData();
+                    if (accepted.available && accepted.completedSteps > 0)
+                    {
+                        time.setCurrentTimeStep(accepted.completedSteps-1);
+                        time.setComputedTime(accepted.time);
+                    }
+                    else
+                    {
+                        time.setCurrentTimeStep(0);
+                        time.setComputedTime(time.getPreviousTime());
+                    }
+                    if (transactionStarted)
+                    {
+                        this->rollbackStepTransaction();
+                    }
+                }
+                catch (const RError &rollbackError)
+                {
+                    RLogger::warning("Structural step rollback also failed: %s\n",
+                                     rollbackError.getMessage().toUtf8().constData());
+                }
+                catch (const std::exception &rollbackError)
+                {
+                    RLogger::warning("Structural step rollback also failed: %s\n",rollbackError.what());
+                }
+                catch (...)
+                {
+                    RLogger::warning("Structural step rollback also failed with an unknown error.\n");
+                }
+                std::rethrow_exception(originalFailure);
+            }
+            else if (modelScaled)
+            {
+                // Preserve the existing exception-safe scale restoration for
+                // all non-transactional solver paths.
+                this->scales.upscale(*this->pModel);
+            }
+            throw;
         }
-
-        this->initialize();
-        this->recoverSharedData();
-        this->recover();
-        this->prepare();
-        this->solve();
-        this->process();
-        this->store();
-        this->storeSharedData();
-
-        if (this->problemType != R_PROBLEM_MESH)
-        {
-            this->scales.upscale(*this->pModel);
-        }
-
-        if (this->problemType != R_PROBLEM_STRESS && this->problemType != R_PROBLEM_STRESS_MODAL)
-        {
-            this->removeDisplacement();
-        }
-
-        this->writeResults();
-        this->statistics();
     }
 
     this->meshChanged = (this->problemType == R_PROBLEM_MESH);

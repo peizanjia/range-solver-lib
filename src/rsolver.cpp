@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <cmath>
+
 #include <rbl_application_state.h>
 #include <rbl_error.h>
 
@@ -168,10 +171,30 @@ void RSolver::run()
     if (dynamics.getEnabled())
     {
         dynamics.validate();
+        RStructuralDynamicsRestartData &checkpoint =
+            this->pModel->getProblemSetup().getStructuralDynamicsRestartData();
         if (this->pModel->getProblemSetup().getRestart())
         {
-            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                         "Second-order structural restart requires a persisted integrator checkpoint and is not supported yet.");
+            checkpoint.validate();
+            if (!checkpoint.available || checkpoint.meshNodeCount != this->pModel->getNNodes() ||
+                checkpoint.meshElementCount != this->pModel->getNElements() ||
+                checkpoint.meshFingerprint != RStructuralDynamicsRestartData::computeMeshFingerprint(*this->pModel) ||
+                checkpoint.completedSteps != timeSolver.getCurrentTimeStep()+1 ||
+                std::fabs(checkpoint.time-timeSolver.getCurrentTime()) >
+                    1.0e-10*std::max(1.0,std::fabs(checkpoint.time)) ||
+                std::fabs(checkpoint.fixedTimeStep-dynamics.getTimeStep()) >
+                    1.0e-12*std::max(checkpoint.fixedTimeStep,dynamics.getTimeStep()))
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Structural restart checkpoint does not match the mesh, accepted time step or fixed dt.");
+            }
+        }
+        else
+        {
+            checkpoint.clear();
+            checkpoint.meshNodeCount = this->pModel->getNNodes();
+            checkpoint.meshElementCount = this->pModel->getNElements();
+            checkpoint.meshFingerprint = RStructuralDynamicsRestartData::computeMeshFingerprint(*this->pModel);
         }
         const RProblemTypeMask problemTypes = this->pModel->getProblemTaskTree().getProblemTypeMask();
         if (problemTypes != R_PROBLEM_STRESS)
@@ -207,7 +230,15 @@ void RSolver::run()
         {
             timeSolver.setNextTimeStep();
         }
-        RSolverGeneric::updateOldRecords(timeSolver,this->modelFileName);
+        // The legacy pre-pass rewrites prior records and removes future ones
+        // before a trial step is accepted. Structural dynamics publishes its
+        // checkpoint/results transactionally; preserve existing files on a
+        // failed step and let RModel::write publish the new latest link only
+        // after its target record succeeds.
+        if (!dynamics.getEnabled())
+        {
+            RSolverGeneric::updateOldRecords(timeSolver,this->modelFileName);
+        }
 
         do {
             RLogger::info("time step: %9u of %-9u | time = % 12e [sec] | dt = % 12e [sec]\n",

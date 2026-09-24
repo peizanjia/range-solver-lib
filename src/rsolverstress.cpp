@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cmath>
 
+#include <QCryptographicHash>
 #include <omp.h>
 
 #include "rsolverstress.h"
@@ -511,6 +512,24 @@ double findAxisymmetricMeasure(const RSurface &surface,
 
 }
 
+struct RSolverStress::DynamicsStepSnapshot
+{
+    bool hadIntegrator = false;
+    RStructuralDynamicsCheckpoint integratorCheckpoint;
+    RRVector previousForce;
+    RRVector currentForce;
+    RRVector initialForce;
+    bool preparingInitialForce = false;
+    RSparseMatrix massReference;
+    RSparseMatrix stiffnessReference;
+    RRMatrix constraintNullspaceReference;
+    RRVector constraintParticularReference;
+    std::vector<double> boundaryReference;
+    bool boundaryReferenceReady = false;
+    double previousTime = 0.0;
+    double currentTime = 0.0;
+};
+
 RSolverStress::RSolverStress(RModel *pModel, const QString &modelFileName, const QString &convergenceFileName, RSolverSharedData &sharedData, bool modalAnalysis)
     : RSolverGeneric(pModel,modelFileName,convergenceFileName,sharedData)
     , nLinearConstraintEquations(0)
@@ -521,6 +540,64 @@ RSolverStress::RSolverStress(RModel *pModel, const QString &modelFileName, const
 RSolverStress::~RSolverStress()
 {
 
+}
+
+void RSolverStress::beginStepTransaction()
+{
+    std::unique_ptr<DynamicsStepSnapshot> snapshot(new DynamicsStepSnapshot);
+    snapshot->hadIntegrator = bool(this->dynamicsIntegrator);
+    if (snapshot->hadIntegrator)
+    {
+        snapshot->integratorCheckpoint = this->dynamicsIntegrator->checkpoint();
+    }
+    snapshot->previousForce = this->previousDynamicForce;
+    snapshot->currentForce = this->currentDynamicForce;
+    snapshot->initialForce = this->initialDynamicForce;
+    snapshot->preparingInitialForce = this->preparingInitialForce;
+    snapshot->massReference = this->dynamicMassReference;
+    snapshot->stiffnessReference = this->dynamicStiffnessReference;
+    snapshot->constraintNullspaceReference = this->dynamicConstraintNullspaceReference;
+    snapshot->constraintParticularReference = this->dynamicConstraintParticularReference;
+    snapshot->boundaryReference = this->dynamicBoundaryReference;
+    snapshot->boundaryReferenceReady = this->dynamicBoundaryReferenceReady;
+    snapshot->previousTime = this->previousDynamicTime;
+    snapshot->currentTime = this->currentDynamicTime;
+    this->dynamicsStepSnapshot = std::move(snapshot);
+}
+
+void RSolverStress::rollbackStepTransaction()
+{
+    if (!this->dynamicsStepSnapshot)
+    {
+        return;
+    }
+    const DynamicsStepSnapshot &snapshot = *this->dynamicsStepSnapshot;
+    if (snapshot.hadIntegrator)
+    {
+        this->dynamicsIntegrator->restore(snapshot.integratorCheckpoint);
+    }
+    else
+    {
+        this->dynamicsIntegrator.reset();
+    }
+    this->previousDynamicForce = snapshot.previousForce;
+    this->currentDynamicForce = snapshot.currentForce;
+    this->initialDynamicForce = snapshot.initialForce;
+    this->preparingInitialForce = snapshot.preparingInitialForce;
+    this->dynamicMassReference = snapshot.massReference;
+    this->dynamicStiffnessReference = snapshot.stiffnessReference;
+    this->dynamicConstraintNullspaceReference = snapshot.constraintNullspaceReference;
+    this->dynamicConstraintParticularReference = snapshot.constraintParticularReference;
+    this->dynamicBoundaryReference = snapshot.boundaryReference;
+    this->dynamicBoundaryReferenceReady = snapshot.boundaryReferenceReady;
+    this->previousDynamicTime = snapshot.previousTime;
+    this->currentDynamicTime = snapshot.currentTime;
+    this->dynamicsStepSnapshot.reset();
+}
+
+void RSolverStress::commitStepTransaction()
+{
+    this->dynamicsStepSnapshot.reset();
 }
 
 bool RSolverStress::hasConverged() const
@@ -578,8 +655,12 @@ void RSolverStress::recover()
             const double initialTime = this->pModel->getTimeSolver().getPreviousTime();
             const RVariableType displacementTypes[3] = {R_VARIABLE_DISPLACEMENT_X,R_VARIABLE_DISPLACEMENT_Y,R_VARIABLE_DISPLACEMENT_Z};
             const RVariableType velocityTypes[3] = {R_VARIABLE_VELOCITY_X,R_VARIABLE_VELOCITY_Y,R_VARIABLE_VELOCITY_Z};
+            const RVariableType rotationTypes[3] = {R_VARIABLE_ROTATION_X,R_VARIABLE_ROTATION_Y,R_VARIABLE_ROTATION_Z};
+            const RVariableType angularVelocityTypes[3] = {R_VARIABLE_ANGULAR_VELOCITY_X,R_VARIABLE_ANGULAR_VELOCITY_Y,R_VARIABLE_ANGULAR_VELOCITY_Z};
             RRVector *displacementComponents[3] = {&this->nodeDisplacement.x,&this->nodeDisplacement.y,&this->nodeDisplacement.z};
             RRVector *velocityComponents[3] = {&this->nodeVelocity.x,&this->nodeVelocity.y,&this->nodeVelocity.z};
+            RRVector *rotationComponents[3] = {&this->nodeRotation.x,&this->nodeRotation.y,&this->nodeRotation.z};
+            RRVector *angularVelocityComponents[3] = {&this->nodeAngularVelocity.x,&this->nodeAngularVelocity.y,&this->nodeAngularVelocity.z};
             for (uint groupId=0;groupId<this->pModel->getNElementGroups();groupId++)
             {
                 const RElementGroup *group = this->pModel->getElementGroupPtr(groupId);
@@ -601,6 +682,16 @@ void RSolverStress::recover()
                     {
                         types = velocityTypes;
                         components = velocityComponents;
+                    }
+                    else if (condition.getType() == R_INITIAL_CONDITION_ROTATION)
+                    {
+                        types = rotationTypes;
+                        components = rotationComponents;
+                    }
+                    else if (condition.getType() == R_INITIAL_CONDITION_ANGULAR_VELOCITY)
+                    {
+                        types = angularVelocityTypes;
+                        components = angularVelocityComponents;
                     }
                     if (!types)
                     {
@@ -1693,6 +1784,99 @@ void RSolverStress::scatterNodalState(const RRVector &physical,
     }
 }
 
+std::vector<RStructuralDofRef> RSolverStress::orderedPhysicalDofs() const
+{
+    std::vector<RStructuralDofRef> ordered(this->nPhysicalEquations);
+    uint visited = 0;
+    for (uint node=0;node<this->equationBook.getNNodes();node++)
+    {
+        for (RDofType dof : this->equationBook.getEnabledDofs(node))
+        {
+            uint equation = 0;
+            if (this->equationBook.getValue(node,dof,equation) && equation < ordered.size())
+            {
+                ordered[equation] = {node,dof};
+                visited++;
+            }
+        }
+    }
+    if (visited != ordered.size())
+    {
+        throw RError(RError::Type::Application,R_ERROR_REF,
+                     "Structural equation book is inconsistent with physical DOF count.");
+    }
+    return ordered;
+}
+
+QString RSolverStress::dynamicSystemFingerprint() const
+{
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    auto appendInt = [&hash](quint64 value)
+    {
+        hash.addData(QByteArray::number(value));
+        hash.addData(";",1);
+    };
+    auto appendReal = [&hash](double value)
+    {
+        // Ordinary model ASCII files use six significant digits for material
+        // values. A five-digit operator signature survives their round trip.
+        hash.addData(QByteArray::number(value == 0.0 ? 0.0 : value,'g',5));
+        hash.addData(";",1);
+    };
+    auto appendSparse = [&](const RSparseMatrix &matrix)
+    {
+        appendInt(matrix.getNRows());
+        for (uint row=0;row<matrix.getNRows();row++)
+        {
+            std::vector<std::pair<uint,double>> entries;
+            for (uint position=0;position<matrix.getNColumns(row);position++)
+            {
+                entries.emplace_back(matrix.getVector(row).getIndex(position),
+                                     matrix.getValue(row,position));
+            }
+            std::sort(entries.begin(),entries.end());
+            appendInt(entries.size());
+            for (const auto &entry : entries)
+            {
+                appendInt(entry.first);
+                appendReal(entry.second);
+            }
+        }
+    };
+    hash.addData("range-fea/dynamics/system/v1;");
+    const RStructuralDynamicsSetup &setup = this->pModel->getProblemSetup().getStructuralDynamicsSetup();
+    appendInt(static_cast<uint>(setup.getMethod()));
+    appendReal(setup.getRhoInfinity());
+    appendReal(setup.getRayleighAlpha());
+    appendReal(setup.getRayleighBeta());
+    appendSparse(this->A);
+    appendSparse(this->M);
+    appendInt(this->constraintNullspace.getNRows());
+    appendInt(this->constraintNullspace.getNColumns());
+    for (uint row=0;row<this->constraintNullspace.getNRows();row++)
+    {
+        for (uint column=0;column<this->constraintNullspace.getNColumns();column++)
+        {
+            appendReal(this->constraintNullspace[row][column]);
+        }
+    }
+    appendInt(this->constraintParticular.size());
+    for (double value : this->constraintParticular) appendReal(value);
+    appendInt(this->nodeConstrainedDirections.size());
+    for (uint node=0;node<this->nodeConstrainedDirections.size();node++)
+    {
+        appendInt(this->nodeConstrainedDirections[node]);
+        appendInt(this->nodeConstrainedRotations[node]);
+        appendInt(this->nodeHasRotationCondition[node] ? 1 : 0);
+        for (uint component=0;component<3;component++)
+        {
+            appendReal(this->nodePrescribedDisplacement[node][component]);
+            appendReal(this->nodePrescribedRotation[node][component]);
+        }
+    }
+    return QString::fromLatin1(hash.result().toHex());
+}
+
 void RSolverStress::solveStructuralDynamics()
 {
     const RStructuralDynamicsSetup &setup = this->pModel->getProblemSetup().getStructuralDynamicsSetup();
@@ -1785,12 +1969,26 @@ void RSolverStress::solveStructuralDynamics()
     this->currentDynamicTime = this->pModel->getTimeSolver().getCurrentTime();
     if (!this->dynamicsIntegrator)
     {
+        const RStructuralDynamicsRestartData &restartData =
+            this->pModel->getProblemSetup().getStructuralDynamicsRestartData();
+        const QString dofFingerprint = RStructuralDynamicsRestartData::computeDofFingerprint(
+            this->orderedPhysicalDofs());
+        if (this->pModel->getProblemSetup().getRestart() &&
+            (!restartData.available || restartData.physicalDofCount != this->nPhysicalEquations ||
+             restartData.dofFingerprint != dofFingerprint ||
+             restartData.systemFingerprint != this->dynamicSystemFingerprint() ||
+             restartData.q.size() != this->A.getNRows()))
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Structural restart checkpoint does not match the equation order, reduced operator or held supports.");
+        }
         if (this->initialDynamicForce.size() != this->currentDynamicForce.size())
         {
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                          "Structural equation count changed between the initial and first time point.");
         }
-        this->previousDynamicForce = this->initialDynamicForce;
+        this->previousDynamicForce = this->pModel->getProblemSetup().getRestart()
+            ? RRVector(restartData.externalForce) : this->initialDynamicForce;
         this->previousDynamicTime = this->pModel->getTimeSolver().getPreviousTime();
         RSparseMatrix damping;
         damping.setNRows(this->M.getNRows());
@@ -1829,10 +2027,27 @@ void RSolverStress::solveStructuralDynamics()
         const RRVector initialVelocityPhysical = this->gatherNodalState(this->nodeVelocity,this->nodeAngularVelocity);
         RLogger::info("Initial structural dynamics state: ||q||=%g ||v||=%g\n",
                       RRVector::euclideanNorm(initialPhysical),RRVector::euclideanNorm(initialVelocityPhysical));
-        this->dynamicsIntegrator->initialize(
-            this->projectPhysicalState(initialPhysical,true),
-            this->projectPhysicalState(initialVelocityPhysical,false),
-            this->previousDynamicTime);
+        if (this->pModel->getProblemSetup().getRestart())
+        {
+            RStructuralDynamicsCheckpoint checkpoint;
+            checkpoint.state.time = restartData.time;
+            checkpoint.state.q = RRVector(restartData.q);
+            checkpoint.state.v = RRVector(restartData.v);
+            checkpoint.state.a = RRVector(restartData.a);
+            checkpoint.state.externalForce = RRVector(restartData.externalForce);
+            checkpoint.state.externalWork = restartData.cumulativeExternalWork;
+            checkpoint.state.dampingDissipation = restartData.cumulativeDampingDissipation;
+            checkpoint.fixedStep = restartData.fixedTimeStep;
+            checkpoint.initialMechanicalEnergy = restartData.initialMechanicalEnergy;
+            this->dynamicsIntegrator->restore(checkpoint);
+        }
+        else
+        {
+            this->dynamicsIntegrator->initialize(
+                this->projectPhysicalState(initialPhysical,true),
+                this->projectPhysicalState(initialVelocityPhysical,false),
+                this->previousDynamicTime);
+        }
     }
     else if (this->currentDynamicForce.size() != this->dynamicsIntegrator->acceptedState().q.size())
     {
@@ -2783,6 +2998,39 @@ void RSolverStress::store()
         {
             storeVector(R_VARIABLE_ANGULAR_VELOCITY,this->nodeAngularVelocity);
             storeVector(R_VARIABLE_ANGULAR_ACCELERATION,this->nodeAngularAcceleration);
+        }
+        if (this->dynamicsIntegrator)
+        {
+            const RStructuralDynamicsCheckpoint committed = this->dynamicsIntegrator->checkpoint();
+            const RStructuralDynamicsState &state = committed.state;
+            RStructuralDynamicsRestartData &restart =
+                this->pModel->getProblemSetup().getStructuralDynamicsRestartData();
+            restart.completedSteps = this->pModel->getTimeSolver().getCurrentTimeStep()+1;
+            restart.time = state.time;
+            restart.fixedTimeStep = committed.fixedStep;
+            restart.physicalDofCount = this->nPhysicalEquations;
+            restart.dofFingerprint = RStructuralDynamicsRestartData::computeDofFingerprint(
+                this->orderedPhysicalDofs());
+            restart.systemFingerprint = this->dynamicSystemFingerprint();
+            restart.q.assign(state.q.begin(),state.q.end());
+            restart.v.assign(state.v.begin(),state.v.end());
+            restart.a.assign(state.a.begin(),state.a.end());
+            restart.externalForce.assign(state.externalForce.begin(),state.externalForce.end());
+            restart.cumulativeExternalWork = state.externalWork;
+            restart.cumulativeDampingDissipation = state.dampingDissipation;
+            restart.initialMechanicalEnergy = committed.initialMechanicalEnergy;
+            restart.available = true;
+            if (restart.q.size() != restart.v.size() ||
+                restart.q.size() != restart.a.size() ||
+                restart.q.size() != restart.externalForce.size() ||
+                restart.q.size() > restart.physicalDofCount)
+            {
+                throw RError(RError::Type::Application,R_ERROR_REF,
+                             "Structural restart internal size mismatch: physical=%u q=%zu v=%zu a=%zu f=%zu.",
+                             restart.physicalDofCount,restart.q.size(),restart.v.size(),
+                             restart.a.size(),restart.externalForce.size());
+            }
+            restart.validate();
         }
     }
 
