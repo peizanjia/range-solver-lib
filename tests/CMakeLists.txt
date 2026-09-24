@@ -30,6 +30,7 @@ set(range_solver_lib_tests
     tst_structural_dynamics_restart_io
     tst_structural_dynamics_failure_atomicity
     tst_structural_dynamics_rotational_initial
+    tst_structural_dynamics_parallel_repro
 )
 
 foreach(test_name IN LISTS range_solver_lib_tests)
