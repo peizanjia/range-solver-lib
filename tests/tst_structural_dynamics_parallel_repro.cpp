@@ -21,7 +21,8 @@
 
 namespace
 {
-constexpr uint nElements = 32;
+constexpr uint smallElementCount = 32;
+constexpr uint mediumElementCount = 384;
 constexpr uint nSteps = 10;
 constexpr uint nRepetitions = 3;
 constexpr double length = 3.2;
@@ -50,15 +51,15 @@ struct Policy
     uint threads;
 };
 
-RModel makeChain(const Policy &policy)
+RModel makeChain(const Policy &policy, uint elementCount)
 {
     RModel model;
-    model.setNNodes(nElements+1);
-    for (uint node=0;node<=nElements;node++)
+    model.setNNodes(elementCount+1);
+    for (uint node=0;node<=elementCount;node++)
     {
-        model.getNode(node).set(length*double(node)/double(nElements),0.0,0.0);
+        model.getNode(node).set(length*double(node)/double(elementCount),0.0,0.0);
     }
-    for (uint elementId=0;elementId<nElements;elementId++)
+    for (uint elementId=0;elementId<elementCount;elementId++)
     {
         RElement element(R_ELEMENT_TRUSS1);
         element.setNodeId(0,elementId);
@@ -106,7 +107,7 @@ RModel makeChain(const Policy &policy)
     model.getPoint(0).addBoundaryCondition(fixed);
 
     RElement tipPoint(R_ELEMENT_POINT);
-    tipPoint.setNodeId(0,nElements);
+    tipPoint.setNodeId(0,elementCount);
     model.addElement(tipPoint,true,1);
     RInitialCondition initial(R_INITIAL_CONDITION_DISPLACEMENT);
     initial.getComponent(initial.findComponentPosition(R_VARIABLE_DISPLACEMENT_X))
@@ -138,15 +139,15 @@ RModel makeChain(const Policy &policy)
 }
 
 bool extractNodalValues(const RModel &model, RVariableType type,
-                        std::vector<double> &values)
+                        uint elementCount, std::vector<double> &values)
 {
     const uint index = model.findVariable(type);
     if (index == RConstants::eod)
     {
         return false;
     }
-    values.reserve(nElements+1);
-    for (uint node=0;node<=nElements;node++)
+    values.reserve(elementCount+1);
+    for (uint node=0;node<=elementCount;node++)
     {
         const double value = model.getVariable(index).getValue(0,node);
         if (!std::isfinite(value))
@@ -158,13 +159,13 @@ bool extractNodalValues(const RModel &model, RVariableType type,
     return true;
 }
 
-double computeMechanicalEnergy(const RunResult &result)
+double computeMechanicalEnergy(const RunResult &result, uint elementCount)
 {
-    const double elementLength = length/double(nElements);
+    const double elementLength = length/double(elementCount);
     const double elementMass = density*area*elementLength;
     const double elementStiffness = youngModulus*area/elementLength;
     double energy = 0.0;
-    for (uint element=0;element<nElements;element++)
+    for (uint element=0;element<elementCount;element++)
     {
         const double vi = result.velocity[element];
         const double vj = result.velocity[element+1];
@@ -176,12 +177,12 @@ double computeMechanicalEnergy(const RunResult &result)
     return energy;
 }
 
-RunResult runCase(const Policy &policy)
+RunResult runCase(const Policy &policy, uint elementCount)
 {
     RunResult result;
     try
     {
-        RModel model = makeChain(policy);
+        RModel model = makeChain(policy,elementCount);
         QElapsedTimer timer;
         timer.start();
         RSolver solver(model,QString(),QString());
@@ -203,9 +204,9 @@ RunResult runCase(const Policy &policy)
             return result;
         }
 
-        if (!extractNodalValues(model,R_VARIABLE_DISPLACEMENT,result.displacement) ||
-            !extractNodalValues(model,R_VARIABLE_VELOCITY,result.velocity) ||
-            !extractNodalValues(model,R_VARIABLE_ACCELERATION,result.acceleration))
+        if (!extractNodalValues(model,R_VARIABLE_DISPLACEMENT,elementCount,result.displacement) ||
+            !extractNodalValues(model,R_VARIABLE_VELOCITY,elementCount,result.velocity) ||
+            !extractNodalValues(model,R_VARIABLE_ACCELERATION,elementCount,result.acceleration))
         {
             result.error = "Missing or non-finite nodal q/v/a output";
             return result;
@@ -216,7 +217,7 @@ RunResult runCase(const Policy &policy)
             result.error = "Dynamics checkpoint is missing or incomplete";
             return result;
         }
-        result.mechanicalEnergy = computeMechanicalEnergy(result);
+        result.mechanicalEnergy = computeMechanicalEnergy(result,elementCount);
         if (!std::isfinite(result.mechanicalEnergy))
         {
             result.error = "Non-finite mechanical energy";
@@ -349,12 +350,21 @@ class TestStructuralDynamicsParallelRepro : public QObject
     Q_OBJECT
 
 private slots:
+    void policiesAgreeAcrossRepeatedRuns_data();
     void policiesAgreeAcrossRepeatedRuns();
     void observerFailureStopsBeforeTimeStepOrDiskWrite();
 };
 
+void TestStructuralDynamicsParallelRepro::policiesAgreeAcrossRepeatedRuns_data()
+{
+    QTest::addColumn<uint>("elementCount");
+    QTest::newRow("small-32-elements") << smallElementCount;
+    QTest::newRow("medium-384-elements") << mediumElementCount;
+}
+
 void TestStructuralDynamicsParallelRepro::policiesAgreeAcrossRepeatedRuns()
 {
+    QFETCH(uint,elementCount);
     const std::array<Policy,3> policies = {{{"serial",RParallelExecutionMode::SerialDeterministic,0},
                                             {"threads-2",RParallelExecutionMode::FixedThreads,2},
                                             {"threads-4",RParallelExecutionMode::FixedThreads,4}}};
@@ -367,9 +377,10 @@ void TestStructuralDynamicsParallelRepro::policiesAgreeAcrossRepeatedRuns()
         RunResult repeatReference;
         double maxCrossFraction = 0.0;
         double maxRepeatFraction = 0.0;
+        RParallelExecutionReport reportedPolicy;
         for (uint repeat=0;repeat<nRepetitions;repeat++)
         {
-            RunResult result = runCase(policy);
+            RunResult result = runCase(policy,elementCount);
             QVERIFY2(result.error.isEmpty(),
                      qPrintable(QString("%1 run %2: %3")
                                 .arg(QString::fromLatin1(policy.name)).arg(repeat+1)
@@ -385,6 +396,7 @@ void TestStructuralDynamicsParallelRepro::policiesAgreeAcrossRepeatedRuns()
             if (repeat == 0)
             {
                 repeatReference = result;
+                reportedPolicy = result.parallelReport;
             }
             double fraction = 0.0;
             QString difference = compareRuns(result,serialReference,fraction);
@@ -404,12 +416,20 @@ void TestStructuralDynamicsParallelRepro::policiesAgreeAcrossRepeatedRuns()
         // Use stdout rather than Qt's message handler: the application logger
         // may filter QtInfoMsg, while CI should retain this diagnostic baseline.
         std::fprintf(stdout,
-                     "BENCH %s: median %.3f ms; serial/this %.3fx; "
-                     "max cross/repeat tolerance fractions %.4g/%.4g\n",
-                     policy.name,medians[policyIndex],
+                     "BENCH elements=%u %s: median %.3f ms; serial/this %.3fx; "
+                     "backend=%s threads requested/applied/actual/available=%u/%u/%u/%u; "
+                     "deterministic requested/effective=%d/%d fallback=%d; "
+                     "max cross/repeat tolerance fractions %.4g/%.4g; diagnostic=%s\n",
+                     elementCount,policy.name,medians[policyIndex],
                      medians[policyIndex] > 0.0
                          ? medians[0]/medians[policyIndex] : 0.0,
-                     maxCrossFraction,maxRepeatFraction);
+                     reportedPolicy.backend.toUtf8().constData(),
+                     reportedPolicy.requestedThreads,reportedPolicy.appliedThreads,
+                     reportedPolicy.actualThreads,reportedPolicy.availableThreads,
+                     int(reportedPolicy.deterministicReductionRequested),
+                     int(reportedPolicy.deterministicReduction),int(reportedPolicy.fallback),
+                     maxCrossFraction,maxRepeatFraction,
+                     reportedPolicy.diagnostic.toUtf8().constData());
         std::fflush(stdout);
     }
     // Wall-clock numbers are diagnostic only: CI load and thread availability
@@ -422,7 +442,7 @@ void TestStructuralDynamicsParallelRepro::observerFailureStopsBeforeTimeStepOrDi
     QVERIFY(directory.isValid());
     const QString output = directory.filePath(QStringLiteral("observer-abort.ram"));
     const Policy policy{"serial",RParallelExecutionMode::SerialDeterministic,0};
-    RModel model = makeChain(policy);
+    RModel model = makeChain(policy,smallElementCount);
     RSolver solver(model,output,QString());
     const uint stepBefore = model.getTimeSolver().getCurrentTimeStep();
     const double computedTimeBefore = model.getTimeSolver().getComputedTime();
