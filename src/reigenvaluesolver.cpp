@@ -422,12 +422,14 @@ void REigenValueSolver::solveSubspaceIteration(const RSparseMatrix &M, const RSp
         m = mKept;
         Y.resize(n,mKept,0.0);
 
-        // Converged when the wanted eigen values stop moving. The change is
-        // measured over all of them, so the slowest converging wanted mode -
-        // always the highest one - decides.
+        // Ritz values may stabilize before their vectors do. Require both the
+        // requested eigenvalue change and a generalized residual for every
+        // wanted pair; modal damping depends on the vectors themselves.
         bool converged = (it > 0);
         uint nWanted = std::min(nEigen,mKept);
         double maxChange = 0.0;
+        double maxResidual = 0.0;
+        const double residualTolerance = std::max(1.0e-8,convergenceValue);
         for (uint j=0;j<nWanted;j++)
         {
             double scale = std::max(std::fabs(theta[j]),RConstants::eps);
@@ -437,10 +439,27 @@ void REigenValueSolver::solveSubspaceIteration(const RSparseMatrix &M, const RSp
             {
                 converged = false;
             }
+            for (uint i=0;i<n;i++) x[i] = X[i][j];
+            RRVector kx,mx;
+            RSparseMatrix::mlt(K,x,kx);
+            RSparseMatrix::mlt(M,x,mx);
+            RRVector residual(kx);
+            for (uint i=0;i<n;i++) residual[i] -= theta[j]*mx[i];
+            const double denominator = RRVector::euclideanNorm(kx) +
+                std::fabs(theta[j])*RRVector::euclideanNorm(mx);
+            const double relativeResidual = denominator > 0.0
+                ? RRVector::euclideanNorm(residual)/denominator
+                : std::numeric_limits<double>::infinity();
+            if (!std::isfinite(relativeResidual) || relativeResidual > residualTolerance)
+            {
+                converged = false;
+            }
+            maxResidual = std::max(maxResidual,relativeResidual);
         }
         if (it > 0)
         {
-            RLogger::info("Convergence rate = %g (required %g)\n",maxChange,convergenceValue);
+            RLogger::info("Convergence rate = %g (required %g); maximum generalized residual = %g (required %g)\n",
+                          maxChange,convergenceValue,maxResidual,residualTolerance);
         }
 
         thetaOld = theta;
@@ -453,9 +472,9 @@ void REigenValueSolver::solveSubspaceIteration(const RSparseMatrix &M, const RSp
         }
         if (it + 1 == nIterations)
         {
-            RLogger::warning("Subspace iteration did not converge in %u iterations - the last change of the wanted eigen values was %g against the required %g. "
-                             "Extracting fewer modes, raising the convergence value or raising the number of iterations may be needed.\n",
-                             nIterations,maxChange,convergenceValue);
+            RLogger::warning("Subspace iteration did not converge in %u iterations - eigenvalue change %g (required %g), "
+                             "generalized residual %g (required %g). Extracting fewer modes or raising the iteration limit may be needed.\n",
+                             nIterations,maxChange,convergenceValue,maxResidual,residualTolerance);
         }
     }
 

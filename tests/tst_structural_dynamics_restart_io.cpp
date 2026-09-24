@@ -6,6 +6,7 @@
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "rml_model.h"
@@ -175,6 +176,15 @@ bool close(double actual, double expected, double absoluteTolerance = 1.0e-12)
     return std::isfinite(actual) && std::isfinite(expected) &&
            std::abs(actual-expected) <= absoluteTolerance*scale;
 }
+
+bool closeAtPhysicalScale(double actual, double expected, double characteristicScale,
+                          double relativeTolerance = 1.0e-8)
+{
+    const double scale = std::max({characteristicScale,std::abs(actual),std::abs(expected)});
+    return std::isfinite(actual) && std::isfinite(expected) &&
+           std::isfinite(scale) && scale > 0.0 &&
+           std::abs(actual-expected) <= relativeTolerance*scale;
+}
 }
 
 class TestStructuralDynamicsRestartIO : public QObject
@@ -184,6 +194,9 @@ class TestStructuralDynamicsRestartIO : public QObject
 private slots:
     void diskRestartMatchesUninterrupted_data();
     void diskRestartMatchesUninterrupted();
+    void modalDampingDiskRestartMatchesUninterrupted_data();
+    void modalDampingDiskRestartMatchesUninterrupted();
+    void modalDampingRejectsChangedRatio();
     void movingSupportDiskRestartMatchesUninterrupted_data();
     void movingSupportDiskRestartMatchesUninterrupted();
     void movingSupportRejectsChangedKnot();
@@ -278,6 +291,107 @@ void TestStructuralDynamicsRestartIO::diskRestartMatchesUninterrupted()
                  qPrintable(QString("Disk restart mismatch for variable %1").arg(int(type))));
     }
     QVERIFY(close(mechanicalEnergy(resumed),mechanicalEnergy(uninterrupted),1.0e-10));
+}
+
+void TestStructuralDynamicsRestartIO::modalDampingDiskRestartMatchesUninterrupted_data()
+{
+    QTest::addColumn<bool>("binary");
+    QTest::newRow("ascii-ram") << false;
+    QTest::newRow("binary-rbm") << true;
+}
+
+void TestStructuralDynamicsRestartIO::modalDampingDiskRestartMatchesUninterrupted()
+{
+    QFETCH(bool,binary);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    constexpr double dampingRatio = 0.05000000000000001;
+    auto enableModal = [dampingRatio](RModel &model)
+    {
+        auto &setup = model.getProblemSetup().getStructuralDynamicsSetup();
+        setup.setRayleighAlpha(0.0);
+        setup.setModalDampingRatios({dampingRatio});
+    };
+    RModel uninterrupted = makeTruss(firstSegmentSteps+secondSegmentSteps);
+    RModel firstSegment = makeTruss(firstSegmentSteps);
+    enableModal(uninterrupted);
+    enableModal(firstSegment);
+    QString error;
+    QVERIFY2(solve(uninterrupted,error),qPrintable(error));
+    QVERIFY2(solve(firstSegment,error),qPrintable(error));
+    const QString path = directory.filePath(binary ? "modal-accepted.rbm" : "modal-accepted.ram");
+    QCOMPARE(firstSegment.write(path,false),path);
+    RModel resumed;
+    QVERIFY2(load(resumed,path,error),qPrintable(error));
+    const auto &loadedRatios = resumed.getProblemSetup()
+        .getStructuralDynamicsSetup().getModalDampingRatios();
+    QCOMPARE(loadedRatios.size(),std::size_t(1));
+    QCOMPARE(loadedRatios.front(),dampingRatio);
+    resumed.getProblemSetup().setRestart(true);
+    auto &resumedSetup = resumed.getProblemSetup().getStructuralDynamicsSetup();
+    resumedSetup.setNSteps(secondSegmentSteps);
+    resumedSetup.setOutputFrequency(secondSegmentSteps);
+    QVERIFY2(solve(resumed,error),qPrintable(error));
+
+    const auto &expected = uninterrupted.getProblemSetup().getStructuralDynamicsRestartData();
+    const auto &actual = resumed.getProblemSetup().getStructuralDynamicsRestartData();
+    QCOMPARE(actual.completedSteps,firstSegmentSteps+secondSegmentSteps);
+    QCOMPARE(actual.systemFingerprint,expected.systemFingerprint);
+    const double omega = std::sqrt(3.0*youngModulus/(density*length*length));
+    const double velocityScale = initialDisplacement*omega;
+    const double accelerationScale = initialDisplacement*omega*omega;
+    const double forceScale = youngModulus*area/length*initialDisplacement;
+    const double energyScale = 0.5*forceScale*initialDisplacement;
+    QVERIFY(closeAtPhysicalScale(actual.time,expected.time,stepSize,1.0e-10));
+    QVERIFY(closeAtPhysicalScale(actual.fixedTimeStep,expected.fixedTimeStep,stepSize,1.0e-10));
+    QCOMPARE(actual.q.size(),expected.q.size());
+    QCOMPARE(actual.v.size(),expected.v.size());
+    QCOMPARE(actual.a.size(),expected.a.size());
+    QCOMPARE(actual.externalForce.size(),expected.externalForce.size());
+    for (std::size_t i=0;i<expected.q.size();++i)
+    {
+        QVERIFY(closeAtPhysicalScale(actual.q[i],expected.q[i],initialDisplacement));
+        QVERIFY(closeAtPhysicalScale(actual.v[i],expected.v[i],velocityScale));
+        QVERIFY(closeAtPhysicalScale(actual.a[i],expected.a[i],accelerationScale));
+        QVERIFY(closeAtPhysicalScale(actual.externalForce[i],expected.externalForce[i],
+                                     forceScale,1.0e-12));
+    }
+    QVERIFY(closeAtPhysicalScale(actual.cumulativeExternalWork,
+                                 expected.cumulativeExternalWork,energyScale));
+    QVERIFY(closeAtPhysicalScale(actual.cumulativeDampingDissipation,
+                                 expected.cumulativeDampingDissipation,energyScale));
+    QVERIFY(closeAtPhysicalScale(actual.initialMechanicalEnergy,
+                                 expected.initialMechanicalEnergy,energyScale));
+    for (const auto &[type,scale] : {std::pair<RVariableType,double>{R_VARIABLE_DISPLACEMENT,initialDisplacement},
+                                     {R_VARIABLE_VELOCITY,velocityScale},
+                                     {R_VARIABLE_ACCELERATION,accelerationScale}})
+    {
+        QVERIFY2(closeAtPhysicalScale(value(resumed,type),value(uninterrupted,type),scale),
+                 qPrintable(QString("Modal disk restart mismatch for variable %1").arg(int(type))));
+    }
+}
+
+void TestStructuralDynamicsRestartIO::modalDampingRejectsChangedRatio()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    RModel firstSegment = makeTruss(firstSegmentSteps);
+    auto &setup = firstSegment.getProblemSetup().getStructuralDynamicsSetup();
+    setup.setRayleighAlpha(0.0);
+    setup.setModalDampingRatios({0.05000000000000001});
+    QString error;
+    QVERIFY2(solve(firstSegment,error),qPrintable(error));
+    const QString path = directory.filePath("modal-checkpoint.ram");
+    QCOMPARE(firstSegment.write(path,false),path);
+    RModel altered;
+    QVERIFY2(load(altered,path,error),qPrintable(error));
+    altered.getProblemSetup().getStructuralDynamicsSetup()
+           .setModalDampingRatios({0.05000000000000002});
+    altered.getProblemSetup().setRestart(true);
+    auto &alteredSetup = altered.getProblemSetup().getStructuralDynamicsSetup();
+    alteredSetup.setNSteps(secondSegmentSteps);
+    QVERIFY2(!solve(altered,error),"Changed modal damping ratio was accepted by restart.");
+    QVERIFY2(error.contains("checkpoint",Qt::CaseInsensitive),qPrintable(error));
 }
 
 void TestStructuralDynamicsRestartIO::movingSupportDiskRestartMatchesUninterrupted_data()

@@ -21,6 +21,7 @@ set(range_solver_lib_tests
     tst_solver_stress
     tst_structural_solver_gate
     tst_eigen_value_solver
+    tst_modal_damping
     tst_parallel_execution_context
     tst_structural_dynamics_integrator
     tst_structural_dynamics_fe

@@ -7,6 +7,7 @@
 
 #include "rsolverstress.h"
 #include "rmatrixsolver.h"
+#include "rmodal_damping.h"
 #include "reigenvaluesolver.h"
 #include "rstructural_dynamics_integrator.h"
 
@@ -2135,6 +2136,15 @@ QString RSolverStress::dynamicSystemFingerprint() const
     appendReal(setup.getRhoInfinity());
     appendReal(setup.getRayleighAlpha());
     appendReal(setup.getRayleighBeta());
+    if (!setup.getModalDampingRatios().empty())
+    {
+        // Modal ratios are written with 17 significant digits in new ASCII
+        // files. Preserve their exact restart identity without changing the
+        // legacy Rayleigh-only fingerprint.
+        hash.addData("modal-damping/v1;");
+        appendInt(setup.getModalDampingRatios().size());
+        for (double ratio : setup.getModalDampingRatios()) appendMotionReal(ratio);
+    }
     appendSparse(this->A);
     appendSparse(this->M);
     appendInt(this->constraintNullspace.getNRows());
@@ -2191,10 +2201,17 @@ QString RSolverStress::dynamicSystemFingerprint() const
 void RSolverStress::solveStructuralDynamics()
 {
     const RStructuralDynamicsSetup &setup = this->pModel->getProblemSetup().getStructuralDynamicsSetup();
-    if (!setup.getModalDampingRatios().empty())
+    const bool useModalDamping = !setup.getModalDampingRatios().empty();
+    if (useModalDamping &&
+        (setup.getRayleighAlpha() != 0.0 || setup.getRayleighBeta() != 0.0))
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Modal damping ratios are configured but modal damping synthesis is not implemented. Use Rayleigh damping.");
+                     "Modal and Rayleigh damping cannot be combined in the first modal-damping implementation.");
+    }
+    if (useModalDamping && !this->prescribedMotions.empty())
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Modal damping with moving support requires modal free/support damping blocks and is not yet supported.");
     }
     if (setup.getMethod() == RStructuralTimeIntegrationMethod::Newmark &&
         (std::fabs(setup.getNewmarkGamma()-0.5) > 1.0e-12 ||
@@ -2314,21 +2331,33 @@ void RSolverStress::solveStructuralDynamics()
             }
         }
         RSparseMatrix damping;
-        damping.setNRows(this->M.getNRows());
-        for (uint row=0;row<this->M.getNRows();row++)
+        if (useModalDamping)
         {
-            for (uint position=0;position<this->M.getNColumns(row);position++)
-            {
-                damping.addValue(row,this->M.getVector(row).getIndex(position),
-                                 setup.getRayleighAlpha()*this->M.getValue(row,position));
-            }
+            const RModalDampingResult modal = RModalDamping::synthesize(
+                this->M,this->A,setup.getModalDampingRatios(),
+                this->pModel->getMatrixSolverConf(RMatrixSolverConf::CG));
+            damping = modal.damping;
+            RLogger::info("Modal damping: %u validated low modes of %u reduced equations; unspecified higher modes have zero modal damping.\n",
+                          uint(modal.eigenvalues.size()),this->M.getNRows());
         }
-        for (uint row=0;row<this->A.getNRows();row++)
+        else
         {
-            for (uint position=0;position<this->A.getNColumns(row);position++)
+            damping.setNRows(this->M.getNRows());
+            for (uint row=0;row<this->M.getNRows();row++)
             {
-                damping.addValue(row,this->A.getVector(row).getIndex(position),
-                                 setup.getRayleighBeta()*this->A.getValue(row,position));
+                for (uint position=0;position<this->M.getNColumns(row);position++)
+                {
+                    damping.addValue(row,this->M.getVector(row).getIndex(position),
+                                     setup.getRayleighAlpha()*this->M.getValue(row,position));
+                }
+            }
+            for (uint row=0;row<this->A.getNRows();row++)
+            {
+                for (uint position=0;position<this->A.getNColumns(row);position++)
+                {
+                    damping.addValue(row,this->A.getVector(row).getIndex(position),
+                                     setup.getRayleighBeta()*this->A.getValue(row,position));
+                }
             }
         }
         auto force = [this](double time, const RStructuralDynamicsState &, RRVector &values)

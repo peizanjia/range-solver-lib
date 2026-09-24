@@ -161,6 +161,10 @@ class TestStructuralDynamicsFE : public QObject
 private slots:
     void freeVibrationMatchesAnalyticAfterManySteps();
     void rayleighDampingMatchesAnalyticAfterManySteps();
+    void modalDampingMatchesAnalyticAfterManySteps();
+    void twoModeDampingMatchesAnalyticProjection();
+    void modalDampingWorksWithHomogeneousMpc();
+    void unsupportedModalDampingCombinationsFailBeforeFirstStep();
     void movingSupportMatchesConsistentMassAnalytic();
     void movingSupportRayleighMassDampingMatchesAnalytic();
     void unsupportedMovingSupportInputsFailBeforeFirstStep();
@@ -206,6 +210,122 @@ void TestStructuralDynamicsFE::rayleighDampingMatchesAnalyticAfterManySteps()
     QVERIFY(std::isfinite(actual));
     QVERIFY2(std::abs(actual-expected) < 3.0e-4*initialDisplacement,
              qPrintable(QString("Damped FE q=%1, analytic q=%2").arg(actual).arg(expected)));
+}
+
+void TestStructuralDynamicsFE::modalDampingMatchesAnalyticAfterManySteps()
+{
+    constexpr double dampingRatio = 0.08;
+    RModel model = makeTruss(1);
+    model.getProblemSetup().getStructuralDynamicsSetup()
+         .setModalDampingRatios({dampingRatio});
+    QString error;
+    QVERIFY2(runSolver(model,error),qPrintable(error));
+    const double omega = singleElementFrequency();
+    const double time = 40.0*model.getProblemSetup().getStructuralDynamicsSetup().getTimeStep();
+    const double expected = dampedDisplacement(omega,dampingRatio,time);
+    const double actual = nodalValue(model,R_VARIABLE_DISPLACEMENT,1);
+    QVERIFY(std::isfinite(actual));
+    QVERIFY2(std::abs(actual-expected) < 3.0e-4*initialDisplacement,
+             qPrintable(QString("Modal-damped FE q=%1, analytic q=%2")
+                        .arg(actual).arg(expected)));
+    const auto &checkpoint = model.getProblemSetup().getStructuralDynamicsRestartData();
+    QVERIFY(checkpoint.available);
+    QVERIFY(checkpoint.cumulativeDampingDissipation > 0.0);
+}
+
+void TestStructuralDynamicsFE::twoModeDampingMatchesAnalyticProjection()
+{
+    // Two equal-length consistent-mass elements, with node 0 held, give
+    // K=k[[2,-1],[-1,1]] and M=m[[4,1],[1,2]], where m=rho*A*Le/6.
+    // The exact generalized eigenvalues are (5 +/- 3*sqrt(2))*k/(7*m).
+    constexpr double lowDamping = 0.08;
+    RModel model = makeTruss(2);
+    const double elementLength = length/2.0;
+    const double k = youngModulus*crossArea/elementLength;
+    const double m = massDensity*crossArea*elementLength/6.0;
+    const double root = std::sqrt(2.0);
+    const double eigenvalues[2] = {(5.0-3.0*root)*k/(7.0*m),
+                                    (5.0+3.0*root)*k/(7.0*m)};
+    auto &setup = model.getProblemSetup().getStructuralDynamicsSetup();
+    setup.setModalDampingRatios({lowDamping,0.0});
+    setup.setTimeStep(0.01/std::sqrt(eigenvalues[1]));
+    setup.setNSteps(120);
+    setup.setOutputFrequency(120);
+
+    QString error;
+    QVERIFY2(runSolver(model,error),qPrintable(error));
+    const double time = 120.0*setup.getTimeStep();
+    double expected[2] = {0.0,0.0};
+    for (uint mode=0;mode<2;mode++)
+    {
+        const double lambda = eigenvalues[mode];
+        const double shape2 = (2.0*k-4.0*m*lambda)/(k+m*lambda);
+        const double massNorm = std::sqrt(m*(4.0+2.0*shape2+2.0*shape2*shape2));
+        const double phi[2] = {1.0/massNorm,shape2/massNorm};
+        // q(0)=[0,u0], v(0)=0; modal coordinate is phi^T*M*q(0).
+        const double amplitude = m*initialDisplacement*(phi[0]+2.0*phi[1]);
+        const double zeta = mode == 0 ? lowDamping : 0.0;
+        const double omega = std::sqrt(lambda);
+        const double dampedOmega = omega*std::sqrt(1.0-zeta*zeta);
+        const double response = std::exp(-zeta*omega*time)*
+            (std::cos(dampedOmega*time)+zeta*omega/dampedOmega*std::sin(dampedOmega*time));
+        for (uint node=0;node<2;node++) expected[node] += phi[node]*amplitude*response;
+    }
+    for (uint node=1;node<=2;node++)
+    {
+        const double actual = nodalValue(model,R_VARIABLE_DISPLACEMENT,node);
+        QVERIFY2(std::isfinite(actual) &&
+                 std::abs(actual-expected[node-1]) < 5.0e-4*initialDisplacement,
+                 qPrintable(QString("Two-mode FE node %1: q=%2, analytic=%3")
+                            .arg(node).arg(actual).arg(expected[node-1])));
+    }
+}
+
+void TestStructuralDynamicsFE::modalDampingWorksWithHomogeneousMpc()
+{
+    RModel model = makeTruss(2,true);
+    constexpr double dampingRatio = 0.08;
+    model.getProblemSetup().getStructuralDynamicsSetup()
+         .setModalDampingRatios({dampingRatio});
+    QString error;
+    QVERIFY2(runSolver(model,error),qPrintable(error));
+    // T=[1,1]^T maps the tied physical DOFs onto one reduced DOF. This
+    // yields K_red=k and M_red=8m, hence the one-element frequency below.
+    const double time = 40.0*model.getProblemSetup().getStructuralDynamicsSetup().getTimeStep();
+    const double expected = dampedDisplacement(singleElementFrequency(),dampingRatio,time);
+    for (uint node=1;node<=2;node++)
+    {
+        const double actual = nodalValue(model,R_VARIABLE_DISPLACEMENT,node);
+        QVERIFY2(std::isfinite(actual) && std::abs(actual-expected) < 3.0e-4*initialDisplacement,
+                 qPrintable(QString("Modal MPC node %1: q=%2, analytic=%3")
+                            .arg(node).arg(actual).arg(expected)));
+    }
+}
+
+void TestStructuralDynamicsFE::unsupportedModalDampingCombinationsFailBeforeFirstStep()
+{
+    RModel mixed = makeTruss(1);
+    auto &mixedSetup = mixed.getProblemSetup().getStructuralDynamicsSetup();
+    mixedSetup.setModalDampingRatios({0.05});
+    mixedSetup.setRayleighAlpha(1.0);
+    QString error;
+    QVERIFY2(!runSolver(mixed,error),"Modal and Rayleigh damping were silently combined.");
+    QVERIFY2(error.contains("Modal and Rayleigh",Qt::CaseInsensitive),qPrintable(error));
+    QVERIFY(!mixed.getProblemSetup().getStructuralDynamicsRestartData().available);
+
+    RModel moving = makeTruss(1);
+    auto &movingSetup = moving.getProblemSetup().getStructuralDynamicsSetup();
+    movingSetup.setModalDampingRatios({0.05});
+    const double duration = movingSetup.getNSteps()*movingSetup.getTimeStep();
+    RStructuralPrescribedMotion motion;
+    motion.id = "modal-motion-unsupported";
+    motion.target = {0,RDofType::UX};
+    motion.knots = {{0.0,0.0,0.0,0.0},{duration,0.0,0.0,0.0}};
+    moving.getProblemSetup().getStructuralInteractionSetup()
+          .getPrescribedMotions().push_back(motion);
+    QVERIFY2(!runSolver(moving,error),"Modal damping with moving support was accepted.");
+    QVERIFY2(error.contains("moving support",Qt::CaseInsensitive),qPrintable(error));
+    QVERIFY(!moving.getProblemSetup().getStructuralDynamicsRestartData().available);
 }
 
 void TestStructuralDynamicsFE::movingSupportMatchesConsistentMassAnalytic()

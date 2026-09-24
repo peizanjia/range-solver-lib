@@ -9,6 +9,7 @@ qt_add_library(range-solver-lib
         src/riterationinfo.cpp
         src/riterationinfovalue.cpp
         src/rlocalrotation.cpp
+        src/rmodal_damping.cpp
         src/rparallel_execution_context.cpp
         src/rmatrixmanager.cpp
         src/rmatrixpreconditioner.cpp
@@ -40,6 +41,7 @@ qt_add_library(range-solver-lib
         include/riterationinfo.h
         include/riterationinfovalue.h
         include/rlocalrotation.h
+        include/rmodal_damping.h
         include/rparallel_execution_context.h
         include/rmatrixmanager.h
         include/rmatrixpreconditioner.h
