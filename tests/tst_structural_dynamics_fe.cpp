@@ -10,6 +10,7 @@
 #include "rml_model.h"
 #include "rbl_logger.h"
 #include "rsolver.h"
+#include "rstructural_control_conditioner.h"
 
 namespace
 {
@@ -221,6 +222,9 @@ private slots:
     void velocityFeedbackReducesMechanicalEnergy();
     void controlRateLimitAndRestartFailClosed();
     void controlCallbackCannotMutateCatalog();
+    void conditionedDelayHoldNoiseRestartsAfterRejectedTrial();
+    void rawLegacyControlStateFailsClosed();
+    void twoChannelMappingIsLinearAndRestartsDeterministically();
     void rayleighDampingMatchesAnalyticAfterManySteps();
     void modalDampingMatchesAnalyticAfterManySteps();
     void twoModeDampingMatchesAnalyticProjection();
@@ -286,7 +290,8 @@ void TestStructuralDynamicsFE::controlClampsAndMatchesAnalyticHeldForce()
     const auto &checkpoint = model.getProblemSetup().getStructuralDynamicsRestartData();
     QVERIFY(checkpoint.controlAvailable);
     QCOMPARE(checkpoint.controlLastCommands[0],5.0e4);
-    QCOMPARE(checkpoint.controlControllerState,QByteArray("40"));
+    QCOMPARE(RStructuralControlStateEnvelope::deserialize(
+                 checkpoint.controlControllerState).controllerState,QByteArray("40"));
     const double expectedWork = 5.0e4*(actual-initialDisplacement);
     QVERIFY(std::abs(checkpoint.cumulativeControlWork[0]-expectedWork) < 1.0e-6);
     QCOMPARE(solver.getStructuralControlSamples()[0].cumulativeWork,
@@ -309,7 +314,8 @@ void TestStructuralDynamicsFE::controlRestartMatchesAndObserverFailureIsReported
         first.setStructuralControlCallback("constant-force","constant-force-test-v1",constantControl);
         first.run();
     }
-    QCOMPARE(resumed.getProblemSetup().getStructuralDynamicsRestartData().controlControllerState,
+    QCOMPARE(RStructuralControlStateEnvelope::deserialize(resumed.getProblemSetup()
+                 .getStructuralDynamicsRestartData().controlControllerState).controllerState,
              QByteArray("17"));
     resumed.getProblemSetup().setRestart(true);
     resumed.getProblemSetup().getStructuralDynamicsSetup().setNSteps(23);
@@ -320,7 +326,8 @@ void TestStructuralDynamicsFE::controlRestartMatchesAndObserverFailureIsReported
     }
     QVERIFY(std::abs(nodalValue(resumed,R_VARIABLE_DISPLACEMENT,1)-
                      nodalValue(uninterrupted,R_VARIABLE_DISPLACEMENT,1)) < 1.0e-12);
-    QCOMPARE(resumed.getProblemSetup().getStructuralDynamicsRestartData().controlControllerState,
+    QCOMPARE(RStructuralControlStateEnvelope::deserialize(resumed.getProblemSetup()
+                 .getStructuralDynamicsRestartData().controlControllerState).controllerState,
              QByteArray("40"));
 
     RModel audited = makeTruss(1);
@@ -503,6 +510,205 @@ void TestStructuralDynamicsFE::controlCallbackCannotMutateCatalog()
     QCOMPARE(model.getProblemSetup().getStructuralInteractionSetup().getActuators()[0].maximum,
              originalLimit);
     QVERIFY(!model.getProblemSetup().getStructuralDynamicsRestartData().available);
+}
+
+void TestStructuralDynamicsFE::conditionedDelayHoldNoiseRestartsAfterRejectedTrial()
+{
+    auto configured = []()
+    {
+        RModel model = makeTruss(1);
+        configureControl(model);
+        model.getProblemSetup().getStructuralDynamicsSetup().setNSteps(6);
+        model.getProblemSetup().getStructuralControlSetup().channelConditioning =
+            {{"tip-x",2,2,500.0}};
+        return model;
+    };
+    auto provider = [](const RStructuralControlObservation &observation)
+    {
+        RStructuralControlDecision decision;
+        decision.requestedCommands = {{"tip-x",1.0e4}};
+        decision.nextControllerState = QByteArray::number(observation.priorControllerState.toUInt()+1);
+        return decision;
+    };
+    RModel baseline = configured();
+    std::vector<RStructuralControlStepRecord> expected;
+    {
+        RSolver solver(baseline,QString(),QString());
+        solver.setStructuralControlCallback("constant-force","conditioned-test-v1",provider);
+        solver.setStructuralControlStepObserver([&expected](const RStructuralControlStepRecord &record)
+            { expected.push_back(record); });
+        try { solver.run(); }
+        catch (const RError &failure) { QFAIL(qPrintable(failure.getMessage())); }
+    }
+    QCOMPARE(expected.size(),size_t(6));
+    QCOMPARE(expected[0].conditionedCommands[0].value,0.0);
+    QCOMPARE(expected[1].conditionedCommands[0].value,0.0);
+    QVERIFY(expected[2].conditionedCommands[0].value != 0.0);
+    QCOMPARE(expected[2].conditionedCommands[0].value,
+             expected[3].conditionedCommands[0].value);
+
+    RModel resumed = configured();
+    std::vector<RStructuralControlStepRecord> actual;
+    {
+        RSolver first(resumed,QString(),QString());
+        first.setStructuralControlCallback("constant-force","conditioned-test-v1",
+            [provider](const RStructuralControlObservation &observation)
+            {
+                if (observation.priorControllerState == "2")
+                    throw std::runtime_error("injected controller failure");
+                return provider(observation);
+            });
+        first.setStructuralControlStepObserver([&actual](const RStructuralControlStepRecord &record)
+            { actual.push_back(record); });
+        bool failed = false;
+        try { first.run(); }
+        catch (const RError &failure)
+        {
+            failed = failure.getMessage().contains("injected controller failure");
+        }
+        QVERIFY(failed);
+    }
+    const auto &interrupted = resumed.getProblemSetup().getStructuralDynamicsRestartData();
+    QCOMPARE(interrupted.completedSteps,uint(2));
+    QCOMPARE(RStructuralControlStateEnvelope::deserialize(
+                 interrupted.controlControllerState).controllerState,QByteArray("2"));
+    resumed.getProblemSetup().setRestart(true);
+    resumed.getProblemSetup().getStructuralDynamicsSetup().setNSteps(4);
+    {
+        RSolver second(resumed,QString(),QString());
+        second.setStructuralControlCallback("constant-force","conditioned-test-v1",provider);
+        second.setStructuralControlStepObserver([&actual](const RStructuralControlStepRecord &record)
+            { actual.push_back(record); });
+        try { second.run(); }
+        catch (const RError &failure) { QFAIL(qPrintable(failure.getMessage())); }
+    }
+    QCOMPARE(actual.size(),expected.size());
+    for (size_t i=0;i<expected.size();i++)
+    {
+        QCOMPARE(actual[i].conditionedCommands[0].value,expected[i].conditionedCommands[0].value);
+        QCOMPARE(actual[i].appliedChannels[0].command,expected[i].appliedChannels[0].command);
+        QCOMPARE(actual[i].appliedChannels[0].cumulativeWork,
+                 expected[i].appliedChannels[0].cumulativeWork);
+    }
+    QVERIFY(std::abs(nodalValue(resumed,R_VARIABLE_DISPLACEMENT,1)-
+                     nodalValue(baseline,R_VARIABLE_DISPLACEMENT,1)) < 1.0e-12);
+    QCOMPARE(RStructuralControlStateEnvelope::deserialize(resumed.getProblemSetup()
+                 .getStructuralDynamicsRestartData().controlControllerState).controllerState,
+             QByteArray("6"));
+}
+
+void TestStructuralDynamicsFE::rawLegacyControlStateFailsClosed()
+{
+    RModel model = makeTruss(1);
+    configureControl(model);
+    model.getProblemSetup().getStructuralDynamicsSetup().setNSteps(2);
+    {
+        RSolver first(model,QString(),QString());
+        first.setStructuralControlCallback("constant-force","legacy-reject-test-v1",constantControl);
+        first.run();
+    }
+    RStructuralDynamicsRestartData &checkpoint = model.getProblemSetup()
+        .getStructuralDynamicsRestartData();
+    checkpoint.controlControllerState = QByteArray("2"); // Pre-RCCE opaque layout.
+    model.getProblemSetup().setRestart(true);
+    model.getProblemSetup().getStructuralDynamicsSetup().setNSteps(1);
+    RSolver resumed(model,QString(),QString());
+    resumed.setStructuralControlCallback("constant-force","legacy-reject-test-v1",constantControl);
+    bool rejected = false;
+    try { resumed.run(); }
+    catch (const RError &failure)
+    {
+        rejected = failure.getMessage().contains("composite",Qt::CaseInsensitive) ||
+                   failure.getMessage().contains("control",Qt::CaseInsensitive);
+    }
+    QVERIFY(rejected);
+    QCOMPARE(checkpoint.completedSteps,uint(2));
+}
+
+void TestStructuralDynamicsFE::twoChannelMappingIsLinearAndRestartsDeterministically()
+{
+    auto runWith = [](RModel &model, const std::vector<double> &forces,
+                      std::vector<RStructuralControlStepRecord> *records = nullptr)
+    {
+        std::vector<QString> ids;
+        for (const auto &actuator : model.getProblemSetup().getStructuralInteractionSetup().getActuators())
+            ids.push_back(actuator.id);
+        QCOMPARE(ids.size(),forces.size());
+        RSolver solver(model,QString(),QString());
+        solver.setStructuralControlCallback("constant-force","two-channel-test-v1",
+            [ids,forces](const RStructuralControlObservation &)
+            {
+                RStructuralControlDecision decision;
+                for (size_t i=0;i<ids.size();i++)
+                    decision.requestedCommands.push_back({ids[i],forces[i]});
+                return decision;
+            });
+        if (records)
+            solver.setStructuralControlStepObserver([records](const RStructuralControlStepRecord &record)
+                { records->push_back(record); });
+        solver.run();
+    };
+    RModel passive = makeTruss(2);
+    QString error;
+    QVERIFY2(runSolver(passive,error),qPrintable(error));
+
+    RModel tip = makeTruss(2);
+    configureControl(tip);
+    runWith(tip,{2.0e4});
+    RModel middle = makeTruss(2);
+    configureControl(middle);
+    middle.getProblemSetup().getStructuralInteractionSetup().getActuators()[0].id = "mid-x";
+    middle.getProblemSetup().getStructuralInteractionSetup().getActuators()[0].target.nodeId = 1;
+    runWith(middle,{-1.0e4});
+
+    auto makeBoth = []()
+    {
+        RModel model = makeTruss(2);
+        configureControl(model);
+        RStructuralActuator middleActuator = model.getProblemSetup()
+            .getStructuralInteractionSetup().getActuators()[0];
+        middleActuator.id = "mid-x";
+        middleActuator.target.nodeId = 1;
+        model.getProblemSetup().getStructuralInteractionSetup().getActuators().push_back(middleActuator);
+        RStructuralSensor middleSensor = model.getProblemSetup()
+            .getStructuralInteractionSetup().getSensors()[0];
+        middleSensor.id = "mid-displacement";
+        middleSensor.target.nodeId = 1;
+        model.getProblemSetup().getStructuralInteractionSetup().getSensors().push_back(middleSensor);
+        return model;
+    };
+    RModel both = makeBoth();
+    std::vector<RStructuralControlStepRecord> records;
+    runWith(both,{2.0e4,-1.0e4},&records);
+    QCOMPARE(records.size(),size_t(40));
+    QCOMPARE(records.front().sensors.size(),size_t(2));
+    QCOMPARE(records.front().appliedChannels[0].actuatorId,QString("tip-x"));
+    QCOMPARE(records.front().appliedChannels[1].actuatorId,QString("mid-x"));
+    for (uint node : {1u,2u})
+    {
+        const double expected = nodalValue(tip,R_VARIABLE_DISPLACEMENT,node)+
+                                nodalValue(middle,R_VARIABLE_DISPLACEMENT,node)-
+                                nodalValue(passive,R_VARIABLE_DISPLACEMENT,node);
+        QVERIFY(std::abs(nodalValue(both,R_VARIABLE_DISPLACEMENT,node)-expected) < 1.0e-10);
+    }
+    RModel resumed = makeBoth();
+    resumed.getProblemSetup().getStructuralDynamicsSetup().setNSteps(13);
+    runWith(resumed,{2.0e4,-1.0e4});
+    resumed.getProblemSetup().setRestart(true);
+    resumed.getProblemSetup().getStructuralDynamicsSetup().setNSteps(27);
+    runWith(resumed,{2.0e4,-1.0e4});
+    for (uint node : {1u,2u})
+    {
+        QVERIFY(std::abs(nodalValue(both,R_VARIABLE_DISPLACEMENT,node)-
+                         nodalValue(resumed,R_VARIABLE_DISPLACEMENT,node)) < 1.0e-12);
+        QVERIFY(std::abs(nodalValue(both,R_VARIABLE_VELOCITY,node)-
+                         nodalValue(resumed,R_VARIABLE_VELOCITY,node)) < 1.0e-10);
+    }
+    const auto &a = both.getProblemSetup().getStructuralDynamicsRestartData();
+    const auto &b = resumed.getProblemSetup().getStructuralDynamicsRestartData();
+    QCOMPARE(a.cumulativeControlWork.size(),size_t(2));
+    for (size_t i=0;i<2;i++)
+        QVERIFY(std::abs(a.cumulativeControlWork[i]-b.cumulativeControlWork[i]) < 1.0e-9);
 }
 
 void TestStructuralDynamicsFE::rayleighDampingMatchesAnalyticAfterManySteps()

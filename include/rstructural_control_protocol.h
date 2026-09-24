@@ -41,6 +41,8 @@ struct RStructuralControlStepRecord
     double nextTime = 0.0;
     std::vector<RStructuralControlSensorSample> sensors;
     std::vector<RStructuralControlCommand> requestedCommands;
+    //! After deterministic delay/hold/noise, before amplitude/rate limiting.
+    std::vector<RStructuralControlCommand> conditionedCommands;
     std::vector<RStructuralControlChannelSample> appliedChannels;
     QByteArray controllerStateSha256;
 };

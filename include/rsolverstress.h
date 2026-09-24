@@ -10,6 +10,7 @@
 #include "requationbook.h"
 #include "rstructural_support_response.h"
 #include "rstructural_control_protocol.h"
+#include "rstructural_control_conditioner.h"
 #include "rsolvergeneric.h"
 
 class RStructuralDynamicsIntegrator;
@@ -124,6 +125,9 @@ class RSolverStress : public RSolverGeneric
         std::function<void(const RStructuralControlStepRecord &)> controlStepObserver;
         std::unique_ptr<RStructuralControlForceMap> controlForceMap;
         std::unique_ptr<RStructuralControlLedger> controlLedger;
+        std::unique_ptr<RStructuralControlConditioner> controlConditioner;
+        RStructuralControlConditioner::State acceptedConditionerState;
+        RStructuralControlConditioner::State candidateConditionerState;
         QString cachedControlFingerprint;
         QString cachedControlCatalogFingerprint;
         std::vector<RStructuralControlCommand> activeControlCommands;

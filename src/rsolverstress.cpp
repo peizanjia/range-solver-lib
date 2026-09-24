@@ -553,6 +553,8 @@ struct RSolverStress::DynamicsStepSnapshot
     QString cachedControlFingerprint;
     QString cachedControlCatalogFingerprint;
     std::vector<RStructuralControlChannelSample> controlLedgerSamples;
+    RStructuralControlConditioner::State acceptedConditionerState;
+    RStructuralControlConditioner::State candidateConditionerState;
     std::vector<RStructuralControlCommand> activeControlCommands;
     RRVector activeControlForce;
     QByteArray acceptedControllerState;
@@ -620,6 +622,8 @@ void RSolverStress::beginStepTransaction()
     snapshot->cachedControlCatalogFingerprint = this->cachedControlCatalogFingerprint;
     if (this->controlLedger)
         snapshot->controlLedgerSamples = this->controlLedger->accepted();
+    snapshot->acceptedConditionerState = this->acceptedConditionerState;
+    snapshot->candidateConditionerState = this->candidateConditionerState;
     snapshot->activeControlCommands = this->activeControlCommands;
     snapshot->activeControlForce = this->activeControlForce;
     snapshot->acceptedControllerState = this->acceptedControllerState;
@@ -678,12 +682,15 @@ void RSolverStress::rollbackStepTransaction()
     {
         this->controlForceMap.reset();
         this->controlLedger.reset();
+        this->controlConditioner.reset();
     }
     else if (this->controlLedger)
     {
         this->controlLedger->restore(snapshot.controlLedgerSamples);
     }
     this->activeControlCommands = snapshot.activeControlCommands;
+    this->acceptedConditionerState = snapshot.acceptedConditionerState;
+    this->candidateConditionerState = snapshot.candidateConditionerState;
     this->cachedControlFingerprint = snapshot.cachedControlFingerprint;
     this->cachedControlCatalogFingerprint = snapshot.cachedControlCatalogFingerprint;
     this->activeControlForce = snapshot.activeControlForce;
@@ -700,6 +707,7 @@ void RSolverStress::commitStepTransaction()
     {
         this->controlLedger->accept();
         this->acceptedControllerState = std::move(this->candidateControllerState);
+        this->acceptedConditionerState = std::move(this->candidateConditionerState);
     }
     this->acceptedSupportSamples = std::move(this->trialSupportSamples);
     this->trialSupportSamples.clear();
@@ -2171,6 +2179,29 @@ void RSolverStress::prepareControlMapping()
         n,this->scales.findScaleFactor(R_VARIABLE_FORCE_X),
         this->scales.findScaleFactor(R_VARIABLE_VELOCITY_X),std::move(channels)));
     this->controlLedger.reset(new RStructuralControlLedger(*this->controlForceMap));
+    std::vector<RStructuralControlConditioningPolicy> policies;
+    policies.reserve(actuators.size());
+    std::map<QString,size_t> positions;
+    for (const auto &channel : this->controlForceMap->getChannels())
+    {
+        positions.emplace(channel.actuatorId,policies.size());
+        policies.push_back({channel.actuatorId,0,1,0.0});
+    }
+    const auto &controlSetup = this->pModel->getProblemSetup().getStructuralControlSetup();
+    for (const auto &configured : controlSetup.channelConditioning)
+    {
+        const auto position = positions.find(configured.actuatorId);
+        if (position == positions.end())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Control conditioner references unknown actuator '%s'.",
+                         configured.actuatorId.toUtf8().constData());
+        policies[position->second] = {configured.actuatorId,configured.delaySteps,
+                                      configured.holdSteps,configured.noiseAmplitude};
+    }
+    this->controlConditioner.reset(new RStructuralControlConditioner(
+        controlSetup.deterministicSeed,std::move(policies)));
+    this->acceptedConditionerState = this->controlConditioner->initialState();
+    this->candidateConditionerState = this->acceptedConditionerState;
     this->activeControlCommands.clear();
     for (const auto &channel : this->controlForceMap->getChannels())
         this->activeControlCommands.push_back({channel.actuatorId,0.0});
@@ -2202,6 +2233,14 @@ QString RSolverStress::controlCatalogFingerprint() const
     number(setup.controlProtocolVersion);
     string(setup.controllerId);
     number(setup.deterministicSeed);
+    number(setup.channelConditioning.size());
+    for (const auto &policy : setup.channelConditioning)
+    {
+        string(policy.actuatorId);
+        number(policy.delaySteps);
+        number(policy.holdSteps);
+        real(policy.noiseAmplitude);
+    }
     const auto &catalog = this->pModel->getProblemSetup().getStructuralInteractionSetup();
     number(catalog.getActuators().size());
     for (const auto &actuator : catalog.getActuators())
@@ -2242,6 +2281,7 @@ QString RSolverStress::controlMappingFingerprint() const
     const auto &setup = this->pModel->getProblemSetup().getStructuralControlSetup();
     hash.addData(setup.controllerId.toUtf8()); hash.addData(";");
     hash.addData(this->controllerRevision.toUtf8()); hash.addData(";");
+    hash.addData(this->controlConditioner->configurationSha256().toHex()); hash.addData(";");
     hash.addData(QByteArray::number(setup.deterministicSeed)); hash.addData(";");
     hash.addData(this->dynamicSystemFingerprint().toUtf8()); hash.addData(";");
     const auto &actuators = this->pModel->getProblemSetup().getStructuralInteractionSetup().getActuators();
@@ -3035,7 +3075,14 @@ void RSolverStress::solveStructuralDynamics()
                 this->activeControlCommands[i].value = restartData.controlLastCommands[i];
             }
             this->controlLedger->restore(samples);
-            this->acceptedControllerState = restartData.controlControllerState;
+            const RStructuralControlStateEnvelope envelope =
+                RStructuralControlStateEnvelope::deserialize(restartData.controlControllerState);
+            this->acceptedControllerState = envelope.controllerState;
+            this->acceptedConditionerState = this->controlConditioner->deserialize(
+                envelope.conditionerState);
+            if (this->acceptedConditionerState.completedSteps != restartData.completedSteps)
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Structural control restart conditioner step count differs from solver checkpoint.");
             this->activeControlForce.fill(0.0);
             this->controlForceMap->addForce(this->activeControlCommands,this->activeControlForce);
         }
@@ -3212,13 +3259,16 @@ void RSolverStress::solveStructuralDynamics()
             decision.nextControllerState.size() > 1024*1024)
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                          "Control provider returned wrong channel count or oversized controller state.");
+        const auto conditioned = this->controlConditioner->advance(
+            this->acceptedConditionerState,decision.requestedCommands);
+        this->candidateConditionerState = conditioned.candidate;
         std::vector<RStructuralControlCommand> applied;
-        applied.reserve(decision.requestedCommands.size());
+        applied.reserve(conditioned.appliedCommands.size());
         const auto &actuators = this->pModel->getProblemSetup().getStructuralInteractionSetup().getActuators();
         bool changed = false;
-        for (size_t i=0;i<decision.requestedCommands.size();i++)
+        for (size_t i=0;i<conditioned.appliedCommands.size();i++)
         {
-            const auto &request = decision.requestedCommands[i];
+            const auto &request = conditioned.appliedCommands[i];
             const auto &actuator = actuators[i];
             if (request.actuatorId != this->activeControlCommands[i].actuatorId ||
                 !std::isfinite(request.value) || std::isnan(actuator.minimum) ||
@@ -3256,6 +3306,7 @@ void RSolverStress::solveStructuralDynamics()
         this->trialControlRecord.nextTime = observation.nextTime;
         this->trialControlRecord.sensors = observation.sensors;
         this->trialControlRecord.requestedCommands = decision.requestedCommands;
+        this->trialControlRecord.conditionedCommands = conditioned.appliedCommands;
         this->trialControlRecord.controllerStateSha256 =
             QCryptographicHash::hash(decision.nextControllerState,QCryptographicHash::Sha256).toHex();
     }
@@ -4266,7 +4317,10 @@ void RSolverStress::store()
             restart.controlPowers.clear();
             restart.cumulativeControlWork.clear();
             restart.controlControllerState = this->controlForceMap
-                ? this->candidateControllerState : QByteArray();
+                ? RStructuralControlStateEnvelope{
+                      this->candidateControllerState,
+                      this->controlConditioner->serialize(this->candidateConditionerState)}.serialize()
+                : QByteArray();
             restart.controlDeterministicSeed = this->controlForceMap
                 ? this->pModel->getProblemSetup().getStructuralControlSetup().deterministicSeed : 0;
             if (this->controlForceMap)
