@@ -5,6 +5,10 @@
 
 find_package(Qt6 REQUIRED COMPONENTS Test)
 
+if(WIN32 AND CMAKE_VERSION VERSION_LESS 3.22)
+    message(FATAL_ERROR "Windows QTest execution requires CMake 3.22 or newer for ENVIRONMENT_MODIFICATION")
+endif()
+
 set(CMAKE_AUTOMOC ON)
 
 set(range_solver_lib_tests
@@ -17,6 +21,10 @@ set(range_solver_lib_tests
     tst_solver_stress
     tst_structural_solver_gate
     tst_eigen_value_solver
+    tst_parallel_execution_context
+    tst_structural_dynamics_integrator
+    tst_structural_dynamics_fe
+    tst_structural_dynamics_beam
 )
 
 foreach(test_name IN LISTS range_solver_lib_tests)
@@ -27,4 +35,8 @@ foreach(test_name IN LISTS range_solver_lib_tests)
             Qt6::Test
     )
     add_test(NAME ${test_name} COMMAND ${test_name})
+    if(WIN32)
+        set_tests_properties(${test_name} PROPERTIES
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+    endif()
 endforeach()

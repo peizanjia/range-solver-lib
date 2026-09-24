@@ -339,6 +339,55 @@ RModel buildTruss(double tipForce)
     return model;
 }
 
+RModel buildSingleDynamicTruss(double initialTipDisplacement)
+{
+    RModel model;
+    model.setNNodes(2);
+    model.getNode(0).set(0.0,0.0,0.0);
+    model.getNode(1).set(barLength,0.0,0.0);
+    RElement truss(R_ELEMENT_TRUSS1);
+    truss.setNodeId(0,0);
+    truss.setNodeId(1,1);
+    model.addElement(truss,true,0);
+
+    RMaterial material(RMaterial::Solid);
+    RMaterialProperty modulus(RMaterialProperty::ModulusOfElasiticity);
+    modulus.add(293.15,elasticityModulus); material.add(modulus);
+    RMaterialProperty poisson(RMaterialProperty::PoissonRatio);
+    poisson.add(293.15,poissonRatio); material.add(poisson);
+    RMaterialProperty densityProperty(RMaterialProperty::Density);
+    densityProperty.add(293.15,density); material.add(densityProperty);
+    RMaterialProperty expansion(RMaterialProperty::ThermalExpansionCoefficient);
+    expansion.add(293.15,thermalExpansion); material.add(expansion);
+    RLine &line = model.getLine(0);
+    line.setCrossArea(barArea);
+    line.setMaterial(material);
+    RBoundaryCondition lateral(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).setEnabled(false);
+    lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+    lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+    line.addBoundaryCondition(lateral);
+
+    RElement fixed(R_ELEMENT_POINT);
+    fixed.setNodeId(0,0);
+    model.addElement(fixed,true,0);
+    RBoundaryCondition fixedBc(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    fixedBc.getComponent(fixedBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).add(0.0,0.0);
+    fixedBc.getComponent(fixedBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+    fixedBc.getComponent(fixedBc.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+    model.getPoint(0).addBoundaryCondition(fixedBc);
+
+    RElement tip(R_ELEMENT_POINT);
+    tip.setNodeId(0,1);
+    model.addElement(tip,true,1);
+    RInitialCondition initial(R_INITIAL_CONDITION_DISPLACEMENT);
+    initial.getComponent(initial.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).add(0.0,initialTipDisplacement);
+    model.getPoint(1).addInitialCondition(initial);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setOutputFrequency(0);
+    return model;
+}
+
 RModel buildQuadraticTruss(double tipForce)
 {
     constexpr uint elements = 4;
@@ -1084,7 +1133,13 @@ private slots:
     void prescribedDisplacementIsAppliedInLocalFrame();
     void contradictingConstraintsAreReported();
     void linearConstraintCouplesTrussNodes();
+    void affineMpcPreservesPhysicalUnits();
     void contradictoryLinearConstraintsAreReported();
+    void secondOrderTrussMatchesOneStepNewmark();
+    void rampLoadUsesInitialForceAtT0();
+    void initialVelocityEntersSecondOrderState();
+    void dynamicRestartWithoutCheckpointIsRejected();
+    void modalMpcUsesConstraintElimination();
 };
 
 //! A fixed-free bar under an axial tip force stretches by F*L/(E*A) and carries
@@ -2358,6 +2413,123 @@ void TestSolverStress::contradictoryLinearConstraintsAreReported()
     QString solverError;
     QVERIFY2(!runSolver(model,solverError),"Contradictory MPC equations were accepted");
     QVERIFY2(solverError.contains("contradict",Qt::CaseInsensitive),qPrintable(solverError));
+}
+
+void TestSolverStress::affineMpcPreservesPhysicalUnits()
+{
+    RModel model = buildTruss(0.0);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+    RLinearConstraint constraint;
+    constraint.id = "prescribed-tip-by-mpc";
+    constraint.terms = {{{nSlices,RDofType::UX},1.0}};
+    constraint.rhs = 1.0e-3;
+    model.getProblemSetup().getStructuralInteractionSetup().getLinearConstraints().push_back(constraint);
+    RMatrixSolverConf &gmres = model.getMatrixSolverConf(RMatrixSolverConf::GMRES);
+    gmres.setNInnerIterations(50);
+    gmres.setNOuterIterations(100);
+    gmres.setSolverCvgValue(1.0e-10);
+    gmres.setOutputFrequency(0);
+    QString error;
+    QVERIFY2(runSolver(model,error),qPrintable(error));
+    const double actual = nodeValue(model,R_VARIABLE_DISPLACEMENT,0,nSlices);
+    QVERIFY2(std::fabs(actual-constraint.rhs) < 1.0e-8*constraint.rhs,
+             qPrintable(QString("Physical affine MPC q=%1 expected=%2").arg(actual).arg(constraint.rhs)));
+}
+
+void TestSolverStress::secondOrderTrussMatchesOneStepNewmark()
+{
+    constexpr double initialDisplacement = 1.0e-4;
+    RModel model = buildSingleDynamicTruss(initialDisplacement);
+    RStructuralDynamicsSetup &setup = model.getProblemSetup().getStructuralDynamicsSetup();
+    setup.setEnabled(true);
+    const double omega = std::sqrt(3.0*elasticityModulus/(density*barLength*barLength));
+    const double dt = 0.1/omega;
+    setup.setTimeStep(dt);
+    setup.setNSteps(1);
+    QString error;
+    QVERIFY2(runSolver(model,error),qPrintable(error));
+    const double factor = (1.0-0.25*omega*omega*dt*dt)/(1.0+0.25*omega*omega*dt*dt);
+    const double q = nodeValue(model,R_VARIABLE_DISPLACEMENT,0,1);
+    const double v = nodeValue(model,R_VARIABLE_VELOCITY,0,1);
+    const double a = nodeValue(model,R_VARIABLE_ACCELERATION,0,1);
+    QVERIFY2(std::isfinite(q) && std::isfinite(v) && std::isfinite(a),"Dynamic q/v/a output is missing");
+    QVERIFY2(std::fabs(q-initialDisplacement*factor) < 2.0e-8*initialDisplacement,
+             qPrintable(QString("Newmark q=%1, expected=%2").arg(q).arg(initialDisplacement*factor)));
+    QVERIFY2(std::fabs(a+omega*omega*q) < 1.0e-7*omega*omega*initialDisplacement,
+             qPrintable(QString("Dynamic equilibrium residual=%1").arg(a+omega*omega*q)));
+}
+
+void TestSolverStress::rampLoadUsesInitialForceAtT0()
+{
+    constexpr double tipForce = 1000.0;
+    RModel model = buildSingleDynamicTruss(0.0);
+    RStructuralDynamicsSetup &setup = model.getProblemSetup().getStructuralDynamicsSetup();
+    const double omega = std::sqrt(3.0*elasticityModulus/(density*barLength*barLength));
+    const double dt = 0.1/omega;
+    setup.setEnabled(true);
+    setup.setTimeStep(dt);
+    setup.setNSteps(1);
+    RBoundaryCondition force(R_BOUNDARY_CONDITION_FORCE);
+    force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_X)).add(0.0,0.0);
+    force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_X)).add(dt,tipForce);
+    model.getPoint(1).addBoundaryCondition(force);
+    QString error;
+    QVERIFY2(runSolver(model,error),qPrintable(error));
+    const double mass = density*barArea*barLength/3.0;
+    const double stiffness = elasticityModulus*barArea/barLength;
+    const double expected = 0.25*dt*dt*tipForce/(mass+0.25*dt*dt*stiffness);
+    const double actual = nodeValue(model,R_VARIABLE_DISPLACEMENT,0,1);
+    QVERIFY2(std::fabs(actual-expected) < 1.0e-8*expected,
+             qPrintable(QString("Ramp q=%1 expected=%2").arg(actual).arg(expected)));
+}
+
+void TestSolverStress::dynamicRestartWithoutCheckpointIsRejected()
+{
+    RModel model = buildSingleDynamicTruss(0.0);
+    model.getProblemSetup().getStructuralDynamicsSetup().setEnabled(true);
+    model.getProblemSetup().setRestart(true);
+    QString error;
+    QVERIFY2(!runSolver(model,error),"Dynamic restart unexpectedly proceeded without a complete checkpoint");
+    QVERIFY2(error.contains("checkpoint",Qt::CaseInsensitive),qPrintable(error));
+}
+
+void TestSolverStress::initialVelocityEntersSecondOrderState()
+{
+    constexpr double initialVelocity = 0.25;
+    RModel model = buildSingleDynamicTruss(0.0);
+    RInitialCondition condition(R_INITIAL_CONDITION_VELOCITY);
+    condition.getComponent(condition.findComponentPosition(R_VARIABLE_VELOCITY_X)).add(0.0,initialVelocity);
+    model.getPoint(1).addInitialCondition(condition);
+    RStructuralDynamicsSetup &setup = model.getProblemSetup().getStructuralDynamicsSetup();
+    const double omega = std::sqrt(3.0*elasticityModulus/(density*barLength*barLength));
+    const double dt = 0.1/omega;
+    setup.setEnabled(true);
+    setup.setTimeStep(dt);
+    setup.setNSteps(1);
+    QString error;
+    QVERIFY2(runSolver(model,error),qPrintable(error));
+    const double expected = dt*initialVelocity/(1.0+0.25*omega*omega*dt*dt);
+    const double actual = nodeValue(model,R_VARIABLE_DISPLACEMENT,0,1);
+    QVERIFY2(std::fabs(actual-expected) < 1.0e-8*expected,
+             qPrintable(QString("Velocity-initialized q=%1 expected=%2").arg(actual).arg(expected)));
+}
+
+void TestSolverStress::modalMpcUsesConstraintElimination()
+{
+    RModel model = buildTruss(0.0);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS_MODAL));
+    model.getProblemSetup().getModalSetup().setNModesToExtract(1);
+    RLinearConstraint tie;
+    tie.id = "modal-tip-tie";
+    tie.terms = {{{nSlices,RDofType::UX},1.0},{{nSlices-1,RDofType::UX},-1.0}};
+    model.getProblemSetup().getStructuralInteractionSetup().getLinearConstraints().push_back(tie);
+    QString error;
+    QVERIFY2(runSolver(model,error),qPrintable(error));
+    const double tip = nodeValue(model,R_VARIABLE_DISPLACEMENT,0,nSlices);
+    const double beforeTip = nodeValue(model,R_VARIABLE_DISPLACEMENT,0,nSlices-1);
+    QVERIFY2(std::isfinite(tip) && std::fabs(tip-beforeTip) < 1.0e-8*std::max(1.0,std::fabs(tip)),
+             qPrintable(QString("Modal MPC residual=%1").arg(tip-beforeTip)));
+    QVERIFY(model.getProblemSetup().getModalSetup().getFrequency() > 0.0);
 }
 
 QTEST_APPLESS_MAIN(TestSolverStress)

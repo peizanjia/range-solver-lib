@@ -15,6 +15,7 @@
 #include "rsolvermesh.h"
 #include "rsolverradiativeheat.h"
 #include "rsolverstress.h"
+#include "rparallel_execution_context.h"
 #include "rsolverwave.h"
 
 void RSolver::_init()
@@ -101,7 +102,33 @@ void RSolver::_init()
     // if not restarting clear results data.
     if (!this->pModel->getProblemSetup().getRestart())
     {
+        std::vector<RVariable> initialKinematics;
+        if (this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled())
+        {
+            // Existing nodal kinematics are an intentional initial state for
+            // a new dynamic run (e.g. a selected modal shape). Other results
+            // remain stale and must still be cleared.
+            for (RVariableType type : {R_VARIABLE_DISPLACEMENT,R_VARIABLE_ROTATION,
+                                       R_VARIABLE_VELOCITY,R_VARIABLE_ANGULAR_VELOCITY})
+            {
+                const uint position = this->pModel->findVariable(type);
+                if (position != RConstants::eod)
+                {
+                    const RVariable &variable = this->pModel->getVariable(position);
+                    if (variable.getApplyType() == R_VARIABLE_APPLY_NODE &&
+                        variable.getNValues() == this->pModel->getNNodes() &&
+                        variable.getNVectors() == 3)
+                    {
+                        initialKinematics.push_back(variable);
+                    }
+                }
+            }
+        }
         this->pModel->removeAllVariables();
+        for (const RVariable &variable : initialKinematics)
+        {
+            this->pModel->addVariable(variable);
+        }
     }
 }
 
@@ -127,7 +154,36 @@ RSolver::~RSolver()
 
 void RSolver::run()
 {
+    RParallelExecutionContext parallelContext(this->pModel->getProblemSetup().getParallelExecutionConfig());
+    const RParallelExecutionReport &parallel = parallelContext.getReport();
+    RLogger::info("Parallel execution: requested=%u applied=%u actual=%u backend=%s deterministic=%s\n",
+                  parallel.requestedThreads,parallel.appliedThreads,parallel.actualThreads,
+                  parallel.backend.toUtf8().constData(),parallel.deterministicReduction ? "yes" : "no");
+    if (!parallel.diagnostic.isEmpty())
+    {
+        RLogger::warning("Parallel execution: %s\n",parallel.diagnostic.toUtf8().constData());
+    }
     RTimeSolver &timeSolver = this->pModel->getTimeSolver();
+    const RStructuralDynamicsSetup &dynamics = this->pModel->getProblemSetup().getStructuralDynamicsSetup();
+    if (dynamics.getEnabled())
+    {
+        dynamics.validate();
+        if (this->pModel->getProblemSetup().getRestart())
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Second-order structural restart requires a persisted integrator checkpoint and is not supported yet.");
+        }
+        const RProblemTypeMask problemTypes = this->pModel->getProblemTaskTree().getProblemTypeMask();
+        if (problemTypes != R_PROBLEM_STRESS)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Second-order structural dynamics currently requires a stress-only task tree.");
+        }
+        timeSolver.setEnabled(true);
+        timeSolver.setInputNTimeSteps(dynamics.getNSteps());
+        timeSolver.setInputTimeStepSize(dynamics.getTimeStep());
+        timeSolver.setOutputFrequency(dynamics.getOutputFrequency());
+    }
     timeSolver.harmonizeTimesWithInput(this->pModel->getProblemSetup().getRestart());
 
     // A harmonic acoustic analysis is a frequency domain analysis - the solver

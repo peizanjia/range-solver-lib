@@ -216,6 +216,16 @@ double RScales::findScaleFactor(RVariableType variableType) const
         case R_VARIABLE_ROTATION_Y:
         case R_VARIABLE_ROTATION_Z:
             return 1.0;
+        case R_VARIABLE_ANGULAR_VELOCITY:
+        case R_VARIABLE_ANGULAR_VELOCITY_X:
+        case R_VARIABLE_ANGULAR_VELOCITY_Y:
+        case R_VARIABLE_ANGULAR_VELOCITY_Z:
+            return 1.0/this->second;
+        case R_VARIABLE_ANGULAR_ACCELERATION:
+        case R_VARIABLE_ANGULAR_ACCELERATION_X:
+        case R_VARIABLE_ANGULAR_ACCELERATION_Y:
+        case R_VARIABLE_ANGULAR_ACCELERATION_Z:
+            return 1.0/std::pow(this->second,2);
         case R_VARIABLE_MOMENT:
         case R_VARIABLE_MOMENT_X:
         case R_VARIABLE_MOMENT_Y:
@@ -456,6 +466,17 @@ void RScales::convert(RModel &model, bool invert) const
 
             rVariable.getVariableData().setMinMaxDisplayValue(rVariable.getVariableData().getMinDisplayValue()*valueScale,
                                                               rVariable.getVariableData().getMaxDisplayValue()*valueScale);
+        }
+    }
+
+    // Tie proximity is a length. Keep it in the same coordinate system as
+    // the nodes when a solver temporarily rescales the model.
+    for (RStructuralCoupling &coupling : model.getProblemSetup()
+             .getStructuralInteractionSetup().getCouplings())
+    {
+        if (coupling.type == RStructuralCouplingType::Tie)
+        {
+            coupling.tolerance *= lengthScale;
         }
     }
 

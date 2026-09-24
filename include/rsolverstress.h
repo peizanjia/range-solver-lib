@@ -2,9 +2,12 @@
 #define RSOLVERSTRESS_H
 
 #include <rbl_rvector.h>
+#include <memory>
 
 #include "requationbook.h"
 #include "rsolvergeneric.h"
+
+class RStructuralDynamicsIntegrator;
 
 class RSolverStress : public RSolverGeneric
 {
@@ -42,6 +45,12 @@ class RSolverStress : public RSolverGeneric
         RSolverCartesianVector<RRVector> nodeDisplacement;
         //! Node rotation vector used by frame elements.
         RSolverCartesianVector<RRVector> nodeRotation;
+        //! Translational velocity/acceleration in global coordinates.
+        RSolverCartesianVector<RRVector> nodeVelocity;
+        RSolverCartesianVector<RRVector> nodeAcceleration;
+        //! Rotational velocity/acceleration in global coordinates (frame nodes).
+        RSolverCartesianVector<RRVector> nodeAngularVelocity;
+        RSolverCartesianVector<RRVector> nodeAngularAcceleration;
         //! Node initial displacement vector.
         RSolverCartesianVector<RRVector> nodeInitialDisplacement;
         //! Node force vector.
@@ -71,6 +80,25 @@ class RSolverStress : public RSolverGeneric
         REquationBook equationBook;
         //! Number of Lagrange multiplier equations appended for MPCs.
         uint nLinearConstraintEquations;
+        //! q = constraintParticular + constraintNullspace * reduced q.
+        RRMatrix constraintNullspace;
+        RRVector constraintParticular;
+        std::vector<uint> constraintFreeEquations;
+        uint nPhysicalEquations = 0;
+        std::unique_ptr<RStructuralDynamicsIntegrator> dynamicsIntegrator;
+        RRVector previousDynamicForce;
+        RRVector currentDynamicForce;
+        RRVector initialDynamicForce;
+        bool preparingInitialForce = false;
+        //! Linear dynamics reuses matrices; reject unsupported time variation.
+        RSparseMatrix dynamicMassReference;
+        RSparseMatrix dynamicStiffnessReference;
+        RRMatrix dynamicConstraintNullspaceReference;
+        RRVector dynamicConstraintParticularReference;
+        std::vector<double> dynamicBoundaryReference;
+        bool dynamicBoundaryReferenceReady = false;
+        double previousDynamicTime = 0.0;
+        double currentDynamicTime = 0.0;
 
     public:
 
@@ -106,6 +134,19 @@ class RSolverStress : public RSolverGeneric
         //! Solve stress-strain problem.
         void solveStressStrain();
 
+        //! Advance the committed second-order structural state one fixed step.
+        void solveStructuralDynamics();
+
+        //! Read/write the physical equation-book state in node frames.
+        RRVector gatherNodalState(const RSolverCartesianVector<RRVector> &translation,
+                                  const RSolverCartesianVector<RRVector> &rotation) const;
+        void scatterNodalState(const RRVector &physical,
+                               RSolverCartesianVector<RRVector> &translation,
+                               RSolverCartesianVector<RRVector> &rotation) const;
+
+        //! Fail explicitly on moving prescribed DOFs (base-motion equations are future work).
+        void validateDynamicBoundaryState();
+
         //! Solve eigen-value problem.
         void solveEigenValue();
 
@@ -135,6 +176,12 @@ class RSolverStress : public RSolverGeneric
 
         //! Validate and append independent linear constraints using Lagrange multipliers.
         void applyLinearConstraints();
+
+        //! Expand an eliminated-coordinate solution to the physical equation book.
+        RRVector expandReducedSolution(const RRVector &reduced, bool includeParticular) const;
+
+        //! Project physical equation-book values to the independent coordinates.
+        RRVector projectPhysicalState(const RRVector &physical, bool subtractParticular) const;
 
         //! Return true if given component of the boundary condition is present
         //! and switched on.

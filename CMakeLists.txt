@@ -9,6 +9,7 @@ qt_add_library(range-solver-lib
         src/riterationinfo.cpp
         src/riterationinfovalue.cpp
         src/rlocalrotation.cpp
+        src/rparallel_execution_context.cpp
         src/rmatrixmanager.cpp
         src/rmatrixpreconditioner.cpp
         src/rmatrixsolver.cpp
@@ -27,6 +28,7 @@ qt_add_library(range-solver-lib
         src/rsolverradiativeheat.cpp
         src/rsolvershareddata.cpp
         src/rsolverstress.cpp
+        src/rstructural_dynamics_integrator.cpp
         src/rsolverwave.cpp
 
         include/rconvection.h
@@ -37,6 +39,7 @@ qt_add_library(range-solver-lib
         include/riterationinfo.h
         include/riterationinfovalue.h
         include/rlocalrotation.h
+        include/rparallel_execution_context.h
         include/rmatrixmanager.h
         include/rmatrixpreconditioner.h
         include/rmatrixsolver.h
@@ -55,6 +58,7 @@ qt_add_library(range-solver-lib
         include/rsolverradiativeheat.h
         include/rsolvershareddata.h
         include/rsolverstress.h
+        include/rstructural_dynamics_integrator.h
         include/rsolverwave.h
 )
 

@@ -7,6 +7,7 @@
 #include "rsolverstress.h"
 #include "rmatrixsolver.h"
 #include "reigenvaluesolver.h"
+#include "rstructural_dynamics_integrator.h"
 
 namespace
 {
@@ -552,6 +553,80 @@ void RSolverStress::recover()
     this->recoverVariable(R_VARIABLE_ROTATION,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),0,this->nodeRotation.x,0.0);
     this->recoverVariable(R_VARIABLE_ROTATION,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),1,this->nodeRotation.y,0.0);
     this->recoverVariable(R_VARIABLE_ROTATION,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),2,this->nodeRotation.z,0.0);
+    if (this->problemType == R_PROBLEM_STRESS && this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled())
+    {
+        this->recoverVariable(R_VARIABLE_VELOCITY,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),0,this->nodeVelocity.x,0.0);
+        this->recoverVariable(R_VARIABLE_VELOCITY,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),1,this->nodeVelocity.y,0.0);
+        this->recoverVariable(R_VARIABLE_VELOCITY,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),2,this->nodeVelocity.z,0.0);
+        this->recoverVariable(R_VARIABLE_ACCELERATION,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),0,this->nodeAcceleration.x,0.0);
+        this->recoverVariable(R_VARIABLE_ACCELERATION,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),1,this->nodeAcceleration.y,0.0);
+        this->recoverVariable(R_VARIABLE_ACCELERATION,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),2,this->nodeAcceleration.z,0.0);
+        this->nodeAngularVelocity.x.resize(this->pModel->getNNodes(),0.0);
+        this->nodeAngularVelocity.y.resize(this->pModel->getNNodes(),0.0);
+        this->nodeAngularVelocity.z.resize(this->pModel->getNNodes(),0.0);
+        this->nodeAngularAcceleration.x.resize(this->pModel->getNNodes(),0.0);
+        this->nodeAngularAcceleration.y.resize(this->pModel->getNNodes(),0.0);
+        this->nodeAngularAcceleration.z.resize(this->pModel->getNNodes(),0.0);
+        this->recoverVariable(R_VARIABLE_ANGULAR_VELOCITY,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),0,this->nodeAngularVelocity.x,0.0);
+        this->recoverVariable(R_VARIABLE_ANGULAR_VELOCITY,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),1,this->nodeAngularVelocity.y,0.0);
+        this->recoverVariable(R_VARIABLE_ANGULAR_VELOCITY,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),2,this->nodeAngularVelocity.z,0.0);
+        this->recoverVariable(R_VARIABLE_ANGULAR_ACCELERATION,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),0,this->nodeAngularAcceleration.x,0.0);
+        this->recoverVariable(R_VARIABLE_ANGULAR_ACCELERATION,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),1,this->nodeAngularAcceleration.y,0.0);
+        this->recoverVariable(R_VARIABLE_ANGULAR_ACCELERATION,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),2,this->nodeAngularAcceleration.z,0.0);
+        if (this->firstRun)
+        {
+            const double initialTime = this->pModel->getTimeSolver().getPreviousTime();
+            const RVariableType displacementTypes[3] = {R_VARIABLE_DISPLACEMENT_X,R_VARIABLE_DISPLACEMENT_Y,R_VARIABLE_DISPLACEMENT_Z};
+            const RVariableType velocityTypes[3] = {R_VARIABLE_VELOCITY_X,R_VARIABLE_VELOCITY_Y,R_VARIABLE_VELOCITY_Z};
+            RRVector *displacementComponents[3] = {&this->nodeDisplacement.x,&this->nodeDisplacement.y,&this->nodeDisplacement.z};
+            RRVector *velocityComponents[3] = {&this->nodeVelocity.x,&this->nodeVelocity.y,&this->nodeVelocity.z};
+            for (uint groupId=0;groupId<this->pModel->getNElementGroups();groupId++)
+            {
+                const RElementGroup *group = this->pModel->getElementGroupPtr(groupId);
+                if (!group)
+                {
+                    continue;
+                }
+                for (uint conditionId=0;conditionId<group->getNInitialConditions();conditionId++)
+                {
+                    const RInitialCondition &condition = group->getInitialCondition(conditionId);
+                    const RVariableType *types = nullptr;
+                    RRVector **components = nullptr;
+                    if (condition.getType() == R_INITIAL_CONDITION_DISPLACEMENT)
+                    {
+                        types = displacementTypes;
+                        components = displacementComponents;
+                    }
+                    else if (condition.getType() == R_INITIAL_CONDITION_VELOCITY)
+                    {
+                        types = velocityTypes;
+                        components = velocityComponents;
+                    }
+                    if (!types)
+                    {
+                        continue;
+                    }
+                    for (uint component=0;component<3;component++)
+                    {
+                        const uint position = condition.findComponentPosition(types[component]);
+                        if (position == RConstants::eod || !condition.getComponent(position).getEnabled())
+                        {
+                            continue;
+                        }
+                        const double value = condition.getComponent(position).get(initialTime);
+                        for (uint member=0;member<group->size();member++)
+                        {
+                            const RElement &element = this->pModel->getElement(group->get(member));
+                            for (uint localNode=0;localNode<element.size();localNode++)
+                            {
+                                (*components[component])[element.getNodeId(localNode)] = value;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     this->recoverVariable(R_VARIABLE_MOMENT,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),0,this->nodeMoment.x,0.0);
     this->recoverVariable(R_VARIABLE_MOMENT,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),1,this->nodeMoment.y,0.0);
     this->recoverVariable(R_VARIABLE_MOMENT,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),2,this->nodeMoment.z,0.0);
@@ -565,7 +640,37 @@ void RSolverStress::recover()
 
 void RSolverStress::prepare()
 {
-    const bool needsMass = this->pModel->getTimeSolver().getEnabled() || this->problemType == R_PROBLEM_STRESS_MODAL;
+    const bool structuralDynamics = this->problemType == R_PROBLEM_STRESS &&
+        this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
+    if (structuralDynamics && !this->dynamicsIntegrator && !this->preparingInitialForce)
+    {
+        // Assemble f(t0) separately. Reusing f(t1) changes the initial
+        // acceleration for a ramp, impulse or user-supplied time history.
+        RTimeSolver &time = this->pModel->getTimeSolver();
+        const uint step = time.getCurrentTimeStep();
+        const double endTime = time.getCurrentTime();
+        const double startTime = time.getPreviousTime();
+        this->preparingInitialForce = true;
+        time.getTimes()[step] = startTime;
+        try
+        {
+            this->prepare();
+            this->initialDynamicForce = this->b;
+            this->dynamicMassReference = this->M;
+            this->dynamicStiffnessReference = this->A;
+            this->dynamicConstraintNullspaceReference = this->constraintNullspace;
+            this->dynamicConstraintParticularReference = this->constraintParticular;
+        }
+        catch (...)
+        {
+            time.getTimes()[step] = endTime;
+            this->preparingInitialForce = false;
+            throw;
+        }
+        time.getTimes()[step] = endTime;
+        this->preparingInitialForce = false;
+    }
+    const bool needsMass = structuralDynamics || this->pModel->getTimeSolver().getEnabled() || this->problemType == R_PROBLEM_STRESS_MODAL;
     const bool lumpedMass = this->pModel->getProblemSetup().getMassMatrixType() == RMassMatrixType::Lumped;
 
     //! Element force vector.
@@ -599,6 +704,10 @@ void RSolverStress::prepare()
     // The node frames and the directions they hold come from the constraints
     // themselves, so they have to be known before the equation book is built.
     this->generateLocalConstraints();
+    if (structuralDynamics)
+    {
+        this->validateDynamicBoundaryState();
+    }
     this->generateEquationBook();
     this->nLinearConstraintEquations = 0;
 
@@ -620,12 +729,6 @@ void RSolverStress::prepare()
                          diagnostic.code.toUtf8().constData(),
                          diagnostic.message.toUtf8().constData());
         }
-    }
-    if (this->problemType == R_PROBLEM_STRESS_MODAL &&
-        (!interactionSetup.getLinearConstraints().empty() || !interactionSetup.getCouplings().empty()))
-    {
-        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Modal analysis with linear constraints or couplings requires constraint elimination and is not supported yet.");
     }
     this->generateVariableVector(R_VARIABLE_FORCE_X,elementForce.x,forceSetValues.x,true,this->firstRun,this->firstRun);
     this->generateVariableVector(R_VARIABLE_FORCE_Y,elementForce.y,forceSetValues.y,true,this->firstRun,this->firstRun);
@@ -1402,10 +1505,7 @@ void RSolverStress::prepare()
             this->pModel->setNode(i,nodesBkp[i]);
         }
     }
-    else
-    {
-        this->applyLinearConstraints();
-    }
+    this->applyLinearConstraints();
 }
 
 void RSolverStress::solve()
@@ -1416,6 +1516,10 @@ void RSolverStress::solve()
         {
             this->solveEigenValue();
         }
+        else if (this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled())
+        {
+            this->solveStructuralDynamics();
+        }
         else
         {
             this->solveStressStrain();
@@ -1424,6 +1528,10 @@ void RSolverStress::solve()
     catch (const RError &error)
     {
         throw RError(RError::Type::Application,R_ERROR_REF,"Failed to solve problem. %s", error.getMessage().toUtf8().constData());
+    }
+    catch (const std::exception &error)
+    {
+        throw RError(RError::Type::Application,R_ERROR_REF,"Failed to solve problem. %s",error.what());
     }
 }
 
@@ -1450,6 +1558,311 @@ void RSolverStress::solveStressStrain()
     }
 
     this->setDisplacement(this->x);
+}
+
+void RSolverStress::validateDynamicBoundaryState()
+{
+    std::vector<double> current;
+    current.reserve(8*this->pModel->getNNodes());
+    for (uint node=0;node<this->pModel->getNNodes();node++)
+    {
+        const uint translational = this->nodeConstrainedDirections[node];
+        const uint rotational = this->nodeHasRotationCondition[node]
+            ? this->nodeConstrainedRotations[node]
+            : (translational == 3 ? 7u : 0u);
+        current.push_back(double(translational));
+        current.push_back(double(rotational));
+        for (uint component=0;component<3;component++)
+        {
+            current.push_back(component < translational
+                              ? this->nodePrescribedDisplacement[node][component] : 0.0);
+            current.push_back((rotational & (1u << component)) != 0u
+                              ? this->nodePrescribedRotation[node][component] : 0.0);
+        }
+    }
+    if (!this->dynamicBoundaryReferenceReady)
+    {
+        this->dynamicBoundaryReference = std::move(current);
+        this->dynamicBoundaryReferenceReady = true;
+        return;
+    }
+    if (current.size() != this->dynamicBoundaryReference.size())
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural prescribed DOF layout changed during dynamics.");
+    }
+    for (uint index=0;index<current.size();index++)
+    {
+        const double tolerance = 1.0e-12*std::max({1.0,std::fabs(current[index]),
+                                                    std::fabs(this->dynamicBoundaryReference[index])});
+        if (std::fabs(current[index]-this->dynamicBoundaryReference[index]) > tolerance)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Moving prescribed displacement/rotation is not yet supported in second-order dynamics; base motion needs mass and damping coupling.");
+        }
+    }
+}
+
+RRVector RSolverStress::gatherNodalState(const RSolverCartesianVector<RRVector> &translation,
+                                        const RSolverCartesianVector<RRVector> &rotation) const
+{
+    RRVector state(this->equationBook.getNEnabled(),0.0);
+    for (uint node=0;node<this->pModel->getNNodes();node++)
+    {
+        RR3Vector globalTranslation(translation.x[node],translation.y[node],translation.z[node]);
+        RR3Vector globalRotation(rotation.x[node],rotation.y[node],rotation.z[node]);
+        for (uint component=0;component<3;component++)
+        {
+            uint equation = 0;
+            if (this->equationBook.getValue(node,translationDof(component),equation))
+            {
+                double value = globalTranslation[component];
+                if (this->localRotations[node].isActive())
+                {
+                    value = 0.0;
+                    for (uint global=0;global<3;global++)
+                    {
+                        value += this->localRotations[node].getR()[global][component]*globalTranslation[global];
+                    }
+                }
+                state[equation] = value;
+            }
+            const RDofType rotationDof = component == 0 ? RDofType::RX
+                                          : component == 1 ? RDofType::RY : RDofType::RZ;
+            if (this->equationBook.getValue(node,rotationDof,equation))
+            {
+                double value = globalRotation[component];
+                if (this->rotationLocalRotations[node].isActive())
+                {
+                    value = 0.0;
+                    for (uint global=0;global<3;global++)
+                    {
+                        value += this->rotationLocalRotations[node].getR()[global][component]*globalRotation[global];
+                    }
+                }
+                state[equation] = value;
+            }
+        }
+    }
+    return state;
+}
+
+void RSolverStress::scatterNodalState(const RRVector &physical,
+                                     RSolverCartesianVector<RRVector> &translation,
+                                     RSolverCartesianVector<RRVector> &rotation) const
+{
+    const uint nNodes = this->pModel->getNNodes();
+    translation.x.resize(nNodes,0.0);
+    translation.y.resize(nNodes,0.0);
+    translation.z.resize(nNodes,0.0);
+    rotation.x.resize(nNodes,0.0);
+    rotation.y.resize(nNodes,0.0);
+    rotation.z.resize(nNodes,0.0);
+    for (uint node=0;node<nNodes;node++)
+    {
+        RR3Vector localTranslation(0.0,0.0,0.0);
+        RR3Vector localRotation(0.0,0.0,0.0);
+        for (uint component=0;component<3;component++)
+        {
+            uint equation = 0;
+            if (this->equationBook.getValue(node,translationDof(component),equation))
+            {
+                localTranslation[component] = physical[equation];
+            }
+            const RDofType rotationDof = component == 0 ? RDofType::RX
+                                          : component == 1 ? RDofType::RY : RDofType::RZ;
+            if (this->equationBook.getValue(node,rotationDof,equation))
+            {
+                localRotation[component] = physical[equation];
+            }
+        }
+        if (this->localRotations[node].isActive())
+        {
+            this->localRotations[node].rotateResultsVector(localTranslation);
+        }
+        if (this->rotationLocalRotations[node].isActive())
+        {
+            this->rotationLocalRotations[node].rotateResultsVector(localRotation);
+        }
+        translation.x[node] = localTranslation[0];
+        translation.y[node] = localTranslation[1];
+        translation.z[node] = localTranslation[2];
+        rotation.x[node] = localRotation[0];
+        rotation.y[node] = localRotation[1];
+        rotation.z[node] = localRotation[2];
+    }
+}
+
+void RSolverStress::solveStructuralDynamics()
+{
+    const RStructuralDynamicsSetup &setup = this->pModel->getProblemSetup().getStructuralDynamicsSetup();
+    if (!setup.getModalDampingRatios().empty())
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Modal damping ratios are configured but modal damping synthesis is not implemented. Use Rayleigh damping.");
+    }
+    if (setup.getMethod() == RStructuralTimeIntegrationMethod::Newmark &&
+        (std::fabs(setup.getNewmarkGamma()-0.5) > 1.0e-12 ||
+         std::fabs(setup.getNewmarkBeta()-0.25) > 1.0e-12))
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "The structural dynamics baseline supports Newmark average acceleration (gamma=0.5, beta=0.25) only.");
+    }
+    RStructuralDynamicsIntegrator::Options options;
+    switch (setup.getMethod())
+    {
+        case RStructuralTimeIntegrationMethod::Newmark:
+            options.method = RStructuralDynamicsIntegrator::Method::NewmarkAverageAcceleration;
+            break;
+        case RStructuralTimeIntegrationMethod::GeneralizedAlpha:
+            options.method = RStructuralDynamicsIntegrator::Method::GeneralizedAlpha;
+            break;
+        case RStructuralTimeIntegrationMethod::CentralDifference:
+            options.method = RStructuralDynamicsIntegrator::Method::CentralDifference;
+            break;
+    }
+    options.rhoInfinity = setup.getRhoInfinity();
+    auto sameMatrix = [](const RSparseMatrix &reference, const RSparseMatrix &current)
+    {
+        if (reference.getNRows() != current.getNRows())
+        {
+            return false;
+        }
+        auto rowsMatch = [](const RSparseMatrix &left, const RSparseMatrix &right)
+        {
+            for (uint row=0;row<left.getNRows();row++)
+            {
+                for (uint position=0;position<left.getNColumns(row);position++)
+                {
+                    const uint column = left.getVector(row).getIndex(position);
+                    const double value = left.getValue(row,position);
+                    const double other = right.findValue(row,column);
+                    if (std::fabs(value-other) >
+                        1.0e-10*std::max({1.0,std::fabs(value),std::fabs(other)}))
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+        return rowsMatch(reference,current) && rowsMatch(current,reference);
+    };
+    if (!sameMatrix(this->dynamicMassReference,this->M) ||
+        !sameMatrix(this->dynamicStiffnessReference,this->A))
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural M/K changed during fixed-matrix dynamics; time-varying material or geometry needs matrix refresh.");
+    }
+    if (this->dynamicConstraintNullspaceReference.getNRows() != this->constraintNullspace.getNRows() ||
+        this->dynamicConstraintNullspaceReference.getNColumns() != this->constraintNullspace.getNColumns() ||
+        this->dynamicConstraintParticularReference.size() != this->constraintParticular.size())
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural MPC layout changed during dynamics.");
+    }
+    for (uint row=0;row<this->constraintNullspace.getNRows();row++)
+    {
+        for (uint column=0;column<this->constraintNullspace.getNColumns();column++)
+        {
+            if (std::fabs(this->constraintNullspace[row][column]-
+                          this->dynamicConstraintNullspaceReference[row][column]) > 1.0e-12)
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Structural MPC coefficients changed during dynamics.");
+            }
+        }
+    }
+    for (uint row=0;row<this->constraintParticular.size();row++)
+    {
+        if (std::fabs(this->constraintParticular[row]-this->dynamicConstraintParticularReference[row]) > 1.0e-12)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Moving affine MPC is not yet supported in second-order dynamics.");
+        }
+    }
+    this->currentDynamicForce = this->b;
+    this->currentDynamicTime = this->pModel->getTimeSolver().getCurrentTime();
+    if (!this->dynamicsIntegrator)
+    {
+        if (this->initialDynamicForce.size() != this->currentDynamicForce.size())
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Structural equation count changed between the initial and first time point.");
+        }
+        this->previousDynamicForce = this->initialDynamicForce;
+        this->previousDynamicTime = this->pModel->getTimeSolver().getPreviousTime();
+        RSparseMatrix damping;
+        damping.setNRows(this->M.getNRows());
+        for (uint row=0;row<this->M.getNRows();row++)
+        {
+            for (uint position=0;position<this->M.getNColumns(row);position++)
+            {
+                damping.addValue(row,this->M.getVector(row).getIndex(position),
+                                 setup.getRayleighAlpha()*this->M.getValue(row,position));
+            }
+        }
+        for (uint row=0;row<this->A.getNRows();row++)
+        {
+            for (uint position=0;position<this->A.getNColumns(row);position++)
+            {
+                damping.addValue(row,this->A.getVector(row).getIndex(position),
+                                 setup.getRayleighBeta()*this->A.getValue(row,position));
+            }
+        }
+        auto force = [this](double time, const RStructuralDynamicsState &, RRVector &values)
+        {
+            values = this->currentDynamicForce;
+            const double span = this->currentDynamicTime-this->previousDynamicTime;
+            if (span > 0.0 && this->previousDynamicForce.size() == values.size())
+            {
+                const double weight = std::max(0.0,std::min(1.0,(time-this->previousDynamicTime)/span));
+                for (uint i=0;i<values.size();i++)
+                {
+                    values[i] = (1.0-weight)*this->previousDynamicForce[i]+weight*values[i];
+                }
+            }
+        };
+        this->dynamicsIntegrator.reset(new RStructuralDynamicsIntegrator(
+            this->M,damping,this->A,this->pModel->getMatrixSolverConf(RMatrixSolverConf::CG),options,force));
+        const RRVector initialPhysical = this->gatherNodalState(this->nodeDisplacement,this->nodeRotation);
+        const RRVector initialVelocityPhysical = this->gatherNodalState(this->nodeVelocity,this->nodeAngularVelocity);
+        RLogger::info("Initial structural dynamics state: ||q||=%g ||v||=%g\n",
+                      RRVector::euclideanNorm(initialPhysical),RRVector::euclideanNorm(initialVelocityPhysical));
+        this->dynamicsIntegrator->initialize(
+            this->projectPhysicalState(initialPhysical,true),
+            this->projectPhysicalState(initialVelocityPhysical,false),
+            this->previousDynamicTime);
+    }
+    else if (this->currentDynamicForce.size() != this->dynamicsIntegrator->acceptedState().q.size())
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural dynamics equation count changed during time integration.");
+    }
+
+    const double dt = this->pModel->getTimeSolver().getCurrentTimeStepSize();
+    if (!std::isfinite(dt) || dt <= 0.0)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural dynamics requires positive dt (enabled=%d, time=%g, previous=%g, input dt=%g).",
+                     int(this->pModel->getTimeSolver().getEnabled()),
+                     this->pModel->getTimeSolver().getCurrentTime(),
+                     this->pModel->getTimeSolver().getPreviousTime(),
+                     this->pModel->getTimeSolver().getInputTimeStepSize());
+    }
+    this->dynamicsIntegrator->trialStep(dt);
+    this->dynamicsIntegrator->acceptStep();
+    const RStructuralDynamicsState &state = this->dynamicsIntegrator->acceptedState();
+    this->x = this->expandReducedSolution(state.q,true);
+    this->setDisplacement(this->x);
+    this->scatterNodalState(this->expandReducedSolution(state.v,false),
+                            this->nodeVelocity,this->nodeAngularVelocity);
+    this->scatterNodalState(this->expandReducedSolution(state.a,false),
+                            this->nodeAcceleration,this->nodeAngularAcceleration);
+    this->previousDynamicForce = this->currentDynamicForce;
+    this->previousDynamicTime = this->currentDynamicTime;
+    RLogger::info("Structural dynamics: kinetic=%g strain=%g energy residual=%g (solver units)\n",
+                  state.kineticEnergy,state.strainEnergy,state.energyBalanceResidual);
 }
 
 void RSolverStress::solveEigenValue()
@@ -1579,7 +1992,7 @@ void RSolverStress::process()
         {
             v[j] = this->ev[modeNum][j];
         }
-        this->setDisplacement(v);
+        this->setDisplacement(this->expandReducedSolution(v,false));
     }
 
     // Initialize force vector
@@ -2344,6 +2757,35 @@ void RSolverStress::store()
         }
     }
 
+    if (this->problemType == R_PROBLEM_STRESS &&
+        this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled())
+    {
+        auto storeVector = [this](RVariableType type, const RSolverCartesianVector<RRVector> &value)
+        {
+            uint position = this->pModel->findVariable(type);
+            if (position == RConstants::eod)
+            {
+                position = this->pModel->addVariable(type);
+            }
+            RVariable &variable = this->pModel->getVariable(position);
+            variable.setApplyType(R_VARIABLE_APPLY_NODE);
+            variable.resize(3,this->pModel->getNNodes());
+            for (uint node=0;node<this->pModel->getNNodes();node++)
+            {
+                variable.setValue(0,node,value.x[node]);
+                variable.setValue(1,node,value.y[node]);
+                variable.setValue(2,node,value.z[node]);
+            }
+        };
+        storeVector(R_VARIABLE_VELOCITY,this->nodeVelocity);
+        storeVector(R_VARIABLE_ACCELERATION,this->nodeAcceleration);
+        if (hasFrameDofs)
+        {
+            storeVector(R_VARIABLE_ANGULAR_VELOCITY,this->nodeAngularVelocity);
+            storeVector(R_VARIABLE_ANGULAR_ACCELERATION,this->nodeAngularAcceleration);
+        }
+    }
+
     // VonMises Stress
     uint vonMisesStressPos = this->pModel->findVariable(R_VARIABLE_STRESS_VON_MISES);
     if (vonMisesStressPos == RConstants::eod)
@@ -3092,8 +3534,13 @@ void RSolverStress::generateEquationBook()
 
 void RSolverStress::applyLinearConstraints()
 {
-    const std::vector<RLinearConstraint> constraints = this->pModel->getProblemSetup()
-        .getStructuralInteractionSetup().buildLinearConstraints(*this->pModel);
+    this->nPhysicalEquations = this->equationBook.getNEnabled();
+    this->constraintNullspace.clear();
+    this->constraintParticular.clear();
+    this->constraintFreeEquations.clear();
+    const RStructuralInteractionSetup &interactionSetup = this->pModel->getProblemSetup()
+        .getStructuralInteractionSetup();
+    const std::vector<RLinearConstraint> constraints = interactionSetup.buildLinearConstraints(*this->pModel);
     if (constraints.empty())
     {
         return;
@@ -3109,8 +3556,12 @@ void RSolverStress::applyLinearConstraints()
     };
     std::vector<ReducedEquation> independent;
 
-    for (const RLinearConstraint &constraint : constraints)
+    for (uint constraintIndex=0;constraintIndex<constraints.size();constraintIndex++)
     {
+        const RLinearConstraint &constraint = constraints[constraintIndex];
+        // Explicit equations are model data in physical units. Generated
+        // couplings are constructed from already scaled node coordinates.
+        const bool explicitEquation = constraintIndex < interactionSetup.getLinearConstraints().size();
         ReducedEquation reduced;
         reduced.coefficients.resize(nPhysicalEquations,0.0);
         reduced.coefficients.fill(0.0);
@@ -3137,7 +3588,10 @@ void RSolverStress::applyLinearConstraints()
                 const double transform = frame.isActive()
                                        ? frame.getR()[component][localComponent]
                                        : (component == localComponent ? 1.0 : 0.0);
-                const double coefficient = term.coefficient*transform;
+                const double dofScale = translation
+                    ? this->scales.findScaleFactor(R_VARIABLE_DISPLACEMENT) : 1.0;
+                const double coefficient = term.coefficient*transform /
+                    (explicitEquation ? dofScale : 1.0);
                 if (std::fabs(coefficient) <= 1.0e-14)
                 {
                     continue;
@@ -3243,6 +3697,113 @@ void RSolverStress::applyLinearConstraints()
     }
 
     this->nLinearConstraintEquations = uint(independent.size());
+    const bool eliminate = this->problemType == R_PROBLEM_STRESS_MODAL ||
+        (this->problemType == R_PROBLEM_STRESS &&
+         this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled());
+    if (eliminate)
+    {
+        if (this->problemType == R_PROBLEM_STRESS_MODAL)
+        {
+            for (const ReducedEquation &row : independent)
+            {
+                if (std::fabs(row.rhs) > 1.0e-12)
+                {
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Modal constraint '%s' is nonhomogeneous; solve about an explicit equilibrium state first.",
+                                 row.id.toUtf8().constData());
+                }
+            }
+        }
+        const uint nReduced = nPhysicalEquations-this->nLinearConstraintEquations;
+        if (nReduced == 0)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "All structural degrees of freedom were eliminated by linear constraints.");
+        }
+        this->constraintNullspace.resize(nPhysicalEquations,nReduced,0.0);
+        this->constraintNullspace.fill(0.0);
+        this->constraintParticular.resize(nPhysicalEquations,0.0);
+        this->constraintParticular.fill(0.0);
+        std::vector<bool> dependent(nPhysicalEquations,false);
+        for (const ReducedEquation &row : independent)
+        {
+            dependent[row.pivot] = true;
+            this->constraintParticular[row.pivot] = row.rhs;
+        }
+        uint reducedColumn = 0;
+        for (uint column=0;column<nPhysicalEquations;column++)
+        {
+            if (dependent[column])
+            {
+                continue;
+            }
+            this->constraintFreeEquations.push_back(column);
+            this->constraintNullspace[column][reducedColumn] = 1.0;
+            for (const ReducedEquation &row : independent)
+            {
+                this->constraintNullspace[row.pivot][reducedColumn] = -row.coefficients[column];
+            }
+            reducedColumn++;
+        }
+
+        std::vector<std::vector<std::pair<uint,double>>> sparseNullspace(nPhysicalEquations);
+        for (uint row=0;row<nPhysicalEquations;row++)
+        {
+            for (uint column=0;column<nReduced;column++)
+            {
+                const double value = this->constraintNullspace[row][column];
+                if (std::fabs(value) > 1.0e-14)
+                {
+                    sparseNullspace[row].push_back({column,value});
+                }
+            }
+        }
+        auto reduceMatrix = [&](const RSparseMatrix &original)
+        {
+            RSparseMatrix reduced;
+            reduced.setNRows(nReduced);
+            for (uint row=0;row<nPhysicalEquations;row++)
+            {
+                for (uint position=0;position<original.getNColumns(row);position++)
+                {
+                    const uint column = original.getVector(row).getIndex(position);
+                    const double value = original.getValue(row,position);
+                    for (const auto &left : sparseNullspace[row])
+                    {
+                        for (const auto &right : sparseNullspace[column])
+                        {
+                            reduced.addValue(left.first,right.first,left.second*value*right.second);
+                        }
+                    }
+                }
+            }
+            return reduced;
+        };
+        RRVector adjustedForce(this->b);
+        if (this->problemType != R_PROBLEM_STRESS_MODAL)
+        {
+            RRVector offsetStiffness;
+            RSparseMatrix::mlt(this->A,this->constraintParticular,offsetStiffness);
+            for (uint row=0;row<nPhysicalEquations;row++)
+            {
+                adjustedForce[row] -= offsetStiffness[row];
+            }
+        }
+        RRVector reducedForce(nReduced,0.0);
+        for (uint row=0;row<nPhysicalEquations;row++)
+        {
+            for (const auto &term : sparseNullspace[row])
+            {
+                reducedForce[term.first] += term.second*adjustedForce[row];
+            }
+        }
+        this->A = reduceMatrix(this->A);
+        this->M = reduceMatrix(this->M);
+        this->b = reducedForce;
+        this->x.resize(nReduced,0.0);
+        this->nLinearConstraintEquations = 0;
+        return;
+    }
     const uint totalEquations = nPhysicalEquations + this->nLinearConstraintEquations;
     double constraintScale = 1.0;
     for (uint row=0;row<nPhysicalEquations;row++)
@@ -3269,6 +3830,39 @@ void RSolverStress::applyLinearConstraints()
     }
 }
 
+RRVector RSolverStress::expandReducedSolution(const RRVector &reduced, bool includeParticular) const
+{
+    if (this->constraintNullspace.getNRows() == 0)
+    {
+        return reduced;
+    }
+    RRVector physical(this->nPhysicalEquations,0.0);
+    for (uint row=0;row<this->nPhysicalEquations;row++)
+    {
+        physical[row] = includeParticular ? this->constraintParticular[row] : 0.0;
+        for (uint column=0;column<reduced.size();column++)
+        {
+            physical[row] += this->constraintNullspace[row][column]*reduced[column];
+        }
+    }
+    return physical;
+}
+
+RRVector RSolverStress::projectPhysicalState(const RRVector &physical, bool subtractParticular) const
+{
+    if (this->constraintNullspace.getNRows() == 0)
+    {
+        return physical;
+    }
+    RRVector reduced(this->constraintNullspace.getNColumns(),0.0);
+    for (uint column=0;column<this->constraintFreeEquations.size();column++)
+    {
+        const uint row = this->constraintFreeEquations[column];
+        reduced[column] = physical[row] - (subtractParticular ? this->constraintParticular[row] : 0.0);
+    }
+    return reduced;
+}
+
 void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRMatrix &Ke, const RRVector &fe, RSparseMatrix &Ap, RRVector &bp, RSparseMatrix &Mp)
 {
     double alpha = this->pModel->getTimeSolver().getTimeMarchApproximationCoefficient();
@@ -3291,7 +3885,9 @@ void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRM
     Be.fill(0.0);
     be.fill(0.0);
 
-    if (this->pModel->getTimeSolver().getEnabled())
+    const bool structuralDynamics = this->problemType == R_PROBLEM_STRESS &&
+        this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
+    if (this->pModel->getTimeSolver().getEnabled() && !structuralDynamics)
     {
         for (uint m=0;m<rElement.size();m++)
         {
@@ -3328,7 +3924,7 @@ void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRM
             }
         }
     }
-    else if (this->problemType == R_PROBLEM_STRESS_MODAL)
+    else if (this->problemType == R_PROBLEM_STRESS_MODAL || structuralDynamics)
     {
         Ae = Ke;
         Be = Me;
@@ -3401,7 +3997,7 @@ void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRM
                         if (this->equationBook.getValue(rElement.getNodeId(n),elementDofs[j],np))
                         {
                             Ap.addValue(mp,np,Ae[nDofs*m+i][nDofs*n+j]);
-                            if (this->problemType == R_PROBLEM_STRESS_MODAL)
+                            if (this->problemType == R_PROBLEM_STRESS_MODAL || structuralDynamics)
                             {
                                 // Be carries the mass in the node frames.
                                 Mp.addValue(mp,np,Be[nDofs*m+i][nDofs*n+j]);
