@@ -551,6 +551,7 @@ struct RSolverStress::DynamicsStepSnapshot
     std::vector<RStructuralSupportSample> trialSupportSamples;
     bool hadControlMap = false;
     QString cachedControlFingerprint;
+    QString cachedControlCatalogFingerprint;
     std::vector<RStructuralControlChannelSample> controlLedgerSamples;
     std::vector<RStructuralControlCommand> activeControlCommands;
     RRVector activeControlForce;
@@ -616,6 +617,7 @@ void RSolverStress::beginStepTransaction()
     snapshot->trialSupportSamples = this->trialSupportSamples;
     snapshot->hadControlMap = bool(this->controlForceMap);
     snapshot->cachedControlFingerprint = this->cachedControlFingerprint;
+    snapshot->cachedControlCatalogFingerprint = this->cachedControlCatalogFingerprint;
     if (this->controlLedger)
         snapshot->controlLedgerSamples = this->controlLedger->accepted();
     snapshot->activeControlCommands = this->activeControlCommands;
@@ -683,6 +685,7 @@ void RSolverStress::rollbackStepTransaction()
     }
     this->activeControlCommands = snapshot.activeControlCommands;
     this->cachedControlFingerprint = snapshot.cachedControlFingerprint;
+    this->cachedControlCatalogFingerprint = snapshot.cachedControlCatalogFingerprint;
     this->activeControlForce = snapshot.activeControlForce;
     this->acceptedControllerState = snapshot.acceptedControllerState;
     this->candidateControllerState = snapshot.candidateControllerState;
@@ -2172,7 +2175,64 @@ void RSolverStress::prepareControlMapping()
     for (const auto &channel : this->controlForceMap->getChannels())
         this->activeControlCommands.push_back({channel.actuatorId,0.0});
     this->activeControlForce.resize(n,0.0);
+    this->cachedControlCatalogFingerprint = this->controlCatalogFingerprint();
     this->cachedControlFingerprint = this->controlMappingFingerprint();
+}
+
+QString RSolverStress::controlCatalogFingerprint() const
+{
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    hash.addData("range-fea/control-catalog/v1;");
+    auto string = [&hash](const QString &value)
+    {
+        const QByteArray bytes = value.toUtf8();
+        hash.addData(QByteArray::number(bytes.size())); hash.addData(":");
+        hash.addData(bytes);
+    };
+    auto number = [&hash](quint64 value)
+    {
+        hash.addData(QByteArray::number(value)); hash.addData(";");
+    };
+    auto real = [&hash](double value)
+    {
+        hash.addData(QByteArray::number(value,'g',17)); hash.addData(";");
+    };
+    const auto &setup = this->pModel->getProblemSetup().getStructuralControlSetup();
+    number(setup.enabled ? 1 : 0);
+    number(setup.controlProtocolVersion);
+    string(setup.controllerId);
+    number(setup.deterministicSeed);
+    const auto &catalog = this->pModel->getProblemSetup().getStructuralInteractionSetup();
+    number(catalog.getActuators().size());
+    for (const auto &actuator : catalog.getActuators())
+    {
+        string(actuator.id);
+        number(uint(actuator.type));
+        number(uint(actuator.variable));
+        number(uint(actuator.frame));
+        number(uint(actuator.target.scope));
+        number(actuator.target.nodeId);
+        string(actuator.target.setName);
+        number(uint(actuator.target.entityType));
+        string(actuator.unit);
+        for (uint axis=0;axis<3;axis++) real(actuator.direction[axis]);
+        real(actuator.minimum); real(actuator.maximum); real(actuator.rateLimit);
+    }
+    number(catalog.getSensors().size());
+    for (const auto &sensor : catalog.getSensors())
+    {
+        string(sensor.id);
+        number(uint(sensor.quantity));
+        number(uint(sensor.aggregation));
+        number(uint(sensor.frame));
+        number(uint(sensor.target.scope));
+        number(sensor.target.nodeId);
+        string(sensor.target.setName);
+        number(uint(sensor.target.entityType));
+        string(sensor.unit);
+        for (uint axis=0;axis<3;axis++) real(sensor.direction[axis]);
+    }
+    return QString::fromLatin1(hash.result().toHex());
 }
 
 QString RSolverStress::controlMappingFingerprint() const
@@ -2818,6 +2878,10 @@ void RSolverStress::solveStructuralDynamics()
 {
     const RStructuralDynamicsSetup &setup = this->pModel->getProblemSetup().getStructuralDynamicsSetup();
     const RStructuralControlSetup &controlSetup = this->pModel->getProblemSetup().getStructuralControlSetup();
+    if (!this->cachedControlCatalogFingerprint.isEmpty() &&
+        this->controlCatalogFingerprint() != this->cachedControlCatalogFingerprint)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural control catalog changed after mapping was frozen.");
     if (controlSetup.enabled && !this->controlCallback)
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                      "Enabled structural control has no registered provider.");
@@ -3141,6 +3205,9 @@ void RSolverStress::solveStructuralDynamics()
         observation.sensors = this->sampleControlSensors(accepted);
         observation.priorControllerState = this->acceptedControllerState;
         const RStructuralControlDecision decision = this->controlCallback(observation);
+        if (this->controlCatalogFingerprint() != this->cachedControlCatalogFingerprint)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Structural control callback changed the frozen sensor/actuator catalog.");
         if (decision.requestedCommands.size() != this->activeControlCommands.size() ||
             decision.nextControllerState.size() > 1024*1024)
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,

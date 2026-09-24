@@ -220,6 +220,7 @@ private slots:
     void zeroControlMatchesPassiveAcrossMethods();
     void velocityFeedbackReducesMechanicalEnergy();
     void controlRateLimitAndRestartFailClosed();
+    void controlCallbackCannotMutateCatalog();
     void rayleighDampingMatchesAnalyticAfterManySteps();
     void modalDampingMatchesAnalyticAfterManySteps();
     void twoModeDampingMatchesAnalyticProjection();
@@ -476,6 +477,32 @@ void TestStructuralDynamicsFE::controlRateLimitAndRestartFailClosed()
         }
         QVERIFY(rejected);
     }
+}
+
+void TestStructuralDynamicsFE::controlCallbackCannotMutateCatalog()
+{
+    RModel model = makeTruss(1);
+    configureControl(model);
+    const double originalLimit = model.getProblemSetup().getStructuralInteractionSetup()
+        .getActuators()[0].maximum;
+    RSolver solver(model,QString(),QString());
+    solver.setStructuralControlCallback("constant-force","mutating-provider-test-v1",
+        [&model](const RStructuralControlObservation &)
+        {
+            model.getProblemSetup().getStructuralInteractionSetup()
+                .getActuators()[0].maximum = 1.0e8;
+            return RStructuralControlDecision{{{"tip-x",1.0e5}},QByteArray()};
+        });
+    bool rejected = false;
+    try { solver.run(); }
+    catch (const RError &failure)
+    {
+        rejected = failure.getMessage().contains("catalog",Qt::CaseInsensitive);
+    }
+    QVERIFY(rejected);
+    QCOMPARE(model.getProblemSetup().getStructuralInteractionSetup().getActuators()[0].maximum,
+             originalLimit);
+    QVERIFY(!model.getProblemSetup().getStructuralDynamicsRestartData().available);
 }
 
 void TestStructuralDynamicsFE::rayleighDampingMatchesAnalyticAfterManySteps()

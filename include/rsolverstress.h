@@ -125,6 +125,7 @@ class RSolverStress : public RSolverGeneric
         std::unique_ptr<RStructuralControlForceMap> controlForceMap;
         std::unique_ptr<RStructuralControlLedger> controlLedger;
         QString cachedControlFingerprint;
+        QString cachedControlCatalogFingerprint;
         std::vector<RStructuralControlCommand> activeControlCommands;
         RRVector activeControlForce;
         QByteArray acceptedControllerState;
@@ -264,6 +265,7 @@ class RSolverStress : public RSolverGeneric
         void prepareSupportResponse();
         void prepareControlMapping();
         QString controlMappingFingerprint() const;
+        QString controlCatalogFingerprint() const;
         std::vector<RStructuralControlSensorSample> sampleControlSensors(
             const RStructuralDynamicsState &state) const;
         std::vector<RStructuralSupportSample> computeSupportSamples(
