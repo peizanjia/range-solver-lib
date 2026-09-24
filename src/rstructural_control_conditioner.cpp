@@ -1,8 +1,6 @@
 #include "rstructural_control_conditioner.h"
 
 #include <QCryptographicHash>
-#include <QJsonDocument>
-#include <QJsonParseError>
 #include <QSet>
 
 #include <cmath>
@@ -108,14 +106,6 @@ double uniformNoise(quint64 seed, const QString &id, quint64 step, double amplit
     return amplitude*(2.0*unit-1.0);
 }
 
-QByteArray canonicalControllerJson(const QByteArray &bytes)
-{
-    QJsonParseError error;
-    const QJsonDocument parsed = QJsonDocument::fromJson(bytes.isEmpty() ? QByteArray("{}") : bytes,&error);
-    if (error.error != QJsonParseError::NoError || !parsed.isObject())
-        throw std::invalid_argument("Controller-private state must be a JSON object");
-    return parsed.toJson(QJsonDocument::Compact);
-}
 }
 
 RStructuralControlConditioner::RStructuralControlConditioner(
@@ -274,14 +264,14 @@ RStructuralControlConditioner::State RStructuralControlConditioner::deserialize(
 
 QByteArray RStructuralControlStateEnvelope::serialize() const
 {
-    const QByteArray json = canonicalControllerJson(this->controllerJson);
-    if (json.size() > maxStateBytes || this->conditionerState.size() > maxStateBytes ||
-        json.size() + this->conditionerState.size() > maxStateBytes-16)
+    if (this->controllerState.size() > maxStateBytes ||
+        this->conditionerState.size() > maxStateBytes ||
+        this->controllerState.size() + this->conditionerState.size() > maxStateBytes-16)
         throw std::invalid_argument("Composite structural control state exceeds 1 MiB");
     QByteArray result("RCCE",4);
     appendU32(result,1);
-    appendU32(result,quint32(json.size()));
-    result.append(json);
+    appendU32(result,quint32(this->controllerState.size()));
+    result.append(this->controllerState);
     appendU32(result,quint32(this->conditionerState.size()));
     result.append(this->conditionerState);
     return result;
@@ -296,8 +286,8 @@ RStructuralControlStateEnvelope RStructuralControlStateEnvelope::deserialize(
     if (input.take(4) != QByteArray("RCCE",4) || input.u32() != 1)
         throw std::invalid_argument("Unsupported composite structural control state version");
     RStructuralControlStateEnvelope result;
-    const uint jsonSize = input.u32();
-    result.controllerJson = canonicalControllerJson(input.take(jsonSize));
+    const uint controllerSize = input.u32();
+    result.controllerState = input.take(controllerSize);
     const uint conditionerSize = input.u32();
     result.conditionerState = input.take(conditionerSize);
     input.finish();

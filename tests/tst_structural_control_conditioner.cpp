@@ -110,11 +110,11 @@ void TestStructuralControlConditioner::compositeEnvelopeRoundTripAndValidation()
 {
     RStructuralControlConditioner conditioner(1,{{QStringLiteral("actuator"),1,1,0.0}});
     RStructuralControlStateEnvelope envelope;
-    envelope.controllerJson = R"({ "integrator": 1.25, "mode": "pid" })";
+    envelope.controllerState = QByteArray::fromHex("00343000feff");
     envelope.conditionerState = conditioner.serialize(conditioner.initialState());
     const QByteArray packed = envelope.serialize();
     const auto restored = RStructuralControlStateEnvelope::deserialize(packed);
-    QCOMPARE(restored.controllerJson,QByteArray(R"({"integrator":1.25,"mode":"pid"})"));
+    QCOMPARE(restored.controllerState,envelope.controllerState);
     QCOMPARE(restored.conditionerState,envelope.conditionerState);
     QCOMPARE(conditioner.serialize(conditioner.deserialize(restored.conditionerState)),
              envelope.conditionerState);
@@ -122,9 +122,10 @@ void TestStructuralControlConditioner::compositeEnvelopeRoundTripAndValidation()
                              std::invalid_argument);
     QVERIFY_EXCEPTION_THROWN(RStructuralControlStateEnvelope::deserialize(packed + 'x'),
                              std::invalid_argument);
-    envelope.controllerJson = "not-json";
-    QVERIFY_EXCEPTION_THROWN(envelope.serialize(),std::invalid_argument);
-    envelope.controllerJson = "[]";
+    envelope.controllerState.clear();
+    QCOMPARE(RStructuralControlStateEnvelope::deserialize(envelope.serialize()).controllerState,
+             QByteArray());
+    envelope.controllerState = QByteArray(1048576,'x');
     QVERIFY_EXCEPTION_THROWN(envelope.serialize(),std::invalid_argument);
 }
 
