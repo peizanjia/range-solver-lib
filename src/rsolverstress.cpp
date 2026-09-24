@@ -536,6 +536,17 @@ struct RSolverStress::DynamicsStepSnapshot
     bool boundaryReferenceReady = false;
     double previousTime = 0.0;
     double currentTime = 0.0;
+    RSparseMatrix supportStiffness;
+    RSparseMatrix supportMass;
+    RSparseMatrix supportStiffnessReference;
+    RSparseMatrix supportMassReference;
+    RRVector supportForce;
+    RRVector initialSupportForce;
+    std::vector<RStructuralDofRef> heldDofs;
+    std::vector<int> heldIndexByNodeDof;
+    std::vector<bool> pointSupportMask;
+    std::vector<RStructuralSupportSample> acceptedSupportSamples;
+    std::vector<RStructuralSupportSample> trialSupportSamples;
 };
 
 RSolverStress::RSolverStress(RModel *pModel, const QString &modelFileName, const QString &convergenceFileName, RSolverSharedData &sharedData, bool modalAnalysis)
@@ -577,6 +588,17 @@ void RSolverStress::beginStepTransaction()
     snapshot->boundaryReferenceReady = this->dynamicBoundaryReferenceReady;
     snapshot->previousTime = this->previousDynamicTime;
     snapshot->currentTime = this->currentDynamicTime;
+    snapshot->supportStiffness = this->supportStiffness;
+    snapshot->supportMass = this->supportMass;
+    snapshot->supportStiffnessReference = this->supportStiffnessReference;
+    snapshot->supportMassReference = this->supportMassReference;
+    snapshot->supportForce = this->supportForce;
+    snapshot->initialSupportForce = this->initialSupportForce;
+    snapshot->heldDofs = this->heldDofs;
+    snapshot->heldIndexByNodeDof = this->heldIndexByNodeDof;
+    snapshot->pointSupportMask = this->pointSupportMask;
+    snapshot->acceptedSupportSamples = this->acceptedSupportSamples;
+    snapshot->trialSupportSamples = this->trialSupportSamples;
     this->dynamicsStepSnapshot = std::move(snapshot);
 }
 
@@ -614,12 +636,54 @@ void RSolverStress::rollbackStepTransaction()
     this->dynamicBoundaryReferenceReady = snapshot.boundaryReferenceReady;
     this->previousDynamicTime = snapshot.previousTime;
     this->currentDynamicTime = snapshot.currentTime;
+    this->supportStiffness = snapshot.supportStiffness;
+    this->supportMass = snapshot.supportMass;
+    this->supportStiffnessReference = snapshot.supportStiffnessReference;
+    this->supportMassReference = snapshot.supportMassReference;
+    this->supportForce = snapshot.supportForce;
+    this->initialSupportForce = snapshot.initialSupportForce;
+    this->heldDofs = snapshot.heldDofs;
+    this->heldIndexByNodeDof = snapshot.heldIndexByNodeDof;
+    this->pointSupportMask = snapshot.pointSupportMask;
+    this->acceptedSupportSamples = snapshot.acceptedSupportSamples;
+    this->trialSupportSamples = snapshot.trialSupportSamples;
     this->dynamicsStepSnapshot.reset();
 }
 
 void RSolverStress::commitStepTransaction()
 {
+    this->acceptedSupportSamples = std::move(this->trialSupportSamples);
+    this->trialSupportSamples.clear();
     this->dynamicsStepSnapshot.reset();
+    if (this->supportResponseObserver)
+    {
+        try
+        {
+            // The result file and in-memory step are already committed.
+            // Observers are notifications, never a reason to roll back a
+            // published checkpoint after an external side effect.
+            this->supportResponseObserver(this->acceptedSupportSamples);
+        }
+        catch (const std::exception &error)
+        {
+            RLogger::warning("Support-response observer failed after commit: %s\n",error.what());
+        }
+        catch (...)
+        {
+            RLogger::warning("Support-response observer failed after commit.\n");
+        }
+    }
+}
+
+void RSolverStress::setSupportResponseObserver(
+    std::function<void(const std::vector<RStructuralSupportSample> &)> observer)
+{
+    this->supportResponseObserver = std::move(observer);
+}
+
+std::vector<RStructuralSupportSample> RSolverStress::getAcceptedSupportSamples() const
+{
+    return this->acceptedSupportSamples;
 }
 
 bool RSolverStress::hasConverged() const
@@ -775,6 +839,9 @@ void RSolverStress::prepare()
             this->dynamicMotionStiffnessReference = this->motionStiffness;
             this->dynamicConstraintNullspaceReference = this->constraintNullspace;
             this->dynamicConstraintParticularReference = this->constraintParticular;
+            this->initialSupportForce = this->supportForce;
+            this->supportStiffnessReference = this->supportStiffness;
+            this->supportMassReference = this->supportMass;
         }
         catch (...)
         {
@@ -848,6 +915,7 @@ void RSolverStress::prepare()
     if (structuralDynamics)
     {
         this->preparePrescribedMotions();
+        this->prepareSupportResponse();
     }
     this->generateVariableVector(R_VARIABLE_FORCE_X,elementForce.x,forceSetValues.x,true,this->firstRun,this->firstRun);
     this->generateVariableVector(R_VARIABLE_FORCE_Y,elementForce.y,forceSetValues.y,true,this->firstRun,this->firstRun);
@@ -895,6 +963,9 @@ void RSolverStress::prepare()
     std::vector<RSparseMatrix> Kfcp(np);
     std::vector<RSparseMatrix> Mfcp(np);
     std::vector<RRVector> bp(np);
+    this->supportStiffnessBuffers.resize(np);
+    this->supportMassBuffers.resize(np);
+    this->supportForceBuffers.resize(np);
     for (int t=0;t<np;t++)
     {
         Ap[t].setNRows(this->b.size());
@@ -906,6 +977,12 @@ void RSolverStress::prepare()
         }
         bp[t].resize(this->b.size());
         bp[t].fill(0.0);
+        this->supportStiffnessBuffers[t].clear();
+        this->supportMassBuffers[t].clear();
+        this->supportStiffnessBuffers[t].setNRows(uint(this->heldDofs.size()));
+        this->supportMassBuffers[t].setNRows(uint(this->heldDofs.size()));
+        this->supportForceBuffers[t].resize(uint(this->heldDofs.size()),0.0);
+        this->supportForceBuffers[t].fill(0.0);
     }
 
     this->pModel->convertElementToNodeVector(elementForce.x,forceSetValues.x,this->nodeForce.x,true);
@@ -1646,6 +1723,24 @@ void RSolverStress::prepare()
             this->pModel->setNode(i,nodesBkp[i]);
         }
     }
+    if (this->supportResponseObserver)
+    {
+        this->supportStiffness.clear();
+        this->supportMass.clear();
+        this->supportStiffness.setNRows(uint(this->heldDofs.size()));
+        this->supportMass.setNRows(uint(this->heldDofs.size()));
+        this->supportForce.resize(uint(this->heldDofs.size()),0.0);
+        this->supportForce.fill(0.0);
+        for (uint row=0;row<this->heldDofs.size();row++)
+        {
+            for (int t=0;t<np;t++)
+            {
+                this->supportStiffness.getVector(row).addVector(this->supportStiffnessBuffers[t].getVector(row));
+                this->supportMass.getVector(row).addVector(this->supportMassBuffers[t].getVector(row));
+                this->supportForce[row] += this->supportForceBuffers[t][row];
+            }
+        }
+    }
     this->applyLinearConstraints();
 }
 
@@ -2024,6 +2119,91 @@ void RSolverStress::preparePrescribedMotions()
     }
 }
 
+void RSolverStress::prepareSupportResponse()
+{
+    this->heldDofs.clear();
+    this->pointSupportMask.clear();
+    this->heldIndexByNodeDof.assign(6*this->pModel->getNNodes(),-1);
+    if (!this->supportResponseObserver) return;
+    const auto &interaction = this->pModel->getProblemSetup().getStructuralInteractionSetup();
+    if (!interaction.getLinearConstraints().empty() || !interaction.getCouplings().empty())
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Support reaction sampling with MPC/coupling is not supported.");
+    }
+    if (!this->pModel->getProblemSetup().getStructuralDynamicsSetup()
+             .getModalDampingRatios().empty())
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Support reaction sampling with modal damping has no defined constrained damping rows.");
+    }
+    for (uint elementId=0;elementId<this->pModel->getNElements();elementId++)
+    {
+        if (!this->computableElements[elementId]) continue;
+        const auto &dofs = RElementDescriptor::get(
+            this->pModel->getElement(elementId).getType()).getDofsPerNode();
+        if (dofs.contains(RDofType::RX) || dofs.contains(RDofType::RY) ||
+            dofs.contains(RDofType::RZ))
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Support reaction sampling of frame rotational DOFs/moments is not supported.");
+        }
+    }
+    auto appendHeld = [this](uint node, RDofType dof)
+    {
+        const uint key = 6*node+uint(dof);
+        this->heldIndexByNodeDof[key] = int(this->heldDofs.size());
+        this->heldDofs.push_back({node,dof});
+        this->pointSupportMask.push_back(false);
+    };
+    for (uint node=0;node<this->pModel->getNNodes();node++)
+    {
+        for (uint component=0;component<this->nodeConstrainedDirections[node];component++)
+        {
+            appendHeld(node,translationDof(component));
+        }
+        const uint rotationalMask = this->nodeHasRotationCondition[node]
+            ? this->nodeConstrainedRotations[node]
+            : (this->nodeConstrainedDirections[node] == 3 ? 7u : 0u);
+        for (uint component=0;component<3;component++)
+        {
+            if ((rotationalMask & (1u << component)) != 0u)
+            {
+                appendHeld(node,component == 0 ? RDofType::RX :
+                                component == 1 ? RDofType::RY : RDofType::RZ);
+            }
+        }
+    }
+    const RVariableType components[3] =
+        {R_VARIABLE_DISPLACEMENT_X,R_VARIABLE_DISPLACEMENT_Y,R_VARIABLE_DISPLACEMENT_Z};
+    for (uint point=0;point<this->pModel->getNPoints();point++)
+    {
+        const RPoint &group = this->pModel->getPoint(point);
+        for (uint bcIndex=0;bcIndex<group.getNBoundaryConditions();bcIndex++)
+        {
+            const RBoundaryCondition &bc = group.getBoundaryCondition(bcIndex);
+            if (bc.getType() != R_BOUNDARY_CONDITION_DISPLACEMENT || bc.getHasLocalDirection())
+                continue;
+            for (uint position=0;position<group.size();position++)
+            {
+                const RElement &element = this->pModel->getElement(group.get(position));
+                const uint node = element.getNodeId(0);
+                if (this->localRotations[node].isActive())
+                {
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Support reaction sampling requires a global point-node constraint frame.");
+                }
+                for (uint component=0;component<3;component++)
+                {
+                    if (!RSolverStress::isComponentEnabled(bc,components[component])) continue;
+                    const int index = this->heldIndexByNodeDof[6*node+component];
+                    if (index >= 0) this->pointSupportMask[uint(index)] = true;
+                }
+            }
+        }
+    }
+}
+
 RStructuralMotionState RSolverStress::scaledMotionState(
     const RStructuralPrescribedMotion &motion, double time) const
 {
@@ -2086,6 +2266,93 @@ void RSolverStress::setPrescribedMotionResults(double time)
         (*velocity[component])[node] = state.velocity;
         (*acceleration[component])[node] = state.acceleration;
     }
+}
+
+std::vector<RStructuralSupportSample> RSolverStress::computeSupportSamples(
+    const RStructuralDynamicsState &state, const RRVector &heldForce,
+    bool initialOperator) const
+{
+    const RSparseMatrix &stiffness = initialOperator
+        ? this->supportStiffnessReference : this->supportStiffness;
+    const RSparseMatrix &mass = initialOperator
+        ? this->supportMassReference : this->supportMass;
+    const uint nFree = this->equationBook.getNEnabled();
+    if (state.q.size() != nFree || state.v.size() != nFree || state.a.size() != nFree ||
+        heldForce.size() != this->heldDofs.size())
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Support response state/equation dimensions do not agree.");
+    }
+    RRVector q(nFree+uint(this->heldDofs.size()),0.0);
+    RRVector v(q.size(),0.0);
+    RRVector a(q.size(),0.0);
+    for (uint index=0;index<nFree;index++)
+    {
+        q[index] = state.q[index];
+        v[index] = state.v[index];
+        a[index] = state.a[index];
+    }
+    for (uint index=0;index<this->heldDofs.size();index++)
+    {
+        const RStructuralDofRef &target = this->heldDofs[index];
+        uint component = 0;
+        if (findTranslationComponent(target.dof,component))
+        {
+            q[nFree+index] = this->nodePrescribedDisplacement[target.nodeId][component];
+            const int motion = this->motionIndexByNodeDof[3*target.nodeId+component];
+            if (motion >= 0)
+            {
+                const RStructuralMotionState evaluated =
+                    this->scaledMotionState(this->prescribedMotions[uint(motion)],state.time);
+                q[nFree+index] = evaluated.displacement;
+                v[nFree+index] = evaluated.velocity;
+                a[nFree+index] = evaluated.acceleration;
+            }
+        }
+        else if (findRotationComponent(target.dof,component))
+        {
+            q[nFree+index] = this->nodePrescribedRotation[target.nodeId][component];
+        }
+    }
+    const RStructuralDynamicsSetup &setup = this->pModel->getProblemSetup()
+        .getStructuralDynamicsSetup();
+    const double forceScale = this->scales.findScaleFactor(R_VARIABLE_FORCE_X);
+    const double velocityScale = this->scales.findScaleFactor(R_VARIABLE_VELOCITY_X);
+    std::vector<RStructuralSupportSample> samples;
+    for (uint row=0;row<this->heldDofs.size();row++)
+    {
+        if (!this->pointSupportMask[row]) continue;
+        double reaction = -heldForce[row];
+        for (uint position=0;position<stiffness.getNColumns(row);position++)
+        {
+            const uint column = stiffness.getVector(row).getIndex(position);
+            const double coefficient = stiffness.getValue(row,position);
+            reaction += coefficient*(q[column]+setup.getRayleighBeta()*v[column]);
+        }
+        for (uint position=0;position<mass.getNColumns(row);position++)
+        {
+            const uint column = mass.getVector(row).getIndex(position);
+            const double coefficient = mass.getValue(row,position);
+            reaction += coefficient*(a[column]+setup.getRayleighAlpha()*v[column]);
+        }
+        const RStructuralDofRef &target = this->heldDofs[row];
+        const uint component = uint(target.dof);
+        const int motion = this->motionIndexByNodeDof[3*target.nodeId+component];
+        RStructuralSupportSample sample;
+        if (motion >= 0) sample.motionId = this->prescribedMotions[uint(motion)].id;
+        sample.target = target;
+        sample.time = state.time/this->scales.getSecond();
+        sample.reaction = reaction/forceScale;
+        sample.velocity = v[nFree+row]/velocityScale;
+        sample.power = sample.reaction*sample.velocity;
+        if (!std::isfinite(sample.reaction) || !std::isfinite(sample.power))
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Support response contains a non-finite reaction or power.");
+        }
+        samples.push_back(std::move(sample));
+    }
+    return samples;
 }
 
 QString RSolverStress::dynamicSystemFingerprint() const
@@ -2198,6 +2465,46 @@ QString RSolverStress::dynamicSystemFingerprint() const
     return QString::fromLatin1(hash.result().toHex());
 }
 
+QString RSolverStress::supportResponseFingerprint() const
+{
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    auto appendInt = [&hash](quint64 value)
+    {
+        hash.addData(QByteArray::number(value));
+        hash.addData(";",1);
+    };
+    auto appendMatrix = [&](const RSparseMatrix &matrix)
+    {
+        appendInt(matrix.getNRows());
+        for (uint row=0;row<matrix.getNRows();row++)
+        {
+            std::vector<std::pair<uint,double>> entries;
+            for (uint position=0;position<matrix.getNColumns(row);position++)
+                entries.emplace_back(matrix.getVector(row).getIndex(position),
+                                     matrix.getValue(row,position));
+            std::sort(entries.begin(),entries.end());
+            appendInt(entries.size());
+            for (const auto &entry : entries)
+            {
+                appendInt(entry.first);
+                hash.addData(QByteArray::number(entry.second == 0.0 ? 0.0 : entry.second,'g',5));
+                hash.addData(";",1);
+            }
+        }
+    };
+    hash.addData("range-fea/dynamics/support-response/v1/5sig;");
+    appendInt(this->heldDofs.size());
+    for (uint index=0;index<this->heldDofs.size();index++)
+    {
+        appendInt(this->heldDofs[index].nodeId);
+        appendInt(uint(this->heldDofs[index].dof));
+        appendInt(this->pointSupportMask[index] ? 1 : 0);
+    }
+    appendMatrix(this->supportStiffness);
+    appendMatrix(this->supportMass);
+    return QString::fromLatin1(hash.result().toHex());
+}
+
 void RSolverStress::solveStructuralDynamics()
 {
     const RStructuralDynamicsSetup &setup = this->pModel->getProblemSetup().getStructuralDynamicsSetup();
@@ -2263,7 +2570,10 @@ void RSolverStress::solveStructuralDynamics()
     if (!sameMatrix(this->dynamicMassReference,this->M) ||
         !sameMatrix(this->dynamicStiffnessReference,this->A) ||
         !sameMatrix(this->dynamicMotionMassReference,this->motionMass) ||
-        !sameMatrix(this->dynamicMotionStiffnessReference,this->motionStiffness))
+        !sameMatrix(this->dynamicMotionStiffnessReference,this->motionStiffness) ||
+        (this->supportResponseObserver &&
+         (!sameMatrix(this->supportStiffnessReference,this->supportStiffness) ||
+          !sameMatrix(this->supportMassReference,this->supportMass))))
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                      "Structural M/K changed during fixed-matrix dynamics; time-varying material or geometry needs matrix refresh.");
@@ -2311,6 +2621,18 @@ void RSolverStress::solveStructuralDynamics()
         {
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                          "Structural restart checkpoint does not match the equation order, reduced operator or held supports.");
+        }
+        if (this->supportResponseObserver && this->pModel->getProblemSetup().getRestart() &&
+            !restartData.supportResponseAvailable)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Support-work restart requires a persisted accepted response ledger; this checkpoint has none.");
+        }
+        if (this->supportResponseObserver && this->pModel->getProblemSetup().getRestart() &&
+            restartData.supportFingerprint != this->supportResponseFingerprint())
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Support-work restart constrained operator or support identity changed.");
         }
         if (this->initialDynamicForce.size() != this->currentDynamicForce.size())
         {
@@ -2409,6 +2731,35 @@ void RSolverStress::solveStructuralDynamics()
                 this->projectPhysicalState(initialVelocityPhysical,false),
                 this->previousDynamicTime);
         }
+        if (this->supportResponseObserver)
+        {
+            this->acceptedSupportSamples = this->computeSupportSamples(
+                this->dynamicsIntegrator->acceptedState(),this->initialSupportForce,true);
+            if (this->pModel->getProblemSetup().getRestart())
+            {
+                if (restartData.supportReactions.size() != this->acceptedSupportSamples.size())
+                {
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Support-work restart checkpoint has a different support layout.");
+                }
+                for (uint index=0;index<this->acceptedSupportSamples.size();index++)
+                {
+                    RStructuralSupportSample &sample = this->acceptedSupportSamples[index];
+                    const double expected = restartData.supportReactions[index];
+                    const double tolerance = 1.0e-5*std::max({1.0,std::fabs(expected),
+                                                               std::fabs(sample.reaction)});
+                    if (std::fabs(sample.reaction-expected) > tolerance ||
+                        std::fabs(sample.power-restartData.supportPowers[index]) >
+                            1.0e-5*std::max({1.0,std::fabs(sample.power),
+                                             std::fabs(restartData.supportPowers[index])}))
+                    {
+                        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                     "Support-work restart reaction/power does not match the accepted model state.");
+                    }
+                    sample.cumulativeWork = restartData.cumulativeSupportWork[index];
+                }
+            }
+        }
     }
     else if (this->currentDynamicForce.size() != this->dynamicsIntegrator->acceptedState().q.size())
     {
@@ -2429,6 +2780,29 @@ void RSolverStress::solveStructuralDynamics()
     this->dynamicsIntegrator->trialStep(dt);
     this->dynamicsIntegrator->acceptStep();
     const RStructuralDynamicsState &state = this->dynamicsIntegrator->acceptedState();
+    if (this->supportResponseObserver)
+    {
+        this->trialSupportSamples = this->computeSupportSamples(state,this->supportForce);
+        if (this->trialSupportSamples.size() != this->acceptedSupportSamples.size())
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Support response layout changed during integration.");
+        }
+        for (uint index=0;index<this->trialSupportSamples.size();index++)
+        {
+            const RStructuralSupportSample &previous = this->acceptedSupportSamples[index];
+            RStructuralSupportSample &current = this->trialSupportSamples[index];
+            if (current.target.nodeId != previous.target.nodeId ||
+                current.target.dof != previous.target.dof ||
+                current.motionId != previous.motionId)
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Support response identity changed during integration.");
+            }
+            current.cumulativeWork = previous.cumulativeWork+
+                0.5*(previous.power+current.power)*(current.time-previous.time);
+        }
+    }
     this->x = this->expandReducedSolution(state.q,true);
     this->setDisplacement(this->x);
     this->scatterNodalState(this->expandReducedSolution(state.v,false),
@@ -3383,6 +3757,18 @@ void RSolverStress::store()
             restart.cumulativeExternalWork = state.externalWork;
             restart.cumulativeDampingDissipation = state.dampingDissipation;
             restart.initialMechanicalEnergy = committed.initialMechanicalEnergy;
+            restart.supportResponseAvailable = bool(this->supportResponseObserver);
+            restart.supportFingerprint = this->supportResponseObserver
+                ? this->supportResponseFingerprint() : QString();
+            restart.supportReactions.clear();
+            restart.supportPowers.clear();
+            restart.cumulativeSupportWork.clear();
+            for (const RStructuralSupportSample &sample : this->trialSupportSamples)
+            {
+                restart.supportReactions.push_back(sample.reaction);
+                restart.supportPowers.push_back(sample.power);
+                restart.cumulativeSupportWork.push_back(sample.cumulativeWork);
+            }
             restart.available = true;
             if (restart.q.size() != restart.v.size() ||
                 restart.q.size() != restart.a.size() ||
@@ -4550,6 +4936,8 @@ void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRM
     this->applyLocalRotations(elementID,Ae);
     this->applyLocalRotations(elementID,Be);
     this->applyLocalRotations(elementID,be);
+    // Save the actual applied load before held-column elimination rewrites be.
+    const RRVector rawElementForce(be);
 
     // Apply explicit boundary conditions. Ae and be are in the frame of each
     // node by now, so the prescribed values have to be taken in that same
@@ -4595,6 +4983,44 @@ void RSolverStress::assemblyMatrix(uint elementID, const RRMatrix &Me, const RRM
         for (uint i=0;i<nDofs;i++)
         {
             uint mp = 0;
+
+            if (structuralDynamics && this->supportResponseObserver)
+            {
+                const uint node = rElement.getNodeId(m);
+                const uint dof = uint(elementDofs[i]);
+                const int heldRow = dof < 6 ? this->heldIndexByNodeDof[6*node+dof] : -1;
+                if (heldRow >= 0)
+                {
+                    const uint row = uint(heldRow);
+                    const uint thread = uint(omp_get_thread_num());
+                    this->supportForceBuffers[thread][row] += rawElementForce[nDofs*m+i];
+                    for (uint n=0;n<rElement.size();n++)
+                    {
+                        for (uint j=0;j<nDofs;j++)
+                        {
+                            const uint columnNode = rElement.getNodeId(n);
+                            const RDofType columnDof = elementDofs[j];
+                            uint column = 0;
+                            if (!this->equationBook.getValue(columnNode,columnDof,column))
+                            {
+                                const uint dofIndex = uint(columnDof);
+                                const int heldColumn = dofIndex < 6
+                                    ? this->heldIndexByNodeDof[6*columnNode+dofIndex] : -1;
+                                if (heldColumn < 0)
+                                {
+                                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                                 "Support reaction row references an inactive non-support DOF.");
+                                }
+                                column = this->equationBook.getNEnabled()+uint(heldColumn);
+                            }
+                            this->supportStiffnessBuffers[thread].addValue(
+                                row,column,Ae[nDofs*m+i][nDofs*n+j]);
+                            this->supportMassBuffers[thread].addValue(
+                                row,column,Be[nDofs*m+i][nDofs*n+j]);
+                        }
+                    }
+                }
+            }
 
             if (this->equationBook.getValue(rElement.getNodeId(m),elementDofs[i],mp))
             {

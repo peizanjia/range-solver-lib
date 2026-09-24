@@ -2,10 +2,12 @@
 #define RSOLVER_H
 
 #include <functional>
+#include <vector>
 
 #include <rml_model.h>
 
 #include "rsolvergeneric.h"
+#include "rstructural_support_response.h"
 #include "rsolvershareddata.h"
 
 struct RParallelExecutionReport;
@@ -17,6 +19,8 @@ class RSolver
 
         using ParallelExecutionReportObserver =
             std::function<void(const RParallelExecutionReport &)>;
+        using StructuralSupportResponseObserver =
+            std::function<void(const std::vector<RStructuralSupportSample> &)>;
 
         enum class ExecutionPolicy
         {
@@ -42,6 +46,7 @@ class RSolver
         QMap<RProblemType,uint> solversExecutionCount;
         //! Optional synchronous observation of the run's scoped OpenMP report.
         ParallelExecutionReportObserver parallelExecutionReportObserver;
+        StructuralSupportResponseObserver structuralSupportResponseObserver;
 
     private:
 
@@ -73,6 +78,15 @@ class RSolver
         //! probe, not a count measured separately in every kernel. An
         //! exception aborts run() before solving.
         void setParallelExecutionReportObserver(ParallelExecutionReportObserver observer);
+
+        //! Accepted-step support samples, emitted after a successful result write.
+        //! Observer exceptions are logged and cannot revoke an already committed step.
+        void setStructuralSupportResponseObserver(StructuralSupportResponseObserver observer);
+
+        //! Last accepted physical-unit support samples (a detached copy).
+        //! Requires setStructuralSupportResponseObserver() before run(); an
+        //! unsubscribed solve does not assemble constrained dynamic rows.
+        std::vector<RStructuralSupportSample> getStructuralSupportSamples() const;
 
     protected:
 

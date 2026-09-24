@@ -1,5 +1,6 @@
 #include <QtTest>
 
+#include <QFile>
 #include <QTemporaryDir>
 
 #include <algorithm>
@@ -112,13 +113,25 @@ void addMovingSupport(RModel &model)
          .getPrescribedMotions().push_back(motion);
 }
 
-bool solve(RModel &model, QString &error)
+bool solve(RModel &model, QString &error,
+           std::vector<RStructuralSupportSample> *lastSupport = nullptr,
+           std::vector<std::vector<RStructuralSupportSample>> *history = nullptr,
+           const QString &outputPath = QString())
 {
     error.clear();
     try
     {
-        RSolver solver(model,QString(),QString());
+        RSolver solver(model,outputPath,QString());
+        if (lastSupport || history)
+        {
+            solver.setStructuralSupportResponseObserver(
+                [history](const std::vector<RStructuralSupportSample> &samples)
+                {
+                    if (history) history->push_back(samples);
+                });
+        }
         solver.run();
+        if (lastSupport) *lastSupport = solver.getStructuralSupportSamples();
         return true;
     }
     catch (const RError &failure)
@@ -185,6 +198,16 @@ bool closeAtPhysicalScale(double actual, double expected, double characteristicS
            std::isfinite(scale) && scale > 0.0 &&
            std::abs(actual-expected) <= relativeTolerance*scale;
 }
+
+const RStructuralSupportSample *findMotionSample(
+    const std::vector<RStructuralSupportSample> &samples, const QString &motionId)
+{
+    for (const RStructuralSupportSample &sample : samples)
+    {
+        if (sample.motionId == motionId) return &sample;
+    }
+    return nullptr;
+}
 }
 
 class TestStructuralDynamicsRestartIO : public QObject
@@ -197,6 +220,11 @@ private slots:
     void modalDampingDiskRestartMatchesUninterrupted_data();
     void modalDampingDiskRestartMatchesUninterrupted();
     void modalDampingRejectsChangedRatio();
+    void supportResponseDiskRestartMatchesUninterrupted_data();
+    void supportResponseDiskRestartMatchesUninterrupted();
+    void supportResponseRejectsMissingLedger_data();
+    void supportResponseRejectsMissingLedger();
+    void supportResponseLateWriteFailureRollsBack();
     void movingSupportDiskRestartMatchesUninterrupted_data();
     void movingSupportDiskRestartMatchesUninterrupted();
     void movingSupportRejectsChangedKnot();
@@ -392,6 +420,143 @@ void TestStructuralDynamicsRestartIO::modalDampingRejectsChangedRatio()
     alteredSetup.setNSteps(secondSegmentSteps);
     QVERIFY2(!solve(altered,error),"Changed modal damping ratio was accepted by restart.");
     QVERIFY2(error.contains("checkpoint",Qt::CaseInsensitive),qPrintable(error));
+}
+
+void TestStructuralDynamicsRestartIO::supportResponseDiskRestartMatchesUninterrupted_data()
+{
+    QTest::addColumn<bool>("binary");
+    QTest::newRow("ascii-ram") << false;
+    QTest::newRow("binary-rbm") << true;
+}
+
+void TestStructuralDynamicsRestartIO::supportResponseDiskRestartMatchesUninterrupted()
+{
+    QFETCH(bool,binary);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    RModel uninterrupted = makeTruss(firstSegmentSteps+secondSegmentSteps);
+    RModel firstSegment = makeTruss(firstSegmentSteps);
+    addMovingSupport(uninterrupted);
+    addMovingSupport(firstSegment);
+    QString error;
+    std::vector<RStructuralSupportSample> expectedSamples, firstSamples, resumedSamples;
+    QVERIFY2(solve(uninterrupted,error,&expectedSamples),qPrintable(error));
+    QVERIFY2(solve(firstSegment,error,&firstSamples),qPrintable(error));
+    const auto &saved = firstSegment.getProblemSetup().getStructuralDynamicsRestartData();
+    QVERIFY(saved.supportResponseAvailable);
+    QCOMPARE(saved.supportReactions.size(),firstSamples.size());
+    const QString path = directory.filePath(binary ? "support-accepted.rbm" : "support-accepted.ram");
+    QCOMPARE(firstSegment.write(path,false),path);
+    RModel resumed;
+    QVERIFY2(load(resumed,path,error),qPrintable(error));
+    const auto &readBack = resumed.getProblemSetup().getStructuralDynamicsRestartData();
+    QVERIFY(readBack.supportResponseAvailable);
+    QCOMPARE(readBack.supportFingerprint,saved.supportFingerprint);
+    QCOMPARE(readBack.supportReactions,saved.supportReactions);
+    QCOMPARE(readBack.supportPowers,saved.supportPowers);
+    QCOMPARE(readBack.cumulativeSupportWork,saved.cumulativeSupportWork);
+    resumed.getProblemSetup().setRestart(true);
+    resumed.getProblemSetup().getStructuralDynamicsSetup().setNSteps(secondSegmentSteps);
+    resumed.getProblemSetup().getStructuralDynamicsSetup().setOutputFrequency(secondSegmentSteps);
+    QVERIFY2(solve(resumed,error,&resumedSamples),qPrintable(error));
+    const auto *expected = findMotionSample(expectedSamples,"restart-base-motion");
+    const auto *actual = findMotionSample(resumedSamples,"restart-base-motion");
+    QVERIFY(expected != nullptr && actual != nullptr);
+    QCOMPARE(actual->motionId,expected->motionId);
+    QCOMPARE(actual->target.nodeId,expected->target.nodeId);
+    QCOMPARE(actual->target.dof,expected->target.dof);
+    QVERIFY(closeAtPhysicalScale(actual->time,expected->time,stepSize,1.0e-10));
+    QVERIFY(closeAtPhysicalScale(actual->reaction,expected->reaction,1.0e5,1.0e-8));
+    QVERIFY(closeAtPhysicalScale(actual->velocity,expected->velocity,1.0,1.0e-8));
+    QVERIFY(closeAtPhysicalScale(actual->power,expected->power,1.0e5,1.0e-8));
+    QVERIFY(closeAtPhysicalScale(actual->cumulativeWork,expected->cumulativeWork,10.0,1.0e-8));
+    const auto &resumedLedger = resumed.getProblemSetup().getStructuralDynamicsRestartData();
+    QVERIFY(resumedLedger.supportResponseAvailable);
+    QCOMPARE(resumedLedger.supportFingerprint,
+             uninterrupted.getProblemSetup().getStructuralDynamicsRestartData().supportFingerprint);
+
+    // The FE checkpoint remains usable when the optional support observer is
+    // absent; only its support-work ledger is no longer continued.
+    RModel noObserver;
+    QVERIFY2(load(noObserver,path,error),qPrintable(error));
+    noObserver.getProblemSetup().setRestart(true);
+    noObserver.getProblemSetup().getStructuralDynamicsSetup().setNSteps(secondSegmentSteps);
+    QVERIFY2(solve(noObserver,error),qPrintable(error));
+    QVERIFY(!noObserver.getProblemSetup().getStructuralDynamicsRestartData()
+             .supportResponseAvailable);
+}
+
+void TestStructuralDynamicsRestartIO::supportResponseRejectsMissingLedger_data()
+{
+    QTest::addColumn<bool>("binary");
+    QTest::newRow("ascii-ram") << false;
+    QTest::newRow("binary-rbm") << true;
+}
+
+void TestStructuralDynamicsRestartIO::supportResponseRejectsMissingLedger()
+{
+    QFETCH(bool,binary);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    RModel first = makeTruss(firstSegmentSteps);
+    addMovingSupport(first);
+    QString error;
+    QVERIFY2(solve(first,error),qPrintable(error));
+    const QString path = directory.filePath(binary ? "no-ledger.rbm" : "no-ledger.ram");
+    QCOMPARE(first.write(path,false),path);
+    RModel resumed;
+    QVERIFY2(load(resumed,path,error),qPrintable(error));
+    resumed.getProblemSetup().setRestart(true);
+    resumed.getProblemSetup().getStructuralDynamicsSetup().setNSteps(secondSegmentSteps);
+    std::vector<RStructuralSupportSample> last;
+    std::vector<std::vector<RStructuralSupportSample>> observed;
+    QVERIFY2(!solve(resumed,error,&last,&observed),
+             "Enabling support telemetry without an accepted ledger was allowed.");
+    QVERIFY2(error.contains("ledger",Qt::CaseInsensitive),qPrintable(error));
+    QVERIFY(observed.empty());
+    QCOMPARE(resumed.getProblemSetup().getStructuralDynamicsRestartData().completedSteps,
+             firstSegmentSteps);
+}
+
+void TestStructuralDynamicsRestartIO::supportResponseLateWriteFailureRollsBack()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    RModel model = makeTruss(1);
+    addMovingSupport(model);
+    QString error;
+    std::vector<RStructuralSupportSample> acceptedSamples;
+    QVERIFY2(solve(model,error,&acceptedSamples),qPrintable(error));
+    QVERIFY(!acceptedSamples.empty());
+    const RStructuralDynamicsRestartData accepted = model.getProblemSetup()
+        .getStructuralDynamicsRestartData();
+    QVERIFY(accepted.supportResponseAvailable);
+
+    // Make the output parent a regular file, so QSaveFile cannot publish the
+    // next result. The trial is numerically valid but must not be accepted.
+    const QString blockerPath = directory.filePath("not-a-directory");
+    QFile blocker(blockerPath);
+    QVERIFY(blocker.open(QIODevice::WriteOnly));
+    blocker.close();
+    model.getProblemSetup().setRestart(true);
+    model.getProblemSetup().getStructuralDynamicsSetup().setNSteps(1);
+    std::vector<RStructuralSupportSample> failedTrialSamples;
+    std::vector<std::vector<RStructuralSupportSample>> notifications;
+    QVERIFY2(!solve(model,error,&failedTrialSamples,&notifications,
+                    blockerPath+"/rejected.rbm"),
+             "A failed result-file publication accepted the trial step.");
+    QVERIFY2(!error.isEmpty(),"Late write failure had no diagnostic.");
+    QVERIFY(notifications.empty());
+    const RStructuralDynamicsRestartData &after = model.getProblemSetup()
+        .getStructuralDynamicsRestartData();
+    QCOMPARE(after.completedSteps,accepted.completedSteps);
+    QCOMPARE(after.time,accepted.time);
+    QCOMPARE(after.systemFingerprint,accepted.systemFingerprint);
+    QCOMPARE(after.supportFingerprint,accepted.supportFingerprint);
+    QCOMPARE(after.supportReactions,accepted.supportReactions);
+    QCOMPARE(after.supportPowers,accepted.supportPowers);
+    QCOMPARE(after.cumulativeSupportWork,accepted.cumulativeSupportWork);
+    QCOMPARE(model.getTimeSolver().getCurrentTime(),accepted.time);
 }
 
 void TestStructuralDynamicsRestartIO::movingSupportDiskRestartMatchesUninterrupted_data()

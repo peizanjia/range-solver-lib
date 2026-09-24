@@ -161,6 +161,29 @@ void RSolver::setParallelExecutionReportObserver(ParallelExecutionReportObserver
     this->parallelExecutionReportObserver = std::move(observer);
 }
 
+void RSolver::setStructuralSupportResponseObserver(StructuralSupportResponseObserver observer)
+{
+    this->structuralSupportResponseObserver = std::move(observer);
+    auto it = this->solvers.find(R_PROBLEM_STRESS);
+    if (it != this->solvers.end())
+    {
+        static_cast<RSolverStress*>(it.value())->setSupportResponseObserver(
+            this->structuralSupportResponseObserver);
+    }
+}
+
+std::vector<RStructuralSupportSample> RSolver::getStructuralSupportSamples() const
+{
+    if (!this->structuralSupportResponseObserver)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural support samples require an observer registered before run().");
+    }
+    auto it = this->solvers.constFind(R_PROBLEM_STRESS);
+    return it == this->solvers.cend() ? std::vector<RStructuralSupportSample>()
+                                     : static_cast<const RSolverStress*>(it.value())->getAcceptedSupportSamples();
+}
+
 void RSolver::run()
 {
     RParallelExecutionContext parallelContext(this->pModel->getProblemSetup().getParallelExecutionConfig());

@@ -4,6 +4,8 @@
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <stdexcept>
+#include <vector>
 
 #include "rml_model.h"
 #include "rsolver.h"
@@ -116,12 +118,23 @@ RModel makeTruss(uint nElements, bool tieLastTwo = false)
     return model;
 }
 
-bool runSolver(RModel &model, QString &error)
+bool runSolver(RModel &model, QString &error,
+               std::vector<std::vector<RStructuralSupportSample>> *supportHistory = nullptr,
+               std::vector<RStructuralSupportSample> *lastSupport = nullptr)
 {
     try
     {
         RSolver solver(model,QString(),QString());
+        if (supportHistory || lastSupport)
+        {
+            solver.setStructuralSupportResponseObserver(
+                [supportHistory](const std::vector<RStructuralSupportSample> &samples)
+                {
+                    if (supportHistory) supportHistory->push_back(samples);
+                });
+        }
         solver.run();
+        if (lastSupport) *lastSupport = solver.getStructuralSupportSamples();
         return true;
     }
     catch (const RError &failure)
@@ -152,6 +165,16 @@ double dampedDisplacement(double omega, double dampingRatio, double time)
          *(std::cos(dampedOmega*time)
            +dampingRatio*omega/dampedOmega*std::sin(dampedOmega*time));
 }
+
+const RStructuralSupportSample *findSupport(
+    const std::vector<RStructuralSupportSample> &samples, uint node, RDofType dof)
+{
+    for (const RStructuralSupportSample &sample : samples)
+    {
+        if (sample.target.nodeId == node && sample.target.dof == dof) return &sample;
+    }
+    return nullptr;
+}
 }
 
 class TestStructuralDynamicsFE : public QObject
@@ -165,6 +188,11 @@ private slots:
     void twoModeDampingMatchesAnalyticProjection();
     void modalDampingWorksWithHomogeneousMpc();
     void unsupportedModalDampingCombinationsFailBeforeFirstStep();
+    void stationarySupportReactionIncludesInertia();
+    void movingSupportReactionPowerAndAppliedSupportForce();
+    void supportGetterRequiresObserver();
+    void supportObserverExceptionsDoNotRevokeAcceptedStep();
+    void supportObserverRejectsModalAndMpc();
     void movingSupportMatchesConsistentMassAnalytic();
     void movingSupportRayleighMassDampingMatchesAnalytic();
     void unsupportedMovingSupportInputsFailBeforeFirstStep();
@@ -326,6 +354,126 @@ void TestStructuralDynamicsFE::unsupportedModalDampingCombinationsFailBeforeFirs
     QVERIFY2(!runSolver(moving,error),"Modal damping with moving support was accepted.");
     QVERIFY2(error.contains("moving support",Qt::CaseInsensitive),qPrintable(error));
     QVERIFY(!moving.getProblemSetup().getStructuralDynamicsRestartData().available);
+}
+
+void TestStructuralDynamicsFE::stationarySupportReactionIncludesInertia()
+{
+    RModel model = makeTruss(1);
+    std::vector<std::vector<RStructuralSupportSample>> history;
+    std::vector<RStructuralSupportSample> last;
+    QString error;
+    QVERIFY2(runSolver(model,error,&history,&last),qPrintable(error));
+    QCOMPARE(history.size(),std::size_t(40));
+    const RStructuralSupportSample *support = findSupport(last,0,RDofType::UX);
+    QVERIFY(support != nullptr);
+    QVERIFY(support->motionId.isEmpty());
+    const double k = youngModulus*crossArea/length;
+    const double q = nodalValue(model,R_VARIABLE_DISPLACEMENT,1);
+    // M_cf=M_ff/2, a_f=-k*q/M_ff; K_cf=-k.
+    const double expected = -1.5*k*q;
+    QVERIFY2(std::abs(support->reaction-expected) < 1.0e-7*k*initialDisplacement,
+             qPrintable(QString("Support-on-structure R=%1, M*a+K*u=%2")
+                        .arg(support->reaction).arg(expected)));
+    QCOMPARE(support->velocity,0.0);
+    QCOMPARE(support->power,0.0);
+    QCOMPARE(support->cumulativeWork,0.0);
+}
+
+void TestStructuralDynamicsFE::movingSupportReactionPowerAndAppliedSupportForce()
+{
+    constexpr double speed = 0.1;
+    constexpr double appliedSupportForce = 1234.567;
+    auto makeMoving = [speed](double appliedForce)
+    {
+        RModel model = makeTruss(1);
+        model.getPoint(1).removeAllInitialConditions();
+        const auto &setup = model.getProblemSetup().getStructuralDynamicsSetup();
+        const double duration = setup.getNSteps()*setup.getTimeStep();
+        RStructuralPrescribedMotion motion;
+        motion.id = "linear-base-x";
+        motion.target = {0,RDofType::UX};
+        motion.knots = {{0.0,0.0,speed,0.0},{duration,speed*duration,speed,0.0}};
+        model.getProblemSetup().getStructuralInteractionSetup()
+             .getPrescribedMotions().push_back(motion);
+        if (appliedForce != 0.0)
+        {
+            RBoundaryCondition force(R_BOUNDARY_CONDITION_FORCE);
+            force.getComponent(force.findComponentPosition(R_VARIABLE_FORCE_X))
+                 .add(0.0,appliedForce);
+            model.getPoint(0).addBoundaryCondition(force);
+        }
+        return model;
+    };
+    RModel model = makeMoving(0.0);
+    RModel loaded = makeMoving(appliedSupportForce);
+    std::vector<RStructuralSupportSample> last;
+    std::vector<RStructuralSupportSample> loadedLast;
+    QString error;
+    QVERIFY2(runSolver(model,error,nullptr,&last),qPrintable(error));
+    QVERIFY2(runSolver(loaded,error,nullptr,&loadedLast),qPrintable(error));
+    const RStructuralSupportSample *support = findSupport(last,0,RDofType::UX);
+    const RStructuralSupportSample *loadedSupport = findSupport(loadedLast,0,RDofType::UX);
+    QVERIFY(support != nullptr && loadedSupport != nullptr);
+    QCOMPARE(support->motionId,QString("linear-base-x"));
+    const double omega = singleElementFrequency();
+    const double time = 40.0*model.getProblemSetup().getStructuralDynamicsSetup().getTimeStep();
+    const double totalMass = massDensity*crossArea*length;
+    const double expectedReaction = 0.5*totalMass*speed*omega*std::sin(omega*time);
+    const double expectedWork = 0.5*totalMass*speed*speed*(1.0-std::cos(omega*time));
+    QVERIFY2(std::abs(support->reaction-expectedReaction) < 5.0e-4*expectedReaction,
+             qPrintable(QString("Moving support R=%1, analytic=%2")
+                        .arg(support->reaction).arg(expectedReaction)));
+    QVERIFY(std::abs(support->power-support->reaction*speed) < 1.0e-10*expectedReaction*speed);
+    QVERIFY(std::abs(support->cumulativeWork-expectedWork) < 1.0e-3*expectedWork);
+    QVERIFY(std::abs(nodalValue(model,R_VARIABLE_DISPLACEMENT,1)-
+                     nodalValue(loaded,R_VARIABLE_DISPLACEMENT,1)) < 1.0e-12);
+    QVERIFY(std::abs((loadedSupport->reaction-support->reaction)+appliedSupportForce) < 1.0e-7);
+    QVERIFY(std::abs((loadedSupport->power-support->power)+appliedSupportForce*speed) < 1.0e-8);
+    QVERIFY(std::abs((loadedSupport->cumulativeWork-support->cumulativeWork)+
+                     appliedSupportForce*speed*time) < 1.0e-6);
+}
+
+void TestStructuralDynamicsFE::supportGetterRequiresObserver()
+{
+    RModel model = makeTruss(1);
+    RSolver solver(model,QString(),QString());
+    QVERIFY_EXCEPTION_THROWN(solver.getStructuralSupportSamples(),RError);
+}
+
+void TestStructuralDynamicsFE::supportObserverExceptionsDoNotRevokeAcceptedStep()
+{
+    RModel model = makeTruss(1);
+    model.getProblemSetup().getStructuralDynamicsSetup().setNSteps(1);
+    RSolver solver(model,QString(),QString());
+    uint notifications = 0;
+    solver.setStructuralSupportResponseObserver(
+        [&notifications](const std::vector<RStructuralSupportSample> &)
+        {
+            notifications++;
+            throw std::runtime_error("consumer failure after support publication");
+        });
+    solver.run();
+    QCOMPARE(notifications,uint(1));
+    QCOMPARE(model.getProblemSetup().getStructuralDynamicsRestartData().completedSteps,uint(1));
+    QVERIFY(model.getProblemSetup().getStructuralDynamicsRestartData().supportResponseAvailable);
+    const auto samples = solver.getStructuralSupportSamples();
+    QVERIFY(findSupport(samples,0,RDofType::UX) != nullptr);
+}
+
+void TestStructuralDynamicsFE::supportObserverRejectsModalAndMpc()
+{
+    RModel modal = makeTruss(1);
+    modal.getProblemSetup().getStructuralDynamicsSetup().setModalDampingRatios({0.05});
+    QString error;
+    std::vector<std::vector<RStructuralSupportSample>> history;
+    QVERIFY2(!runSolver(modal,error,&history),"Modal support reaction sampling was accepted.");
+    QVERIFY2(error.contains("modal damping",Qt::CaseInsensitive),qPrintable(error));
+    QVERIFY(history.empty());
+
+    RModel mpc = makeTruss(2,true);
+    QVERIFY2(!runSolver(mpc,error,&history),"MPC support reaction sampling was accepted.");
+    QVERIFY2(error.contains("MPC",Qt::CaseInsensitive),qPrintable(error));
+    QVERIFY(history.empty());
 }
 
 void TestStructuralDynamicsFE::movingSupportMatchesConsistentMassAnalytic()

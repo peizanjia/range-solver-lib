@@ -3,12 +3,15 @@
 
 #include <rbl_rvector.h>
 #include <rml_structural_interaction.h>
+#include <functional>
 #include <memory>
 
 #include "requationbook.h"
+#include "rstructural_support_response.h"
 #include "rsolvergeneric.h"
 
 class RStructuralDynamicsIntegrator;
+struct RStructuralDynamicsState;
 
 class RSolverStress : public RSolverGeneric
 {
@@ -110,6 +113,21 @@ class RSolverStress : public RSolverGeneric
         double currentDynamicTime = 0.0;
         struct DynamicsStepSnapshot;
         std::unique_ptr<DynamicsStepSnapshot> dynamicsStepSnapshot;
+        std::function<void(const std::vector<RStructuralSupportSample> &)> supportResponseObserver;
+        std::vector<RStructuralSupportSample> acceptedSupportSamples;
+        std::vector<RStructuralSupportSample> trialSupportSamples;
+        std::vector<RStructuralDofRef> heldDofs;
+        std::vector<int> heldIndexByNodeDof;
+        std::vector<bool> pointSupportMask;
+        RSparseMatrix supportStiffness;
+        RSparseMatrix supportMass;
+        RSparseMatrix supportStiffnessReference;
+        RSparseMatrix supportMassReference;
+        RRVector supportForce;
+        RRVector initialSupportForce;
+        std::vector<RSparseMatrix> supportStiffnessBuffers;
+        std::vector<RSparseMatrix> supportMassBuffers;
+        std::vector<RRVector> supportForceBuffers;
 
     public:
 
@@ -124,6 +142,9 @@ class RSolverStress : public RSolverGeneric
 
         //! Number of modes the last eigen-value solve actually produced.
         uint getNComputedModes() const override;
+
+        void setSupportResponseObserver(std::function<void(const std::vector<RStructuralSupportSample> &)> observer);
+        std::vector<RStructuralSupportSample> getAcceptedSupportSamples() const;
 
     protected:
 
@@ -205,11 +226,16 @@ class RSolverStress : public RSolverGeneric
 
         //! Stable digest of the reduced operator, constraint map and held supports.
         QString dynamicSystemFingerprint() const;
+        QString supportResponseFingerprint() const;
         QString motionDefinitionFingerprint() const;
         void preparePrescribedMotions();
         RStructuralMotionState scaledMotionState(const RStructuralPrescribedMotion &motion, double time) const;
         void motionEffectiveForce(double time, RRVector &force) const;
         void setPrescribedMotionResults(double time);
+        void prepareSupportResponse();
+        std::vector<RStructuralSupportSample> computeSupportSamples(
+            const RStructuralDynamicsState &state, const RRVector &heldForce,
+            bool initialOperator = false) const;
 
         //! Return true if given component of the boundary condition is present
         //! and switched on.
