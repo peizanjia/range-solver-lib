@@ -5,6 +5,7 @@
 #include <rml_model.h>
 
 #include "rstructural_temperature_field.h"
+#include "rstructural_coupled_field_snapshot.h"
 
 namespace
 {
@@ -52,7 +53,67 @@ private slots:
     void rejectsGeometricChangeBelowLegacyFiveDigitPrecision();
     void rejectsInvalidIdsAndTemperatures();
     void rejectsOrientedConnectivityChange();
+    void coupledSnapshotKeepsPhysicalIdsAndMissingFieldsExplicit();
 };
+
+void TestStructuralTemperatureField::coupledSnapshotKeepsPhysicalIdsAndMissingFieldsExplicit()
+{
+    const std::vector<QString> ids = {"A","B","C"};
+    RModel first = mesh(ids);
+    RVariable temperature(R_VARIABLE_TEMPERATURE,R_VARIABLE_APPLY_NODE);
+    temperature.resize(1,3);
+    for (uint i=0;i<3;i++) temperature.setValue(0,i,300.0+10.0*i);
+    first.addVariable(temperature);
+    RVariable displacement(R_VARIABLE_DISPLACEMENT,R_VARIABLE_APPLY_NODE);
+    displacement.resize(3,3);
+    for (uint i=0;i<3;i++)
+    {
+        displacement.setValue(0,i,0.001*i);
+        displacement.setValue(1,i,0.0);
+        displacement.setValue(2,i,0.0);
+    }
+    first.addVariable(displacement);
+    const RVariableType stressTypes[6] = {
+        R_VARIABLE_STRESS_X,R_VARIABLE_STRESS_Y,R_VARIABLE_STRESS_Z,
+        R_VARIABLE_STRESS_YZ,R_VARIABLE_STRESS_XZ,R_VARIABLE_STRESS_XY
+    };
+    for (uint component=0;component<6;component++)
+    {
+        RVariable stress(stressTypes[component],R_VARIABLE_APPLY_ELEMENT);
+        stress.resize(1,2);
+        stress.setValue(0,0,11.0+component);
+        stress.setValue(0,1,22.0+component);
+        first.addVariable(stress);
+    }
+    first.getTimeSolver().setComputedTime(1.0);
+    const auto before = RStructuralCoupledFieldSnapshot::capture(
+        first,ids,{"AB","BC"});
+    QCOMPARE(before.selectNodes({"B"})[0].temperatureKelvin,310.0);
+    QVERIFY(!before.selectNodes({"B"})[0].velocityMetresPerSecond.has_value());
+    QVERIFY(!before.selectNodes({"B"})[0].temperatureRateKelvinPerSecond.has_value());
+    QCOMPARE(before.selectElements({"BC"})[0].stressPascals,
+             std::vector<double>({22.0,23.0,24.0,25.0,26.0,27.0}));
+
+    const std::vector<QString> reorderedIds = {"C","A","B"};
+    RModel reordered = mesh(reorderedIds,true);
+    RVariable nextTemperature(R_VARIABLE_TEMPERATURE,R_VARIABLE_APPLY_NODE);
+    nextTemperature.resize(1,3);
+    nextTemperature.setValue(0,0,322.0);
+    nextTemperature.setValue(0,1,302.0);
+    nextTemperature.setValue(0,2,312.0);
+    reordered.addVariable(nextTemperature);
+    reordered.getTimeSolver().setComputedTime(2.0);
+    const auto after = RStructuralCoupledFieldSnapshot::capture(
+        reordered,reorderedIds,{"BC","AB"},&before);
+    before.verifyMesh(reordered,reorderedIds,{"BC","AB"});
+    QCOMPARE(after.meshDigest(),before.meshDigest());
+    QCOMPARE(after.selectNodes({"B"})[0].temperatureRateKelvinPerSecond.value(),2.0);
+    QVERIFY(!after.selectNodes({"B"})[0].displacementMetres.has_value());
+    QVERIFY_EXCEPTION_THROWN(after.selectNodes({"B","B"}),std::invalid_argument);
+    reordered.getNode(2).set(1.0+1.0e-9,0.0,0.0);
+    QVERIFY_EXCEPTION_THROWN(after.verifyMesh(reordered,reorderedIds,{"BC","AB"}),
+                             std::invalid_argument);
+}
 
 void TestStructuralTemperatureField::reordersByPhysicalIdWithoutChangingTheField()
 {
