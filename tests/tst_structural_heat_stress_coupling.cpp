@@ -72,13 +72,15 @@ RModel heatedRod(bool fixRight,
                  bool temperatureDependentExpansion = false,
                  bool elasticModulusDefined = true,
                  double thermalExpansion = expansion,
-                 bool densityDefined = true)
+                 bool densityDefined = true,
+                 uint segments = 2)
 {
+    Q_ASSERT(segments > 0);
     RModel model;
-    model.setNNodes(3);
-    for (uint node=0;node<3;node++)
-        model.getNode(node).set(double(node),0.0,0.0);
-    for (uint segment=0;segment<2;segment++)
+    model.setNNodes(segments+1);
+    for (uint node=0;node<=segments;node++)
+        model.getNode(node).set(2.0*double(node)/double(segments),0.0,0.0);
+    for (uint segment=0;segment<segments;segment++)
     {
         RElement rod(R_ELEMENT_TRUSS1);
         rod.setNodeId(0,segment);
@@ -116,19 +118,19 @@ RModel heatedRod(bool fixRight,
     setComponent(lateral,R_VARIABLE_DISPLACEMENT_Z,0.0);
     line.addBoundaryCondition(lateral);
 
-    for (uint node=0;node<3;node++)
+    for (uint node=0;node<=segments;node++)
     {
         RElement point(R_ELEMENT_POINT);
         point.setNodeId(0,node);
         model.addElement(point,true,node);
         model.getPoint(node).setVolume(0.0);
-        if (node == 0 || node == 2)
+        if (node == 0 || node == segments)
         {
             RBoundaryCondition temperature(R_BOUNDARY_CONDITION_TEMPERATURE);
             setComponent(temperature,R_VARIABLE_TEMPERATURE,node == 0 ? 300.0 : 400.0);
             model.getPoint(node).addBoundaryCondition(temperature);
         }
-        if (node == 0 || (fixRight && node == 2))
+        if (node == 0 || (fixRight && node == segments))
         {
             RBoundaryCondition fixed(R_BOUNDARY_CONDITION_DISPLACEMENT);
             setComponent(fixed,R_VARIABLE_DISPLACEMENT_X,0.0);
@@ -465,15 +467,15 @@ void TestStructuralHeatStressCoupling::persistedTemperatureChangesModalFrequency
 
 void TestStructuralHeatStressCoupling::solvedHeatChangesModalFrequency()
 {
-    auto solveAt = [](double kelvin) {
-        RModel model = heatedRod(false);
+    auto solveAt = [](double kelvin,uint segments) {
+        RModel model = heatedRod(false,false,true,expansion,true,segments);
         RMaterial material = model.getLine(0).getMaterial();
         RMaterialProperty youngsModulus(RMaterialProperty::ModulusOfElasiticity);
         youngsModulus.add(300.0,modulus);
         youngsModulus.add(400.0,0.5*modulus);
         material.add(youngsModulus);
         model.getLine(0).setMaterial(material);
-        for (uint point : {0u,2u})
+        for (uint point : {0u,segments})
         {
             RBoundaryCondition &temperature = model.getPoint(point)
                 .getBoundaryCondition(R_BOUNDARY_CONDITION_TEMPERATURE);
@@ -490,15 +492,28 @@ void TestStructuralHeatStressCoupling::solvedHeatChangesModalFrequency()
         modal.setConvergenceValue(1.0e-12);
         RSolver solver(model,QString(),QString());
         solver.run();
-        return std::make_pair(nodal(model,R_VARIABLE_TEMPERATURE,0,1),modal.getFrequency());
+        return std::make_pair(nodal(model,R_VARIABLE_TEMPERATURE,0,segments/2),
+                              modal.getFrequency());
     };
 
-    const auto cold = solveAt(300.0);
-    const auto hot = solveAt(400.0);
+    const auto coldCoarse = solveAt(300.0,2);
+    const auto coldMedium = solveAt(300.0,4);
+    const auto cold = solveAt(300.0,8);
+    const auto hot = solveAt(400.0,8);
+    QVERIFY(std::fabs(coldCoarse.first-300.0) < 1.0e-8);
+    QVERIFY(std::fabs(coldMedium.first-300.0) < 1.0e-8);
     QVERIFY(std::fabs(cold.first-300.0) < 1.0e-8);
     QVERIFY(std::fabs(hot.first-400.0) < 1.0e-8);
     QVERIFY(std::isfinite(cold.second) && cold.second > 0.0);
     QVERIFY(std::isfinite(hot.second) && hot.second > 0.0);
+    const double continuumFrequency = std::sqrt(modulus/8000.0)/8.0;
+    const double coarseError = std::fabs(coldCoarse.second-continuumFrequency);
+    const double mediumError = std::fabs(coldMedium.second-continuumFrequency);
+    const double fineError = std::fabs(cold.second-continuumFrequency);
+    QVERIFY2(coarseError > mediumError && mediumError > fineError,
+             qPrintable(QString("Thermal modal mesh errors: %1, %2, %3")
+                        .arg(coarseError).arg(mediumError).arg(fineError)));
+    QVERIFY(fineError < 0.005*continuumFrequency);
     // This checks E(T) in the actual Heat -> Modal FE task sequence. The
     // modal path does not include initial-stress geometric stiffness.
     const double expectedRatio = std::sqrt(0.5);
