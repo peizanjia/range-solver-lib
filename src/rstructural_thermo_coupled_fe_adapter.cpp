@@ -449,6 +449,9 @@ RStructuralThermoCoupled1DResult RStructuralThermoCoupledFEAdapter::advanceByPhy
     RModel candidate(model);
     RStructuralThermoCoupled1DResult result = advance(
         candidate,byPosition,indexed,options,referenceTemperatureKelvin);
+    require(result.nextState.size() == model.getNNodes() &&
+                result.nodes.size() == model.getNNodes(),
+            "Certified physical-ID thermo-mechanical node count differs from RModel.");
     for (uint position=0;position<model.getNNodes();position++)
     {
         const QString physicalId = QString::number(model.getNodePhysicalId(position));
