@@ -5,9 +5,11 @@
 
 #include <vector>
 
+#include <rml_structural_piezo_setup.h>
+
 class RModel;
 
-//! Converged static voltage-controlled 1-D terminal-rod FE response.
+//! Converged static TRUSS1 piezoelectric FE response.
 struct RStructuralPiezoModelResult
 {
     //! Full model translations, flattened xyz by node, in solver units.
@@ -20,18 +22,30 @@ struct RStructuralPiezoModelResult
     //! sorted members. V1 requires exactly one configured port per member.
     std::vector<double> memberRightCharges;
     //! Euclidean physical free-DOF residual norm in solver force units.
+    //! In NodalPotential mode this is the mechanical residual in N.
     double residualNorm = 0.0;
     //! Sum of 1-D rod electric enthalpies in solver energy units.
     double enthalpy = 0.0;
+    //! Electrical formulation used to produce this result. Publication rejects
+    //! results whose formulation no longer matches the current model setup.
+    RStructuralPiezoElectricalMode electricalMode =
+        RStructuralPiezoElectricalMode::LegacyTerminalVoltage;
+    //! Nodal electric potential in V; populated only in NodalPotential mode.
+    std::vector<double> nodalPotentials;
+    //! Physical conductor charge in C, including prescribed-potential
+    //! electrode reactions; populated only in NodalPotential mode.
+    std::vector<double> nodalConductorCharges;
+    //! Fresh free-node conductor-charge residual norm in C.
+    double electricResidualNorm = 0.0;
 };
 
-//! Validates, solves and publishes bounded static voltage-controlled TRUSS1 rods.
+//! Validates, solves and publishes bounded static TRUSS1 piezoelectric rods.
 //!
-//! Only the prescribed-voltage terminal rod model is represented. The adapter
-//! does not add electric-potential unknowns, open-circuit constraints, dynamics,
-//! control, beam/patch kinematics, or a coupled-field FE capability claim.
-//! A force-residual certificate also does not certify uniqueness or stability
-//! when the mechanical member network contains a mechanism.
+//! LegacyTerminalVoltage preserves the version 1.3.14 terminal voltage model.
+//! NodalPotential uses coupled 1-D mechanical/electric nodal fields and voltage
+//! or physical conductor-charge boundary conditions. Neither mode represents
+//! dynamics, control, or beam/patch kinematics. Residual certificates do not
+//! certify uniqueness or stability when the member network contains a mechanism.
 class RStructuralPiezoModelAdapter
 {
     public:
@@ -41,7 +55,7 @@ class RStructuralPiezoModelAdapter
         //! Solve without mutating model result variables.
         static RStructuralPiezoModelResult solve(const RModel &model);
 
-        //! Clear prior structural/electric charge outputs before a repeated solve.
+        //! Clear prior structural/electric potential/charge outputs before a repeated solve.
         static void clearResults(RModel &model);
 
         //! Publish only a dimensionally consistent finite converged result.

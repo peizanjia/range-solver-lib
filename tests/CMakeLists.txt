@@ -43,6 +43,10 @@ set(range_solver_lib_tests
     tst_structural_heat_certification
     tst_structural_cable_dynamics
     tst_structural_piezo_coupled_1d
+    tst_structural_heat_stress_coupling
+    tst_structural_piezo_network_fe
+    tst_structural_thermal_control
+    tst_structural_thermo_coupled_1d
 )
 
 foreach(test_name IN LISTS range_solver_lib_tests)

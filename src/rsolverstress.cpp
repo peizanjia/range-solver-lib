@@ -598,6 +598,53 @@ RSolverStress::RSolverStress(RModel *pModel, const QString &modelFileName, const
     }
 }
 
+// RMaterialProperty uses piecewise-linear interpolation with endpoint clamping.
+// The mean alpha over the actual temperature interval makes alpha*DeltaT equal
+// the integrated free thermal strain, including when alpha varies with T.
+double meanThermalExpansion(const RMaterialProperty &property,
+                            double referenceKelvin,double currentKelvin)
+{
+    if (!std::isfinite(referenceKelvin) || referenceKelvin < 0.0 ||
+        !std::isfinite(currentKelvin) || currentKelvin < 0.0 || property.empty())
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Thermal expansion requires finite absolute-kelvin temperatures and a nonempty alpha table.");
+    }
+    if (referenceKelvin == currentKelvin)
+        return property.get(currentKelvin);
+
+    const double low = std::min(referenceKelvin,currentKelvin);
+    const double high = std::max(referenceKelvin,currentKelvin);
+    double previous = low;
+    double integral = 0.0;
+    for (uint point=0;point<property.size();point++)
+    {
+        const double knot = property.getKey(point);
+        if (!std::isfinite(knot))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Thermal expansion table has a non-finite temperature key.");
+        if (knot <= previous || knot >= high) continue;
+        const double left = property.get(previous);
+        const double right = property.get(knot);
+        if (!std::isfinite(left) || !std::isfinite(right))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Thermal expansion table has a non-finite coefficient.");
+        integral += 0.5*(left+right)*(knot-previous);
+        previous = knot;
+    }
+    const double left = property.get(previous);
+    const double right = property.get(high);
+    if (!std::isfinite(left) || !std::isfinite(right))
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Thermal expansion table has a non-finite coefficient.");
+    integral += 0.5*(left+right)*(high-previous);
+    const double mean = integral/(high-low);
+    if (!std::isfinite(mean))
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Integrated thermal expansion is non-finite.");
+    return mean;
+}
+
 RSolverStress::~RSolverStress()
 {
 
@@ -950,7 +997,10 @@ void RSolverStress::recover()
         this->structuralCableResult = RStructuralCableEquilibriumResult();
         this->structuralPiezoResultReady = false;
         this->structuralPiezoResult = RStructuralPiezoModelResult();
-        RStructuralStaticTrussModel::clearResults(*this->pModel);
+        if (this->isStructuralPiezoMode())
+            RStructuralPiezoModelAdapter::clearResults(*this->pModel);
+        else
+            RStructuralCableModelAdapter::clearResults(*this->pModel);
         return;
     }
     this->recoverVariable(R_VARIABLE_DISPLACEMENT,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),0,this->nodeDisplacement.x,0.0);
@@ -1188,6 +1238,30 @@ void RSolverStress::prepare()
     this->generateMaterialVecor(RMaterialProperty::Density,this->elementDensity);
     this->generateMaterialVecor(RMaterialProperty::ThermalExpansionCoefficient,this->elementThermalExpansion);
     this->generateVariableVector(R_VARIABLE_TEMPERATURE,this->elementEnvironmentTemperature,temperatureSetValues,false,false,true);
+    if (this->elementTemperature.getNRows() == this->pModel->getNElements() &&
+        this->elementEnvironmentTemperature.getNRows() == this->pModel->getNElements())
+    {
+        for (uint groupId=0;groupId<this->pModel->getNElementGroups();groupId++)
+        {
+            const RElementGroup *group = this->pModel->getElementGroupPtr(groupId);
+            if (!group) continue;
+            const RMaterial &material = group->getMaterial();
+            const uint propertyPosition = material.findPosition(
+                RMaterialProperty::ThermalExpansionCoefficient);
+            if (propertyPosition >= material.size()) continue;
+            const RMaterialProperty &property = material.get(propertyPosition);
+            for (uint position=0;position<group->size();position++)
+            {
+                const uint elementId = group->get(position);
+                if (elementId >= this->pModel->getNElements())
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Thermal expansion group references invalid element %u.",elementId);
+                this->elementThermalExpansion[elementId] = meanThermalExpansion(
+                    property,this->elementEnvironmentTemperature[elementId],
+                    this->elementTemperature[elementId]);
+            }
+        }
+    }
 
     this->b.resize(this->equationBook.getNEnabled());
     this->x.resize(this->equationBook.getNEnabled());

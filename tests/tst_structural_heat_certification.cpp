@@ -139,6 +139,13 @@ void TestStructuralHeatCertification::steadyRodProducesCertifiedAnalyticTemperat
                  qPrintable(QString("Node %1 temperature %2, expected %3")
                             .arg(node).arg(nodeTemperature(model,node),0,'g',16).arg(expected)));
     }
+    const uint heatFluxPosition = model.findVariable(R_VARIABLE_HEAT_FLUX);
+    QVERIFY(heatFluxPosition != RConstants::eod);
+    const RVariable &heatFlux = model.getVariable(heatFluxPosition);
+    for (uint segment=0;segment+1<model.getNNodes();segment++)
+    {
+        QVERIFY(std::fabs(heatFlux.getValue(0,segment)+50.0) < 1.0e-7);
+    }
 }
 
 void TestStructuralHeatCertification::allFixedRodCertifiesZeroSizedSystem()

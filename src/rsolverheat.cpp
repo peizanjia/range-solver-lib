@@ -755,7 +755,11 @@ void RSolverHeat::solve()
     const double residualNorm = stableNorm(residual);
     const double rhsNorm = stableNorm(this->b);
     const double configuredTolerance = this->pModel->getMatrixSolverConf(RMatrixSolverConf::CG).getSolverCvgValue();
-    const double allowedResidual = std::max(1.0e-8,configuredTolerance)*rhsNorm+1.0e-12;
+    // Certify the requested relative tolerance.  The separate machine-scale
+    // allowance covers rounding in the independently recomputed A*x-b.
+    const double roundingAllowance = 64.0*std::numeric_limits<double>::epsilon()
+                                     *std::max(1.0,rhsNorm);
+    const double allowedResidual = configuredTolerance*rhsNorm+roundingAllowance;
     if (!std::isfinite(residualNorm) || !std::isfinite(rhsNorm) || !std::isfinite(allowedResidual))
     {
         throw RError(RError::Type::Application,R_ERROR_REF,

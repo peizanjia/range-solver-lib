@@ -42,6 +42,8 @@ qt_add_library(range-solver-lib
         src/rstructural_temperature_field.cpp
         src/rstructural_cable_dynamics.cpp
         src/rstructural_piezo_coupled_1d.cpp
+        src/rstructural_thermal_control.cpp
+        src/rstructural_thermo_coupled_1d.cpp
         src/rsolverwave.cpp
 
         include/rconvection.h
@@ -86,6 +88,8 @@ qt_add_library(range-solver-lib
         include/rstructural_temperature_field.h
         include/rstructural_cable_dynamics.h
         include/rstructural_piezo_coupled_1d.h
+        include/rstructural_thermal_control.h
+        include/rstructural_thermo_coupled_1d.h
         include/rsolverwave.h
 )
 

@@ -53,7 +53,50 @@ void RSolver::_init()
         }
     }
 
-    this->sharedData.addData("element-temperature",RRVector(this->pModel->getNElements(),RVariable::getInitValue(R_VARIABLE_TEMPERATURE)));
+    RRVector initialElementTemperature(this->pModel->getNElements(),
+        RVariable::getInitValue(R_VARIABLE_TEMPERATURE));
+    const uint temperaturePosition = this->pModel->findVariable(R_VARIABLE_TEMPERATURE);
+    if (temperaturePosition != RConstants::eod)
+    {
+        const RVariable &temperature = this->pModel->getVariable(temperaturePosition);
+        if (temperature.getNVectors() != 1)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Persisted temperature must contain exactly one absolute-kelvin component.");
+        }
+        if (temperature.getApplyType() == R_VARIABLE_APPLY_NODE &&
+            temperature.getNValues() == this->pModel->getNNodes())
+        {
+            RRVector nodalTemperature(this->pModel->getNNodes());
+            for (uint node=0;node<this->pModel->getNNodes();node++)
+            {
+                const double value = temperature.getValue(0,node);
+                if (!std::isfinite(value) || value < 0.0)
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Persisted nodal temperature is not finite absolute kelvin at node %u.",node);
+                nodalTemperature[node] = value;
+            }
+            this->pModel->convertNodeToElementVector(nodalTemperature,initialElementTemperature);
+        }
+        else if (temperature.getApplyType() == R_VARIABLE_APPLY_ELEMENT &&
+                 temperature.getNValues() == this->pModel->getNElements())
+        {
+            for (uint element=0;element<this->pModel->getNElements();element++)
+            {
+                const double value = temperature.getValue(0,element);
+                if (!std::isfinite(value) || value < 0.0)
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Persisted element temperature is not finite absolute kelvin at element %u.",element);
+                initialElementTemperature[element] = value;
+            }
+        }
+        else
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Persisted temperature has an unsupported scope or sample count.");
+        }
+    }
+    this->sharedData.addData("element-temperature",initialElementTemperature);
 
     std::vector<RProblemType> problemTypes = RProblem::getTypes(problemTypeMask);
     for (uint i=0;i<problemTypes.size();i++)
