@@ -191,7 +191,38 @@ private slots:
     void pointHeaterControlsTransientHeatAndStressFE();
     void legacyPointHeatBoundaryActuallyAppliesWatts();
     void pointThermalMassActuallyStoresHeat();
+    void multirateFeSubstepsPreserveTemperature();
 };
+
+void TestStructuralThermalControl::multirateFeSubstepsPreserveTemperature()
+{
+    RModel model = thermalFeRod();
+    RStructuralThermalControlConfig settings;
+    settings.thermalSubstepSeconds = 1.0;
+    settings.thermalSubstepsPerMechanicalMacrostep = 2;
+    settings.mechanicalMacrostepsPerControllerSample = 1;
+    const QString node = RStructuralThermalFEAdapter::nodeId(model,1);
+    settings.channels = {{"heater-fe",node,"sensor-fe",node,
+                          400.0,401.0,2.0,0.0,2.0}};
+    settings.sparseObservationNodeIds = {node};
+    const RStructuralThermalControlScheduler scheduler(settings);
+    const auto initial = scheduler.initialState(RStructuralThermalFEAdapter::capture(model));
+    RStructuralThermalControlScheduler::Result result;
+    try { result = RStructuralThermalFEAdapter::advance(model,scheduler,initial); }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
+    // Backward Euler with the rod row C/dt=K=1 and 2 W input yields
+    // theta_1=1 K, theta_2=1.5 K before the single mechanical solve.
+    QVERIFY(std::abs(model.getVariable(model.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1)-
+                     294.65) < 1.0e-8);
+    // The two-node rod uses mean element temperature, so its elastic free
+    // elongation is alpha * (1.5 K / 2) * L = 0.0075 m.
+    QVERIFY(std::abs(model.getVariable(model.findVariable(R_VARIABLE_DISPLACEMENT)).getValue(0,1)-
+                     0.0075) < 1.0e-8);
+    QCOMPARE(result.channels[0].appliedEnergyJoules,4.0);
+    QCOMPARE(result.candidate.completedMechanicalMacrosteps,quint64(1));
+    QCOMPARE(model.getTimeSolver().getComputedTime(),2.0);
+}
 
 void TestStructuralThermalControl::pointThermalMassActuallyStoresHeat()
 {
