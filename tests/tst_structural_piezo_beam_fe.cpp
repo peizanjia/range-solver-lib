@@ -167,8 +167,10 @@ RStructuralPiezoBeamFEInput makeInput(const RModel &model,double voltage=drivenV
         patch.prescribedValue = voltage;
         input.patches.push_back(patch);
     }
-    input.mechanicalAbsoluteTolerance = 1.0e-7;
-    input.mechanicalRelativeTolerance = 1.0e-10;
+    input.translationalAbsoluteTolerance = 1.0e-7;
+    input.translationalRelativeTolerance = 1.0e-10;
+    input.rotationalAbsoluteTolerance = 1.0e-7;
+    input.rotationalRelativeTolerance = 1.0e-10;
     input.electricAbsoluteTolerance = 1.0e-14;
     input.electricRelativeTolerance = 1.0e-10;
     return input;
@@ -256,7 +258,8 @@ void TestStructuralPiezoBeamFE::beamMesh()
             2.0e-8*std::max(1.0,std::fabs(curvature*beamLength)));
     QVERIFY(std::fabs(voltage.displacements[3*tip+1]-0.5*curvature*beamLength*beamLength)<
             2.0e-8*std::max(1.0,std::fabs(curvature*beamLength*beamLength)));
-    QVERIFY(voltage.mechanicalResidualNorm<1.0e-6);
+    QVERIFY(voltage.translationalResidualNorm<1.0e-6);
+    QVERIFY(voltage.rotationalResidualNorm<1.0e-6);
     QVERIFY(std::fabs(voltage.enthalpy-expectedEnthalpy(voltage,drivenVoltage))<
             1.0e-8*std::max(1.0,std::fabs(voltage.enthalpy)));
 
@@ -284,7 +287,8 @@ void TestStructuralPiezoBeamFE::beamMesh()
     for (std::size_t patch=0;patch<voltage.patchVoltages.size();patch++)
         QVERIFY(std::fabs(charge.patchVoltages[patch]-voltage.patchVoltages[patch])<
                 2.0e-8*std::max(1.0,std::fabs(voltage.patchVoltages[patch])));
-    QVERIFY(charge.mechanicalResidualNorm<1.0e-6);
+    QVERIFY(charge.translationalResidualNorm<1.0e-6);
+    QVERIFY(charge.rotationalResidualNorm<1.0e-6);
     QVERIFY(charge.electricResidualNorm<1.0e-12);
 }
 
@@ -316,7 +320,8 @@ void TestStructuralPiezoBeamFE::pointForceUsesGlobalPointLoadAndBeamConventions(
         QVERIFY(std::fabs(result.rotations[3*tip+2]-expectedTipRotation)<
                 1.0e-8*std::max(1.0,std::fabs(expectedTipRotation)));
         QVERIFY(std::fabs(result.internalForces[6*tip+1]-appliedTipForce)<1.0e-6);
-        QVERIFY(result.mechanicalResidualNorm<1.0e-6);
+        QVERIFY(result.translationalResidualNorm<1.0e-6);
+        QVERIFY(result.rotationalResidualNorm<1.0e-6);
     }
     // The offset patch needs a quadratic axial field as EB curvature varies.
     // BEAM1's linear axial interpolation converges monotonically to this
@@ -338,15 +343,49 @@ void TestStructuralPiezoBeamFE::candidatePublicationAndRollback()
         RStructuralPiezoBeamFEAdapter::solve(model,input);
     QCOMPARE(model.getNVariables(),1u);
 
-    RStructuralPiezoBeamFEResult invalid = result;
-    invalid.modelFingerprint.clear();
     const uint priorVariables = model.getNVariables();
-    QVERIFY(rejects([&]() { RStructuralPiezoBeamFEAdapter::publish(model,input,invalid); }));
+    const auto rejectedWithoutMutation = [&](const RStructuralPiezoBeamFEResult &candidate)
+    {
+        QVERIFY(rejects([&]() { RStructuralPiezoBeamFEAdapter::publish(model,input,candidate); }));
+        QCOMPARE(model.getNVariables(),priorVariables);
+        QCOMPARE(model.getVariable(model.findVariable(R_VARIABLE_DISPLACEMENT)).getValue(0,0),42.0);
+        QCOMPARE(model.findVariable(R_VARIABLE_ROTATION),uint(RConstants::eod));
+        QCOMPARE(model.findVariable(R_VARIABLE_ELECTRIC_POTENTIAL),uint(RConstants::eod));
+        QCOMPARE(model.findVariable(R_VARIABLE_ELECTRIC_CHARGE),uint(RConstants::eod));
+    };
+    const std::vector<std::function<void(RStructuralPiezoBeamFEResult &)>> finiteTampering = {
+        [](RStructuralPiezoBeamFEResult &candidate) { candidate.displacements[0]+=1.0; },
+        [](RStructuralPiezoBeamFEResult &candidate) { candidate.rotations[0]+=1.0; },
+        [](RStructuralPiezoBeamFEResult &candidate) { candidate.internalForces[0]+=1.0; },
+        [](RStructuralPiezoBeamFEResult &candidate) { candidate.patchVoltages[0]+=1.0; },
+        [](RStructuralPiezoBeamFEResult &candidate) { candidate.patchCharges[0]+=1.0; },
+        [](RStructuralPiezoBeamFEResult &candidate) { candidate.enthalpy+=1.0; },
+        [](RStructuralPiezoBeamFEResult &candidate) { candidate.translationalResidualNorm+=1.0; },
+        [](RStructuralPiezoBeamFEResult &candidate) { candidate.rotationalResidualNorm+=1.0; },
+        [](RStructuralPiezoBeamFEResult &candidate) { candidate.translationalRoundoffBound+=1.0; },
+        [](RStructuralPiezoBeamFEResult &candidate) { candidate.rotationalRoundoffBound+=1.0; },
+        [](RStructuralPiezoBeamFEResult &candidate) { candidate.electricResidualNorm+=1.0; },
+        [](RStructuralPiezoBeamFEResult &candidate) { candidate.electricRoundoffBound+=1.0; },
+        [](RStructuralPiezoBeamFEResult &candidate)
+        {
+            candidate.modelFingerprint.append(QStringLiteral("-tampered"));
+        }
+    };
+    for (const auto &tamper : finiteTampering)
+    {
+        RStructuralPiezoBeamFEResult candidate = result;
+        tamper(candidate);
+        rejectedWithoutMutation(candidate);
+    }
+    RStructuralPiezoBeamFEInput changedToleranceInput = input;
+    changedToleranceInput.rotationalAbsoluteTolerance *= 2.0;
+    QVERIFY(rejects([&]()
+    {
+        RStructuralPiezoBeamFEAdapter::publish(model,changedToleranceInput,result);
+    }));
     QCOMPARE(model.getNVariables(),priorVariables);
     QCOMPARE(model.getVariable(model.findVariable(R_VARIABLE_DISPLACEMENT)).getValue(0,0),42.0);
     QCOMPARE(model.findVariable(R_VARIABLE_ROTATION),uint(RConstants::eod));
-    QCOMPARE(model.findVariable(R_VARIABLE_ELECTRIC_POTENTIAL),uint(RConstants::eod));
-    QCOMPARE(model.findVariable(R_VARIABLE_ELECTRIC_CHARGE),uint(RConstants::eod));
 
     RStructuralPiezoBeamFEAdapter::publish(model,input,result);
     QCOMPARE(model.findVariable(R_VARIABLE_DISPLACEMENT),uint(0));

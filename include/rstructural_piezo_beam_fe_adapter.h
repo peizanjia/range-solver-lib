@@ -7,6 +7,7 @@
 #include <QtGlobal>
 
 class RModel;
+class RStructuralPiezoBeamFEAdapter;
 
 //! Electrical boundary mode for independent, through-thickness beam patches.
 enum class RStructuralPiezoBeamElectricalMode
@@ -43,9 +44,13 @@ struct RStructuralPiezoBeamFEInput
         RStructuralPiezoBeamElectricalMode::PrescribedVoltage;
     //! Each BEAM1 patch is an electrically isolated electrode pair.
     std::vector<RStructuralPiezoBeamPatch> patches;
-    //! Physical residual gates, in N and C.
-    double mechanicalAbsoluteTolerance = 1.0e-8;
-    double mechanicalRelativeTolerance = 1.0e-9;
+    //! Force-residual gates, in N.
+    double translationalAbsoluteTolerance = 1.0e-8;
+    double translationalRelativeTolerance = 1.0e-9;
+    //! Moment-residual gates, in N*m.
+    double rotationalAbsoluteTolerance = 1.0e-8;
+    double rotationalRelativeTolerance = 1.0e-9;
+    //! Charge-residual gates, in C.
     double electricAbsoluteTolerance = 1.0e-14;
     double electricRelativeTolerance = 1.0e-9;
 };
@@ -65,12 +70,25 @@ struct RStructuralPiezoBeamFEResult
     std::vector<double> patchCharges;
     //! Total mechanical/electric enthalpy, in J.
     double enthalpy = 0.0;
-    //! Fresh norm of free in-plane nodal force/moment residuals.
-    double mechanicalResidualNorm = 0.0;
-    //! Fresh norm of free patch-charge residuals; zero for voltage control.
+    //! Fresh norm of free translational force residuals, in N.
+    double translationalResidualNorm = 0.0;
+    //! Fresh norm of free rotational moment residuals, in N*m.
+    double rotationalResidualNorm = 0.0;
+    //! Assembly-aware roundoff bound for the translational residual norm, in N.
+    double translationalRoundoffBound = 0.0;
+    //! Assembly-aware roundoff bound for the rotational residual norm, in N*m.
+    double rotationalRoundoffBound = 0.0;
+    //! Fresh norm of free patch-charge residuals; zero for voltage control, in C.
     double electricResidualNorm = 0.0;
+    //! Assembly-aware roundoff bound for the electric residual norm, in C.
+    double electricRoundoffBound = 0.0;
     //! Exact model/input binding checked again at publication time.
     QString modelFingerprint;
+
+    private:
+        //! Adapter-owned seal over every public result field and the fingerprint.
+        QString resultSeal;
+        friend class RStructuralPiezoBeamFEAdapter;
 };
 
 //! Direct-call, multi-element BEAM1 piezoelectric patch finite-element adapter.
@@ -93,7 +111,7 @@ class RStructuralPiezoBeamFEAdapter
             const RModel &model,
             const RStructuralPiezoBeamFEInput &input);
 
-        //! Publish a dimensionally consistent, finite converged candidate.
+        //! Publish only an unmodified solve-certified candidate for this model/input.
         static void publish(RModel &model,
                            const RStructuralPiezoBeamFEInput &input,
                            const RStructuralPiezoBeamFEResult &result);

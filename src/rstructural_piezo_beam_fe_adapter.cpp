@@ -77,6 +77,14 @@ void appendUInt(QByteArray &bytes,uint value)
         bytes.append(char((value>>(8*byte))&0xffu));
 }
 
+void appendSize(QByteArray &bytes,std::size_t value)
+{
+    static_assert(sizeof(std::size_t)<=sizeof(quint64),"Fingerprint size exceeds 64 bits.");
+    const quint64 encoded = quint64(value);
+    for (unsigned int byte=0;byte<8;byte++)
+        bytes.append(char((encoded>>(8*byte))&0xffu));
+}
+
 void appendDouble(QByteArray &bytes,double value)
 {
     static_assert(sizeof(double)==sizeof(quint64),"Fingerprint requires binary64 doubles.");
@@ -116,8 +124,35 @@ struct ValidatedModel
     std::vector<double> prescribed;
     std::vector<bool> prescribedMask;
     std::vector<double> mechanicalLoads;
+    std::vector<double> mechanicalLoadMagnitude;
+    std::vector<std::size_t> mechanicalLoadTerms;
     QString fingerprint;
 };
+
+void accumulateMagnitude(std::vector<double> &magnitudes,
+                         std::vector<std::size_t> &termCounts,
+                         std::size_t position,
+                         double term,
+                         const QString &description)
+{
+    const double magnitude = std::fabs(term);
+    const double updated = magnitudes[position]+magnitude;
+    if (!std::isfinite(magnitude) || !std::isfinite(updated) ||
+        termCounts[position]==std::numeric_limits<std::size_t>::max())
+        fail(description+QStringLiteral(" scale or operation count overflowed."));
+    magnitudes[position] = updated;
+    ++termCounts[position];
+}
+
+void addMechanicalLoad(ValidatedModel &data,std::size_t dof,double value)
+{
+    const double updated = data.mechanicalLoads[dof]+value;
+    if (!std::isfinite(value) || !std::isfinite(updated))
+        fail(QStringLiteral("BEAM1 piezo load assembly overflowed."));
+    data.mechanicalLoads[dof] = updated;
+    accumulateMagnitude(data.mechanicalLoadMagnitude,data.mechanicalLoadTerms,dof,value,
+                        QStringLiteral("BEAM1 piezo load"));
+}
 
 void addSymmetric(std::array<std::array<double,6>,6> &matrix,
                   std::size_t row,std::size_t column,double value)
@@ -192,10 +227,39 @@ void buildPatchConstitutive(PatchData &data,const BeamMember &member)
                     strainRow[row]*strainRow[column];
         }
     }
+
     data.capacitance = data.patch.permittivity*data.patch.area*member.length/
         (data.patch.thickness*data.patch.thickness);
     if (!std::isfinite(data.capacitance) || data.capacitance <= 0.0)
         fail(QStringLiteral("BEAM1 piezo patch %1 has invalid capacitance.").arg(data.patch.elementId));
+}
+
+void appendDoubleVector(QByteArray &bytes,const std::vector<double> &values)
+{
+    appendSize(bytes,values.size());
+    for (double value : values) appendDouble(bytes,value);
+}
+
+QString resultCertificate(const RStructuralPiezoBeamFEResult &result)
+{
+    QByteArray bytes("range-fea/piezo/beam-result/v1");
+    appendDoubleVector(bytes,result.displacements);
+    appendDoubleVector(bytes,result.rotations);
+    appendDoubleVector(bytes,result.internalForces);
+    appendDoubleVector(bytes,result.patchVoltages);
+    appendDoubleVector(bytes,result.patchCharges);
+    appendDouble(bytes,result.enthalpy);
+    appendDouble(bytes,result.translationalResidualNorm);
+    appendDouble(bytes,result.rotationalResidualNorm);
+    appendDouble(bytes,result.translationalRoundoffBound);
+    appendDouble(bytes,result.rotationalRoundoffBound);
+    appendDouble(bytes,result.electricResidualNorm);
+    appendDouble(bytes,result.electricRoundoffBound);
+    const QByteArray fingerprint = result.modelFingerprint.toUtf8();
+    appendSize(bytes,std::size_t(fingerprint.size()));
+    bytes.append(fingerprint);
+    return QString::fromLatin1(
+        QCryptographicHash::hash(bytes,QCryptographicHash::Sha256).toHex());
 }
 
 void setPrescribed(ValidatedModel &data,std::size_t dof,double value)
@@ -239,15 +303,19 @@ ValidatedModel inspectModel(const RModel &model,
         fail(QStringLiteral("BEAM1 piezo adapter requires at least one bonded patch."));
     if (input.patches.size()>std::numeric_limits<uint>::max())
         fail(QStringLiteral("BEAM1 piezo patch count exceeds the sparse solver index limit."));
-    const double tolerances[4] = {input.mechanicalAbsoluteTolerance,
-                                  input.mechanicalRelativeTolerance,
+    const double tolerances[6] = {input.translationalAbsoluteTolerance,
+                                  input.translationalRelativeTolerance,
+                                  input.rotationalAbsoluteTolerance,
+                                  input.rotationalRelativeTolerance,
                                   input.electricAbsoluteTolerance,
                                   input.electricRelativeTolerance};
     for (double tolerance : tolerances)
         if (!std::isfinite(tolerance) || tolerance<0.0)
             fail(QStringLiteral("BEAM1 piezo residual tolerances must be finite and nonnegative."));
-    if (input.mechanicalAbsoluteTolerance==0.0 && input.mechanicalRelativeTolerance==0.0)
-        fail(QStringLiteral("BEAM1 piezo mechanical residual gate cannot be disabled."));
+    if (input.translationalAbsoluteTolerance==0.0 && input.translationalRelativeTolerance==0.0)
+        fail(QStringLiteral("BEAM1 piezo translational residual gate cannot be disabled."));
+    if (input.rotationalAbsoluteTolerance==0.0 && input.rotationalRelativeTolerance==0.0)
+        fail(QStringLiteral("BEAM1 piezo rotational residual gate cannot be disabled."));
     if (input.electricAbsoluteTolerance==0.0 && input.electricRelativeTolerance==0.0)
         fail(QStringLiteral("BEAM1 piezo electrical residual gate cannot be disabled."));
 
@@ -397,6 +465,8 @@ ValidatedModel inspectModel(const RModel &model,
     data.prescribed.assign(3*std::size_t(model.getNNodes()),0.0);
     data.prescribedMask.assign(data.prescribed.size(),false);
     data.mechanicalLoads.assign(data.prescribed.size(),0.0);
+    data.mechanicalLoadMagnitude.assign(data.prescribed.size(),0.0);
+    data.mechanicalLoadTerms.assign(data.prescribed.size(),0);
     const double time = model.getTimeSolver().getCurrentTime();
     if (!std::isfinite(time))
         fail(QStringLiteral("BEAM1 piezo model time is non-finite."));
@@ -465,7 +535,8 @@ ValidatedModel inspectModel(const RModel &model,
                         if (!active && value!=0.0)
                             fail(QStringLiteral("BEAM1 piezo rejects nonzero out-of-plane force or moment."));
                         if (active)
-                            data.mechanicalLoads[3*std::size_t(node)+(force ? component : 2)]+=value;
+                            addMechanicalLoad(data,
+                                3*std::size_t(node)+(force ? component : 2),value);
                     }
                 }
                 else
@@ -492,13 +563,13 @@ ValidatedModel inspectModel(const RModel &model,
         const double axialLoadPerLength = member.density*member.area*member.gravityX;
         const double transverseLoadPerLength = member.density*member.area*member.gravityY;
         const double halfLength = 0.5*member.length;
-        data.mechanicalLoads[3*std::size_t(member.node0)] += axialLoadPerLength*halfLength;
-        data.mechanicalLoads[3*std::size_t(member.node1)] += axialLoadPerLength*halfLength;
-        data.mechanicalLoads[3*std::size_t(member.node0)+1] += transverseLoadPerLength*halfLength;
-        data.mechanicalLoads[3*std::size_t(member.node1)+1] += transverseLoadPerLength*halfLength;
+        addMechanicalLoad(data,3*std::size_t(member.node0),axialLoadPerLength*halfLength);
+        addMechanicalLoad(data,3*std::size_t(member.node1),axialLoadPerLength*halfLength);
+        addMechanicalLoad(data,3*std::size_t(member.node0)+1,transverseLoadPerLength*halfLength);
+        addMechanicalLoad(data,3*std::size_t(member.node1)+1,transverseLoadPerLength*halfLength);
         const double consistentMoment = transverseLoadPerLength*member.length*member.length/12.0;
-        data.mechanicalLoads[3*std::size_t(member.node0)+2] += consistentMoment;
-        data.mechanicalLoads[3*std::size_t(member.node1)+2] -= consistentMoment;
+        addMechanicalLoad(data,3*std::size_t(member.node0)+2,consistentMoment);
+        addMechanicalLoad(data,3*std::size_t(member.node1)+2,-consistentMoment);
     }
 
     std::set<uint> patchIds;
@@ -527,7 +598,7 @@ ValidatedModel inspectModel(const RModel &model,
         data.patches.push_back(patchData);
     }
 
-    QByteArray fingerprint("range-fea/piezo/beam-fe/direct/v1");
+    QByteArray fingerprint("range-fea/piezo/beam-fe/direct/v2");
     appendUInt(fingerprint,uint(model.getNNodes()));
     appendUInt(fingerprint,uint(data.members.size()));
     for (uint node=0;node<model.getNNodes();node++)
@@ -554,8 +625,16 @@ ValidatedModel inspectModel(const RModel &model,
         appendUInt(fingerprint,data.prescribedMask[dof] ? 1u : 0u);
         appendDouble(fingerprint,data.prescribed[dof]);
         appendDouble(fingerprint,data.mechanicalLoads[dof]);
+        appendDouble(fingerprint,data.mechanicalLoadMagnitude[dof]);
+        appendSize(fingerprint,data.mechanicalLoadTerms[dof]);
     }
     appendUInt(fingerprint,static_cast<uint>(input.electricalMode));
+    appendDouble(fingerprint,input.translationalAbsoluteTolerance);
+    appendDouble(fingerprint,input.translationalRelativeTolerance);
+    appendDouble(fingerprint,input.rotationalAbsoluteTolerance);
+    appendDouble(fingerprint,input.rotationalRelativeTolerance);
+    appendDouble(fingerprint,input.electricAbsoluteTolerance);
+    appendDouble(fingerprint,input.electricRelativeTolerance);
     appendUInt(fingerprint,uint(data.patches.size()));
     for (const PatchData &patch : data.patches)
     {
@@ -586,6 +665,41 @@ void addLocalMatrix(RSparseMatrix &matrix,
             if (value!=0.0)
                 matrix.addValue(uint(dofs[row]),uint(dofs[column]),value);
         }
+}
+
+void accumulateLocalProducts(std::vector<double> &magnitudes,
+                             std::vector<std::size_t> &termCounts,
+                             const std::array<std::size_t,6> &dofs,
+                             const std::array<std::array<double,6>,6> &local,
+                             const std::vector<double> &solution)
+{
+    for (std::size_t row=0;row<6;row++)
+        for (std::size_t column=0;column<6;column++)
+        {
+            const double coefficient = local[row][column];
+            if (coefficient==0.0) continue;
+            const double term = coefficient*solution[dofs[column]];
+            if (!std::isfinite(term))
+                fail(QStringLiteral("BEAM1 piezo local matrix product is non-finite."));
+            accumulateMagnitude(magnitudes,termCounts,dofs[row],term,
+                                QStringLiteral("BEAM1 piezo matrix-product"));
+        }
+}
+
+std::size_t roundoffOperationCount(std::size_t matrixTerms,
+                                   std::size_t loadTerms,
+                                   std::size_t sparseProductTerms)
+{
+    const std::size_t max = std::numeric_limits<std::size_t>::max();
+    if (matrixTerms>(max-8)/4 || loadTerms>(max-8)/2 || sparseProductTerms>(max-8)/2)
+        fail(QStringLiteral("BEAM1 piezo roundoff operation count overflowed."));
+    const std::size_t matrixOperations = 4*matrixTerms;
+    const std::size_t loadOperations = 2*loadTerms;
+    const std::size_t productOperations = 2*sparseProductTerms;
+    if (matrixOperations>max-loadOperations-8 ||
+        matrixOperations+loadOperations+8>max-productOperations)
+        fail(QStringLiteral("BEAM1 piezo roundoff operation count overflowed."));
+    return matrixOperations+loadOperations+productOperations+8;
 }
 
 std::vector<double> multiply(const RSparseMatrix &matrix,const std::vector<double> &values)
@@ -625,6 +739,7 @@ void storeVariable(RModel &model,RVariableType type,RVariableApplyType applyType
     else
         model.setVariable(existing,variable);
 }
+
 }
 
 void RStructuralPiezoBeamFEAdapter::validate(
@@ -781,13 +896,33 @@ RStructuralPiezoBeamFEResult RStructuralPiezoBeamFEAdapter::solve(
     }
 
     const std::vector<double> freshProduct = multiply(tangent,fullSolution);
-    std::vector<double> mechanicalResidual;
-    std::vector<double> freeLoads;
-    std::vector<double> freeInternal;
+    std::vector<double> translationalResidual;
+    std::vector<double> rotationalResidual;
+    std::vector<double> freeTranslationalLoads;
+    std::vector<double> freeRotationalLoads;
+    std::vector<double> freeTranslationalInternal;
+    std::vector<double> freeRotationalInternal;
+    std::vector<double> translationalRoundoffRows;
+    std::vector<double> rotationalRoundoffRows;
     std::vector<double> electricResidual;
     std::vector<double> prescribedCharges;
     std::vector<double> recoveredCharges;
+    std::vector<double> electricRoundoffRows;
     std::vector<double> voltageForce(mechanicalDofs,0.0);
+    std::vector<double> voltageForceMagnitude(mechanicalDofs,0.0);
+    std::vector<std::size_t> voltageForceTerms(mechanicalDofs,0);
+    std::vector<double> matrixProductMagnitude(mechanicalDofs,0.0);
+    std::vector<std::size_t> matrixProductTerms(mechanicalDofs,0);
+    for (const BeamMember &member : data.members)
+        accumulateLocalProducts(matrixProductMagnitude,matrixProductTerms,
+                                localDofs(member),hostStiffness(member),fullSolution);
+    for (const PatchData &patch : data.patches)
+    {
+        const BeamMember &member = data.members[patch.memberIndex];
+        const auto dofs = localDofs(member);
+        accumulateLocalProducts(matrixProductMagnitude,matrixProductTerms,
+                                dofs,patch.stiffness,fullSolution);
+    }
     if (!chargeMode)
     {
         for (const PatchData &patch : data.patches)
@@ -795,16 +930,68 @@ RStructuralPiezoBeamFEResult RStructuralPiezoBeamFEAdapter::solve(
             const BeamMember &member = data.members[patch.memberIndex];
             const auto dofs = localDofs(member);
             for (std::size_t local=0;local<6;local++)
-                voltageForce[dofs[local]] += patch.coupling[local]*patch.patch.prescribedValue;
+            {
+                const double term = patch.coupling[local]*patch.patch.prescribedValue;
+                const double updated = voltageForce[dofs[local]]+term;
+                if (!std::isfinite(term) || !std::isfinite(updated))
+                    fail(QStringLiteral("BEAM1 piezo voltage-load assembly overflowed."));
+                voltageForce[dofs[local]] = updated;
+                accumulateMagnitude(voltageForceMagnitude,voltageForceTerms,
+                                   dofs[local],term,QStringLiteral("BEAM1 piezo voltage load"));
+            }
+        }
+    }
+    else
+    {
+        for (std::size_t patchIndex=0;patchIndex<data.patches.size();patchIndex++)
+        {
+            const PatchData &patch = data.patches[patchIndex];
+            const BeamMember &member = data.members[patch.memberIndex];
+            const auto dofs = localDofs(member);
+            const double voltage = fullSolution[mechanicalDofs+patchIndex];
+            for (std::size_t local=0;local<6;local++)
+            {
+                const double term = patch.coupling[local]*voltage;
+                if (!std::isfinite(term))
+                    fail(QStringLiteral("BEAM1 piezo electromechanical product is non-finite."));
+                accumulateMagnitude(matrixProductMagnitude,matrixProductTerms,
+                                    dofs[local],term,
+                                    QStringLiteral("BEAM1 piezo electromechanical matrix"));
+            }
         }
     }
     for (std::size_t dof=0;dof<mechanicalDofs;dof++)
     {
         if (!prescribedMask[dof])
         {
-            mechanicalResidual.push_back(freshProduct[dof]-rhs[dof]);
-            freeLoads.push_back(rhs[dof]);
-            freeInternal.push_back(freshProduct[dof]+voltageForce[dof]);
+            const double residual = freshProduct[dof]-rhs[dof];
+            const double internal = freshProduct[dof]+voltageForce[dof];
+            if (!std::isfinite(residual) || !std::isfinite(internal))
+                fail(QStringLiteral("BEAM1 piezo fresh mechanical residual is non-finite."));
+            const std::size_t sparseTerms = tangent.getVector(uint(dof)).size();
+            if (data.mechanicalLoadTerms[dof]>
+                std::numeric_limits<std::size_t>::max()-voltageForceTerms[dof])
+                fail(QStringLiteral("BEAM1 piezo load roundoff operation count overflowed."));
+            const std::size_t loadTerms = data.mechanicalLoadTerms[dof]+voltageForceTerms[dof];
+            const double rowMagnitude = matrixProductMagnitude[dof]+
+                data.mechanicalLoadMagnitude[dof]+voltageForceMagnitude[dof];
+            const double rowBound = roundoffBound(
+                roundoffOperationCount(matrixProductTerms[dof],loadTerms,sparseTerms),
+                rowMagnitude);
+            if (dof%3==2)
+            {
+                rotationalResidual.push_back(residual);
+                freeRotationalLoads.push_back(rhs[dof]);
+                freeRotationalInternal.push_back(internal);
+                rotationalRoundoffRows.push_back(rowBound);
+            }
+            else
+            {
+                translationalResidual.push_back(residual);
+                freeTranslationalLoads.push_back(rhs[dof]);
+                freeTranslationalInternal.push_back(internal);
+                translationalRoundoffRows.push_back(rowBound);
+            }
         }
     }
     for (std::size_t patchIndex=0;patchIndex<data.patches.size();patchIndex++)
@@ -815,16 +1002,36 @@ RStructuralPiezoBeamFEResult RStructuralPiezoBeamFEAdapter::solve(
         const BeamMember &member = data.members[patch.memberIndex];
         const auto dofs = localDofs(member);
         double couplingWork = 0.0;
+        double absoluteCouplingWork = 0.0;
+        std::size_t couplingTerms = 0;
         for (std::size_t local=0;local<6;local++)
         {
-            couplingWork += patch.coupling[local]*fullSolution[dofs[local]];
+            const double term = patch.coupling[local]*fullSolution[dofs[local]];
+            const double updated = couplingWork+term;
+            const double updatedMagnitude = absoluteCouplingWork+std::fabs(term);
+            if (!std::isfinite(term) || !std::isfinite(updated) ||
+                !std::isfinite(updatedMagnitude) ||
+                (patch.coupling[local]!=0.0 && couplingTerms==
+                    std::numeric_limits<std::size_t>::max()))
+                fail(QStringLiteral("BEAM1 piezo patch coupling work overflowed."));
+            couplingWork = updated;
+            absoluteCouplingWork = updatedMagnitude;
+            if (patch.coupling[local]!=0.0) ++couplingTerms;
         }
-        const double charge = patch.capacitance*voltage-couplingWork;
+        const double capacitanceTerm = patch.capacitance*voltage;
+        const double charge = capacitanceTerm-couplingWork;
         if (!std::isfinite(charge) || !std::isfinite(voltage))
             fail(QStringLiteral("BEAM1 piezo recovered voltage or charge is non-finite."));
         if (chargeMode)
         {
-            electricResidual.push_back(charge-patch.patch.prescribedValue);
+            const double residual = charge-patch.patch.prescribedValue;
+            const double magnitude = std::fabs(capacitanceTerm)+absoluteCouplingWork+
+                std::fabs(patch.patch.prescribedValue);
+            if (!std::isfinite(residual) || !std::isfinite(magnitude))
+                fail(QStringLiteral("BEAM1 piezo fresh electric residual is non-finite."));
+            electricResidual.push_back(residual);
+            electricRoundoffRows.push_back(roundoffBound(
+                roundoffOperationCount(couplingTerms,1,0),magnitude));
             prescribedCharges.push_back(patch.patch.prescribedValue);
             recoveredCharges.push_back(charge);
         }
@@ -850,26 +1057,43 @@ RStructuralPiezoBeamFEResult RStructuralPiezoBeamFEAdapter::solve(
         result.internalForces[6*node+resultComponent] =
             freshProduct[dof]+voltageForce[dof];
     }
-    result.mechanicalResidualNorm = stableNorm(mechanicalResidual,
-                                               QStringLiteral("BEAM1 piezo fresh mechanical residual"));
+    result.translationalResidualNorm = stableNorm(
+        translationalResidual,QStringLiteral("BEAM1 piezo fresh translational residual"));
+    result.rotationalResidualNorm = stableNorm(
+        rotationalResidual,QStringLiteral("BEAM1 piezo fresh rotational residual"));
+    result.translationalRoundoffBound = stableNorm(
+        translationalRoundoffRows,QStringLiteral("BEAM1 piezo translational roundoff bound"));
+    result.rotationalRoundoffBound = stableNorm(
+        rotationalRoundoffRows,QStringLiteral("BEAM1 piezo rotational roundoff bound"));
     result.electricResidualNorm = stableNorm(electricResidual,
                                              QStringLiteral("BEAM1 piezo fresh electric residual"));
-    const double mechanicalScale = std::max(stableNorm(freeLoads,QStringLiteral("BEAM1 piezo free loads")),
-                                             stableNorm(freeInternal,QStringLiteral("BEAM1 piezo free internal forces")));
-    const double mechanicalTolerance = input.mechanicalAbsoluteTolerance+
-        input.mechanicalRelativeTolerance*mechanicalScale+
-        roundoffBound(4*mechanicalResidual.size()+8,mechanicalScale);
+    result.electricRoundoffBound = stableNorm(
+        electricRoundoffRows,QStringLiteral("BEAM1 piezo electric roundoff bound"));
+    const double translationalScale = std::max(
+        stableNorm(freeTranslationalLoads,QStringLiteral("BEAM1 piezo free translational loads")),
+        stableNorm(freeTranslationalInternal,QStringLiteral("BEAM1 piezo free translational internal forces")));
+    const double rotationalScale = std::max(
+        stableNorm(freeRotationalLoads,QStringLiteral("BEAM1 piezo free rotational loads")),
+        stableNorm(freeRotationalInternal,QStringLiteral("BEAM1 piezo free rotational internal moments")));
+    const double translationalTolerance = input.translationalAbsoluteTolerance+
+        input.translationalRelativeTolerance*translationalScale+
+        result.translationalRoundoffBound;
+    const double rotationalTolerance = input.rotationalAbsoluteTolerance+
+        input.rotationalRelativeTolerance*rotationalScale+
+        result.rotationalRoundoffBound;
     const double electricScale = std::max(stableNorm(prescribedCharges,
                                                       QStringLiteral("BEAM1 piezo prescribed charges")),
                                            stableNorm(recoveredCharges,
                                                       QStringLiteral("BEAM1 piezo recovered charges")));
     const double electricTolerance = input.electricAbsoluteTolerance+
         input.electricRelativeTolerance*electricScale+
-        roundoffBound(4*electricResidual.size()+8,electricScale);
-    if (!std::isfinite(mechanicalTolerance) || !std::isfinite(electricTolerance) ||
-        result.mechanicalResidualNorm>mechanicalTolerance ||
+        result.electricRoundoffBound;
+    if (!std::isfinite(translationalTolerance) || !std::isfinite(rotationalTolerance) ||
+        !std::isfinite(electricTolerance) ||
+        result.translationalResidualNorm>translationalTolerance ||
+        result.rotationalResidualNorm>rotationalTolerance ||
         (chargeMode && result.electricResidualNorm>electricTolerance))
-        fail(QStringLiteral("BEAM1 piezo solution failed its fresh N/C residual certification."));
+        fail(QStringLiteral("BEAM1 piezo solution failed its fresh N/N*m/C residual certification."));
 
     double enthalpy = 0.0;
     for (const BeamMember &member : data.members)
@@ -904,6 +1128,7 @@ RStructuralPiezoBeamFEResult RStructuralPiezoBeamFEAdapter::solve(
         fail(QStringLiteral("BEAM1 piezo enthalpy is non-finite."));
     result.enthalpy = enthalpy;
     result.modelFingerprint = data.fingerprint;
+    result.resultSeal = resultCertificate(result);
     return result;
 }
 
@@ -918,9 +1143,13 @@ void RStructuralPiezoBeamFEAdapter::publish(
         result.patchVoltages.size()!=data.patches.size() ||
         result.patchCharges.size()!=data.patches.size() ||
         result.modelFingerprint!=data.fingerprint ||
-        !std::isfinite(result.enthalpy) || !std::isfinite(result.mechanicalResidualNorm) ||
-        result.mechanicalResidualNorm<0.0 || !std::isfinite(result.electricResidualNorm) ||
-        result.electricResidualNorm<0.0)
+        !std::isfinite(result.enthalpy) ||
+        !std::isfinite(result.translationalResidualNorm) || result.translationalResidualNorm<0.0 ||
+        !std::isfinite(result.rotationalResidualNorm) || result.rotationalResidualNorm<0.0 ||
+        !std::isfinite(result.translationalRoundoffBound) || result.translationalRoundoffBound<0.0 ||
+        !std::isfinite(result.rotationalRoundoffBound) || result.rotationalRoundoffBound<0.0 ||
+        !std::isfinite(result.electricResidualNorm) || result.electricResidualNorm<0.0 ||
+        !std::isfinite(result.electricRoundoffBound) || result.electricRoundoffBound<0.0)
         fail(QStringLiteral("BEAM1 piezo candidate dimensions or model binding are invalid."));
     for (double value : result.displacements)
         if (!std::isfinite(value)) fail(QStringLiteral("BEAM1 piezo displacement is non-finite."));
@@ -932,6 +1161,9 @@ void RStructuralPiezoBeamFEAdapter::publish(
         if (!std::isfinite(value)) fail(QStringLiteral("BEAM1 piezo voltage is non-finite."));
     for (double value : result.patchCharges)
         if (!std::isfinite(value)) fail(QStringLiteral("BEAM1 piezo charge is non-finite."));
+
+    if (result.resultSeal.isEmpty() || result.resultSeal!=resultCertificate(result))
+        fail(QStringLiteral("BEAM1 piezo candidate differs from its trusted solve certificate."));
 
     std::vector<double> displacementOutput(3*nNodes,0.0);
     std::vector<double> rotationOutput(3*nNodes,0.0);
