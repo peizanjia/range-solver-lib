@@ -44,6 +44,7 @@ qt_add_library(range-solver-lib
         src/rstructural_coupled_field_snapshot.cpp
         src/rstructural_cable_dynamics.cpp
         src/rstructural_piezo_coupled_1d.cpp
+        src/rstructural_piezo_beam_fe_adapter.cpp
         src/rstructural_thermal_control.cpp
         src/rstructural_thermal_fe_adapter.cpp
         src/rstructural_thermo_coupled_1d.cpp
@@ -96,6 +97,7 @@ qt_add_library(range-solver-lib
         include/rstructural_coupled_field_snapshot.h
         include/rstructural_cable_dynamics.h
         include/rstructural_piezo_coupled_1d.h
+        include/rstructural_piezo_beam_fe_adapter.h
         include/rstructural_thermal_control.h
         include/rstructural_thermal_fe_adapter.h
         include/rstructural_thermo_coupled_1d.h

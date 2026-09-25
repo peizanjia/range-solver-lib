@@ -50,6 +50,7 @@ set(range_solver_lib_tests
     tst_structural_monitor_output_concurrency
     tst_structural_thermal_bending
     tst_structural_piezo_network_fe
+    tst_structural_piezo_beam_fe
     tst_structural_thermal_control
     tst_structural_thermo_coupled_1d
     tst_structural_thermo_coupled_fe_adapter
