@@ -2,10 +2,12 @@
 
 #include <QByteArray>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 #include <rbl_error.h>
 
@@ -13,7 +15,9 @@
 #include <rml_model.h>
 #include <rml_problem_task_item.h>
 #include <rml_structural_cable_setup.h>
+#include <rml_structural_control_setup.h>
 #include <rml_structural_dynamics_setup.h>
+#include <rml_structural_interaction.h>
 #include <rml_variable.h>
 
 #include "rsolver.h"
@@ -268,6 +272,101 @@ RModel makeLoadedSlackCable()
     return model;
 }
 
+RModel makePrestressedTransverseVibrationCable(double transverseLoad)
+{
+    RModel model;
+    model.setNNodes(2);
+    model.getNode(0).set(0.0,0.0,0.0);
+    model.getNode(1).set(2.0,0.0,0.0);
+
+    RElement cable(R_ELEMENT_TRUSS1);
+    cable.setNodeId(0,0);
+    cable.setNodeId(1,1);
+    model.addElement(cable,true,0);
+    assignCableMaterial(model.getLine(0),0.5,1000.0,2.0);
+    addPointElement(model,0,0);
+    addPointElement(model,1,1);
+    model.getPoint(0).addBoundaryCondition(
+        displacementCondition({{true,true,true}},{{0.0,0.0,0.0}}));
+    model.getPoint(1).addBoundaryCondition(
+        displacementCondition({{true,false,true}},{{0.0,0.0,0.0}}));
+    model.getPoint(1).addBoundaryCondition(
+        forceCondition({{0.0,transverseLoad,0.0}}));
+    setZeroGravity(model);
+
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+    RStructuralCableSetup &cableSetup = model.getProblemSetup().getStructuralCableSetup();
+    cableSetup.enabled = true;
+    addCableMember(cableSetup,0,2.0,80.0);
+    cableSetup.bindToModel(model);
+
+    RStructuralDynamicsSetup &dynamics =
+        model.getProblemSetup().getStructuralDynamicsSetup();
+    dynamics.setEnabled(true);
+    dynamics.setMethod(RStructuralTimeIntegrationMethod::Newmark);
+    dynamics.setNewmarkGamma(0.5);
+    dynamics.setNewmarkBeta(0.25);
+    dynamics.setTimeStep(5.0e-2);
+    dynamics.setNSteps(1);
+    dynamics.setOutputFrequency(1);
+    return model;
+}
+
+RStructuralSensor makeCableDisplacementSensor(const QString &id,uint node,
+                                               const RR3Vector &direction)
+{
+    RStructuralSensor sensor;
+    sensor.id = id;
+    sensor.target.scope = RStructuralTargetScope::Node;
+    sensor.target.nodeId = node;
+    sensor.quantity = RStructuralSensorQuantity::Displacement;
+    sensor.aggregation = RStructuralSensorAggregation::Point;
+    sensor.frame = RStructuralFrame::Global;
+    sensor.direction = direction;
+    sensor.unit = RStructuralInteractionSetup::getSensorUnit(sensor.quantity);
+    return sensor;
+}
+
+RModel makeControlledSlackRetensionCable()
+{
+    RModel model = makeAxialCable(false,false,2.0);
+    model.getProblemSetup().getStructuralCableSetup().members[0].initialTension = 0.0;
+    RBoundaryCondition &deadForce =
+        model.getPoint(1).getBoundaryCondition(R_BOUNDARY_CONDITION_FORCE);
+    setComponent(deadForce,R_VARIABLE_FORCE_X,true,0.0);
+
+    RStructuralDynamicsSetup &dynamics =
+        model.getProblemSetup().getStructuralDynamicsSetup();
+    dynamics.setEnabled(true);
+    dynamics.setMethod(RStructuralTimeIntegrationMethod::Newmark);
+    dynamics.setNewmarkGamma(0.5);
+    dynamics.setNewmarkBeta(0.25);
+    dynamics.setTimeStep(1.0);
+    dynamics.setNSteps(2);
+    dynamics.setOutputFrequency(1);
+
+    RStructuralControlSetup &control = model.getProblemSetup().getStructuralControlSetup();
+    control.enabled = true;
+    control.controllerId = QStringLiteral("cable-slack-retension-test");
+    RStructuralActuator actuator;
+    actuator.id = QStringLiteral("axial-force");
+    actuator.type = RStructuralActuatorType::NodalForce;
+    actuator.target.scope = RStructuralTargetScope::Node;
+    actuator.target.nodeId = 1;
+    actuator.variable = R_VARIABLE_FORCE_X;
+    actuator.frame = RStructuralFrame::Global;
+    actuator.direction = RR3Vector(1.0,0.0,0.0);
+    actuator.unit = RVariable::getUnits(R_VARIABLE_FORCE_X);
+    actuator.minimum = -10.0;
+    actuator.maximum = 10.0;
+    actuator.rateLimit = 100.0;
+    auto &interaction = model.getProblemSetup().getStructuralInteractionSetup();
+    interaction.getActuators().push_back(actuator);
+    interaction.getSensors().push_back(makeCableDisplacementSensor(
+        QStringLiteral("axial-displacement"),1,RR3Vector(1.0,0.0,0.0)));
+    return model;
+}
+
 RModel makeFixedTwoMemberCableWithReversedSetupOrder()
 {
     RModel model;
@@ -346,7 +445,9 @@ private slots:
     void nonzeroEnvironmentGravityRejected();
     void cableMembersFollowElementIdsWhenSetupOrderIsReversed();
     void transientSingleCableMatchesNewmarkAverageAcceleration();
+    void prestressedTransverseCableMatchesSmallStepGeometricReference();
     void failedSecondCableStepRollsBackToLastAcceptedState();
+    void acceptedSlackCableRetensionsOnFollowingControlledStep();
     void cableAndPiezoModesCannotBeEnabledTogether();
 };
 
@@ -650,6 +751,73 @@ void TestStructuralCableFE::transientSingleCableMatchesNewmarkAverageAcceleratio
     QVERIFY(std::fabs(model.getTimeSolver().getComputedTime()-0.1) < 1.0e-14);
 }
 
+void TestStructuralCableFE::prestressedTransverseCableMatchesSmallStepGeometricReference()
+{
+    constexpr double length = 2.0;
+    constexpr double area = 0.5;
+    constexpr double youngModulus = 1000.0;
+    constexpr double density = 2.0;
+    constexpr double initialTension = 80.0;
+    constexpr double transverseLoad = 0.2;
+    constexpr double dt = 5.0e-2;
+    constexpr double beta = 0.25;
+    constexpr double nodalMass = density*area*length/2.0;
+
+    RModel model = makePrestressedTransverseVibrationCable(transverseLoad);
+    try
+    {
+        RSolver solver(model,QString(),QString());
+        solver.run();
+    }
+    catch (const RError &error)
+    {
+        const QByteArray message = error.getMessage().toUtf8();
+        QFAIL(message.constData());
+    }
+
+    // Starting from rest under a small transverse load, the one-step Newmark
+    // equation is m*q1/(beta*dt^2) + T(q1)*q1/L(q1) = F. This scalar
+    // reference includes both the initial geometric tension and the small
+    // axial material extension caused by the transverse motion.
+    auto internalTransverseForce = [=](double q)
+    {
+        const double currentLength = std::hypot(length,q);
+        const double tension = std::max(0.0,initialTension+
+            youngModulus*area/length*(currentLength-length));
+        return tension*q/currentLength;
+    };
+    auto residual = [&](double q)
+    {
+        return nodalMass*q/(beta*dt*dt)+internalTransverseForce(q)-transverseLoad;
+    };
+    double lower = 0.0;
+    double upper = transverseLoad*beta*dt*dt/nodalMass;
+    for (uint iteration=0;iteration<100;iteration++)
+    {
+        const double middle = 0.5*(lower+upper);
+        if (residual(middle) < 0.0)
+            lower = middle;
+        else
+            upper = middle;
+    }
+    const double expectedDisplacement = 0.5*(lower+upper);
+    const double expectedAcceleration = expectedDisplacement/(beta*dt*dt);
+    const double displacement = nodeValue(model,R_VARIABLE_DISPLACEMENT,1,1);
+    const double acceleration = nodeValue(model,R_VARIABLE_ACCELERATION,1,1);
+    QVERIFY(std::isfinite(displacement));
+    QVERIFY(std::isfinite(acceleration));
+    QVERIFY(std::fabs(displacement-expectedDisplacement) < 2.0e-10);
+    QVERIFY(std::fabs(acceleration-expectedAcceleration) < 2.0e-6);
+
+    // For this infinitesimal transverse motion, material axial stiffness has
+    // no first-order term. Recover the FE transverse tangent from M*a+f=F;
+    // it must equal the prestress geometric stiffness T0/L.
+    const double observedTangent = (transverseLoad-nodalMass*acceleration)/displacement;
+    const double expectedGeometricTangent = initialTension/length;
+    QVERIFY(std::fabs(observedTangent-expectedGeometricTangent)/
+            expectedGeometricTangent < 1.0e-3);
+}
+
 void TestStructuralCableFE::failedSecondCableStepRollsBackToLastAcceptedState()
 {
     RModel model = makeAxialCable(false,false,2.0);
@@ -691,6 +859,78 @@ void TestStructuralCableFE::failedSecondCableStepRollsBackToLastAcceptedState()
     QVERIFY(std::fabs(model.getTimeSolver().getComputedTime()-1.0) < 1.0e-14);
 }
 
+void TestStructuralCableFE::acceptedSlackCableRetensionsOnFollowingControlledStep()
+{
+    RModel model = makeControlledSlackRetensionCable();
+    const RBoundaryCondition &deadForce =
+        model.getPoint(1).getBoundaryCondition(R_BOUNDARY_CONDITION_FORCE);
+    const uint forceXPosition = deadForce.findComponentPosition(R_VARIABLE_FORCE_X);
+    QVERIFY(forceXPosition != RConstants::eod);
+    QCOMPARE(deadForce.getComponent(forceXPosition).get(0.0),0.0);
+    std::vector<RStructuralControlObservation> observations;
+    std::vector<RStructuralControlStepRecord> acceptedSteps;
+    RSolver solver(model,QString(),QString());
+    solver.setStructuralControlCallback(
+        QStringLiteral("cable-slack-retension-test"),QStringLiteral("revision-1"),
+        [&observations](const RStructuralControlObservation &observation)
+        {
+            observations.push_back(observation);
+            RStructuralControlDecision decision;
+            const double command = observation.nextTime < 1.5 ? -1.6 : 10.0;
+            decision.requestedCommands.push_back({QStringLiteral("axial-force"),command});
+            decision.nextControllerState = QByteArray::number(observation.nextTime,'g',17);
+            return decision;
+        });
+    solver.setStructuralControlStepObserver(
+        [&acceptedSteps](const RStructuralControlStepRecord &record)
+        {
+            acceptedSteps.push_back(record);
+        });
+    try
+    {
+        solver.run();
+    }
+    catch (const RError &error)
+    {
+        const QByteArray message = error.getMessage().toUtf8();
+        QFAIL(message.constData());
+    }
+
+    QCOMPARE(observations.size(),size_t(2));
+    QCOMPARE(acceptedSteps.size(),size_t(2));
+    QCOMPARE(observations[1].sensors.size(),size_t(1));
+    QCOMPARE(acceptedSteps[0].requestedCommands.size(),size_t(1));
+    QCOMPARE(acceptedSteps[0].appliedChannels.size(),size_t(1));
+    const QString firstStepDetails = QStringLiteral(
+        "accepted=%1 next=%2 sensor=%3 requested=%4 applied=%5")
+        .arg(observations[0].acceptedTime,0,'g',17)
+        .arg(observations[0].nextTime,0,'g',17)
+        .arg(observations[1].sensors[0].value,0,'g',17)
+        .arg(acceptedSteps[0].requestedCommands[0].value,0,'g',17)
+        .arg(acceptedSteps[0].appliedChannels[0].command,0,'g',17);
+    QVERIFY2(std::fabs(observations[0].nextTime-1.0) < 1.0e-14,
+             qPrintable(firstStepDetails));
+    QVERIFY2(std::fabs(acceptedSteps[0].appliedChannels[0].command+1.6) < 1.0e-14,
+             qPrintable(firstStepDetails));
+    QCOMPARE(observations[1].acceptedTime,1.0);
+    QCOMPARE(observations[1].sensors.size(),size_t(1));
+    // A changed force command refreshes the accepted right-limit acceleration
+    // before Newmark predicts, so the first constant-load step ends at -0.8 m.
+    QVERIFY2(std::fabs(observations[1].sensors[0].value+0.8) < 1.0e-9,
+             qPrintable(firstStepDetails));
+    QCOMPARE(acceptedSteps[0].appliedChannels.size(),size_t(1));
+    QCOMPARE(acceptedSteps[1].appliedChannels.size(),size_t(1));
+    QCOMPARE(acceptedSteps[0].appliedChannels[0].command,-1.6);
+    QCOMPARE(acceptedSteps[1].appliedChannels[0].command,10.0);
+
+    // The second accepted solve must cross the reference length and recover
+    // positive cable force after the first accepted state was slack.
+    QVERIFY(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,1) > 0.0);
+    QVERIFY(elementValue(model,R_VARIABLE_STRESS_NORMAL,0) > 0.0);
+    QCOMPARE(model.getTimeSolver().getCurrentTimeStep(),uint(1));
+    QVERIFY(std::fabs(model.getTimeSolver().getComputedTime()-2.0) < 1.0e-14);
+}
+
 void TestStructuralCableFE::cableAndPiezoModesCannotBeEnabledTogether()
 {
     RModel model = makeAxialCable();
@@ -709,5 +949,5 @@ void TestStructuralCableFE::cableAndPiezoModesCannotBeEnabledTogether()
     QVERIFY(model.findVariable(R_VARIABLE_DISPLACEMENT) == RConstants::eod);
 }
 
-QTEST_MAIN(TestStructuralCableFE)
+QTEST_APPLESS_MAIN(TestStructuralCableFE)
 #include "tst_structural_cable_fe.moc"
