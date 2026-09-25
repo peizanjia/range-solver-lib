@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <limits>
 #include <map>
 
 #include <QCryptographicHash>
@@ -609,6 +610,156 @@ RSolverStress::RSolverStress(RModel *pModel, const QString &modelFileName, const
     }
 }
 
+namespace
+{
+
+void appendProblemTaskLeaves(const RProblemTaskItem &item,std::vector<RProblemType> &leaves)
+{
+    if (item.getProblemType() != R_PROBLEM_NONE)
+    {
+        leaves.push_back(item.getProblemType());
+        return;
+    }
+    for (uint child=0;child<item.getNChildren();child++)
+    {
+        appendProblemTaskLeaves(item.getChild(child),leaves);
+    }
+}
+
+//! Prestress is accepted only from an executed Heat -> Stress sequence that
+//! precedes the modal task in the current task tree. A shared-data entry left
+//! by a prior solver run must not silently activate geometric stiffness.
+bool hasCurrentThermalStressBeforeModal(const RProblemTaskItem &taskTree)
+{
+    std::vector<RProblemType> leaves;
+    appendProblemTaskLeaves(taskTree,leaves);
+    bool heatSeen = false;
+    bool stressAfterHeatSeen = false;
+    for (RProblemType type : leaves)
+    {
+        if (type == R_PROBLEM_STRESS_MODAL)
+        {
+            return heatSeen && stressAfterHeatSeen;
+        }
+        if (type == R_PROBLEM_HEAT && !stressAfterHeatSeen)
+        {
+            heatSeen = true;
+        }
+        else if (type == R_PROBLEM_STRESS && heatSeen)
+        {
+            stressAfterHeatSeen = true;
+        }
+    }
+    return false;
+}
+
+void addTrussGeometricStiffness(const RElement &element,
+                                const std::vector<RNode> &nodes,
+                                double axialForce,
+                                RRMatrix &stiffness)
+{
+    if (element.getType() != R_ELEMENT_TRUSS1 || element.size() != 2 ||
+        stiffness.getNRows() != 6 || stiffness.getNColumns() != 6)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Thermal geometric stiffness supports only TRUSS1 elements.");
+    }
+
+    RR3Vector direction;
+    RR3Vector::subtract(nodes[element.getNodeId(1)].toVector(),
+                        nodes[element.getNodeId(0)].toVector(),direction);
+    const double length = direction.normalize();
+    if (!std::isfinite(length) || length <= RConstants::eps || !std::isfinite(axialForce))
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "TRUSS1 geometric stiffness requires finite axial force and nonzero length.");
+    }
+
+    // The consistent initial-stress block is N/L times the transverse
+    // projector, with positive N denoting tension.
+    for (uint rowNode=0;rowNode<2;rowNode++)
+    {
+        const double rowSign = rowNode == 0 ? 1.0 : -1.0;
+        for (uint columnNode=0;columnNode<2;columnNode++)
+        {
+            const double columnSign = columnNode == 0 ? 1.0 : -1.0;
+            for (uint row=0;row<3;row++)
+            {
+                for (uint column=0;column<3;column++)
+                {
+                    const double projector = (row == column ? 1.0 : 0.0)
+                                           - direction[row]*direction[column];
+                    stiffness[3*rowNode+row][3*columnNode+column] +=
+                        axialForce/length*rowSign*columnSign*projector;
+                }
+            }
+        }
+    }
+}
+
+void addBeam1GeometricStiffness(const RLine &line,
+                                const RElement &element,
+                                const std::vector<RNode> &nodes,
+                                double axialForce,
+                                RRMatrix &stiffness)
+{
+    if (element.getType() != R_ELEMENT_BEAM1 || element.size() != 2 ||
+        stiffness.getNRows() != 12 || stiffness.getNColumns() != 12)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Thermal geometric stiffness supports only BEAM1 elements.");
+    }
+
+    RRMatrix rotation,transformation;
+    const double length = buildBeamTransformation(line,element,nodes,rotation,transformation);
+    if (!std::isfinite(axialForce) || !std::isfinite(length) || length <= RConstants::eps)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "BEAM1 geometric stiffness requires finite axial force and nonzero length.");
+    }
+
+    // Integral of N_i' N_j' for cubic Hermite bending interpolation. Tension
+    // adds stiffness; compression subtracts it. The local z-rotation used by
+    // the w-plane beam DOFs is opposite to dw/dx, so that block changes sign
+    // on its rotational rows and columns.
+    const double length2 = length*length;
+    const double geometric[4][4] = {
+        {36.0,3.0*length,-36.0,3.0*length},
+        {3.0*length,4.0*length2,-3.0*length,-length2},
+        {-36.0,-3.0*length,36.0,-3.0*length},
+        {3.0*length,-length2,-3.0*length,4.0*length2}};
+    const uint vDofs[4] = {1,5,7,11};
+    const uint wDofs[4] = {2,4,8,10};
+    const double vSigns[4] = {1.0,1.0,1.0,1.0};
+    const double wSigns[4] = {1.0,-1.0,1.0,-1.0};
+    RRMatrix local(12,12,0.0);
+    const double factor = axialForce/(30.0*length);
+    for (uint row=0;row<4;row++)
+    {
+        for (uint column=0;column<4;column++)
+        {
+            local[vDofs[row]][vDofs[column]] += factor*geometric[row][column]
+                                               * vSigns[row]*vSigns[column];
+            local[wDofs[row]][wDofs[column]] += factor*geometric[row][column]
+                                               * wSigns[row]*wSigns[column];
+        }
+    }
+
+    RRMatrix transformationT,temporary,global;
+    transformationT.transpose(transformation);
+    RRMatrix::mlt(transformation,local,temporary);
+    RRMatrix::mlt(temporary,transformationT,global,true);
+    for (uint row=0;row<12;row++)
+    {
+        for (uint column=0;column<12;column++)
+        {
+            stiffness[row][column] += global[row][column];
+        }
+    }
+}
+
+}
+
 // RMaterialProperty uses piecewise-linear interpolation with endpoint clamping.
 // The mean alpha over the actual temperature interval makes alpha*DeltaT equal
 // the integrated free thermal strain, including when alpha varies with T.
@@ -1203,6 +1354,77 @@ void RSolverStress::prepare()
         RStructuralPiezoModelAdapter::validate(*this->pModel);
         return;
     }
+
+    RRVector modalAxialForce;
+    bool useThermalGeometricStiffness = false;
+    if (this->problemType == R_PROBLEM_STRESS_MODAL &&
+        hasCurrentThermalStressBeforeModal(this->pModel->getProblemTaskTree()))
+    {
+        const uint elementCount = this->pModel->getNElements();
+        const QString axialForceKey = QStringLiteral("structural-thermal-axial-force-v1");
+        const QString temperatureKey = QStringLiteral("structural-thermal-axial-force-temperature-v1");
+        if (!this->pSharedData->hasData(axialForceKey,elementCount) ||
+            !this->pSharedData->hasData(temperatureKey,elementCount))
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Heat->Stress->Modal requires an accepted axial-force field from the preceding stress solve.");
+        }
+
+        const RRVector &acceptedAxialForce = this->pSharedData->findData(axialForceKey);
+        const RRVector &acceptedTemperature = this->pSharedData->findData(temperatureKey);
+        const double forceScale = this->scales.findScaleFactor(R_VARIABLE_FORCE);
+        if (!std::isfinite(forceScale) || forceScale <= 0.0)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Heat->Stress->Modal axial-force scale is invalid.");
+        }
+
+        modalAxialForce.resize(elementCount,0.0);
+        for (uint elementId=0;elementId<elementCount;elementId++)
+        {
+            const double currentTemperature = this->elementTemperature[elementId];
+            const double stressTemperature = acceptedTemperature[elementId];
+            if (!std::isfinite(currentTemperature) || !std::isfinite(stressTemperature) ||
+                std::fabs(currentTemperature-stressTemperature) >
+                    1.0e-10*std::max({1.0,std::fabs(currentTemperature),std::fabs(stressTemperature)}))
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Modal temperature differs from the temperature field accepted by the preceding stress solve.");
+            }
+            const RElementType type = this->pModel->getElement(elementId).getType();
+            if (this->computableElements[elementId] && type != R_ELEMENT_POINT &&
+                type != R_ELEMENT_TRUSS1 && type != R_ELEMENT_BEAM1)
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Thermal-prestress modal geometric stiffness supports only TRUSS1 and BEAM1 structural elements; '%s' is unsupported.",
+                             RElement::getName(type).toUtf8().constData());
+            }
+            if (!std::isfinite(acceptedAxialForce[elementId]))
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Accepted thermal axial-force field is non-finite at element %u.",elementId);
+            }
+            if (type == R_ELEMENT_POINT && std::fabs(acceptedAxialForce[elementId]) > 0.0)
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Accepted thermal axial-force field assigns nonzero force to point element %u.",elementId);
+            }
+            if (!this->computableElements[elementId])
+            {
+                continue;
+            }
+
+            const double scaledForce = acceptedAxialForce[elementId]*forceScale;
+            if (!std::isfinite(scaledForce))
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Accepted thermal axial force overflows the modal force scale at element %u.",elementId);
+            }
+            modalAxialForce[elementId] = scaledForce;
+        }
+        useThermalGeometricStiffness = true;
+    }
+
     const bool structuralDynamics = this->problemType == R_PROBLEM_STRESS &&
         this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
     if (structuralDynamics && !this->dynamicsIntegrator && !this->preparingInitialForce)
@@ -1591,6 +1813,11 @@ void RSolverStress::prepare()
                                      this->elementThermalExpansion[elementID],
                                      this->elementTemperature[elementID]-this->elementEnvironmentTemperature[elementID],
                                      distributedForce,needsMass,lumpedMass,Me,Ke,fe);
+                    if (useThermalGeometricStiffness)
+                    {
+                        addBeam1GeometricStiffness(line,element,this->pModel->getNodes(),
+                                                   modalAxialForce[elementID],Ke);
+                    }
                     this->assemblyMatrix(elementID,Me,Ke,fe,
                                          Ap[uint(omp_get_thread_num())],
                                          bp[uint(omp_get_thread_num())],
@@ -1702,6 +1929,11 @@ void RSolverStress::prepare()
                         }
 
                     }
+                }
+                if (useThermalGeometricStiffness)
+                {
+                    addTrussGeometricStiffness(element,this->pModel->getNodes(),
+                                               modalAxialForce[elementID],Ke);
                 }
                 this->assemblyMatrix(elementID,Me,Ke,fe,Ap[uint(omp_get_thread_num())],bp[uint(omp_get_thread_num())],Mp[uint(omp_get_thread_num())],Kfcp[uint(omp_get_thread_num())],Mfcp[uint(omp_get_thread_num())]);
             }
@@ -3850,6 +4082,16 @@ void RSolverStress::setDisplacement(const RRVector &v)
 
 void RSolverStress::process()
 {
+    if (this->problemType == R_PROBLEM_STRESS)
+    {
+        // Clear any force field from an earlier execution before processing a
+        // new stress result. It is republished below only after this solve has
+        // completed result recovery for a supported Heat -> Stress -> Modal
+        // task sequence.
+        this->pSharedData->addData(QStringLiteral("structural-thermal-axial-force-v1"),RRVector());
+        this->pSharedData->addData(QStringLiteral("structural-thermal-axial-force-temperature-v1"),RRVector());
+    }
+
     if (this->isSpecializedStaticTrussMode() || this->isStructuralCableDynamicsMode())
     {
         if (!this->hasConverged())
@@ -4578,6 +4820,65 @@ void RSolverStress::process()
         {
             throw RError(RError::Type::Application,R_ERROR_REF,"Failed to process results.");
         }
+    }
+
+    const bool structuralDynamics = this->pModel->getProblemSetup()
+                                        .getStructuralDynamicsSetup().getEnabled();
+    if (this->problemType == R_PROBLEM_STRESS &&
+        !this->pModel->getTimeSolver().getEnabled() && !structuralDynamics &&
+        hasCurrentThermalStressBeforeModal(this->pModel->getProblemTaskTree()))
+    {
+        const uint elementCount = this->pModel->getNElements();
+        const double forceScale = this->scales.findScaleFactor(R_VARIABLE_FORCE);
+        if (!std::isfinite(forceScale) || forceScale <= 0.0)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Thermal axial-force publication scale is invalid.");
+        }
+
+        const double unsupported = std::numeric_limits<double>::quiet_NaN();
+        RRVector axialForce(elementCount,unsupported);
+        for (uint elementId=0;elementId<elementCount;elementId++)
+        {
+            if (!this->computableElements[elementId] ||
+                this->pModel->getElement(elementId).getType() == R_ELEMENT_POINT)
+            {
+                axialForce[elementId] = 0.0;
+            }
+        }
+
+        for (uint lineId=0;lineId<this->pModel->getNLines();lineId++)
+        {
+            const RLine &line = this->pModel->getLine(lineId);
+            const double area = line.getCrossArea();
+            for (uint position=0;position<line.size();position++)
+            {
+                const uint elementId = line.get(position);
+                const RElementType type = this->pModel->getElement(elementId).getType();
+                if (type != R_ELEMENT_TRUSS1 && type != R_ELEMENT_BEAM1)
+                {
+                    continue;
+                }
+                if (!this->computableElements[elementId])
+                {
+                    axialForce[elementId] = 0.0;
+                    continue;
+                }
+                if (!std::isfinite(area) || area <= 0.0)
+                {
+                    axialForce[elementId] = unsupported;
+                    continue;
+                }
+                const double scaledForce = this->elementStress[0][elementId]*area;
+                axialForce[elementId] = std::isfinite(scaledForce)
+                                      ? scaledForce/forceScale
+                                      : unsupported;
+            }
+        }
+
+        this->pSharedData->addData(QStringLiteral("structural-thermal-axial-force-v1"),axialForce);
+        this->pSharedData->addData(QStringLiteral("structural-thermal-axial-force-temperature-v1"),
+                                   this->elementTemperature);
     }
 }
 
