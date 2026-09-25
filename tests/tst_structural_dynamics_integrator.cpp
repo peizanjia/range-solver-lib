@@ -18,6 +18,15 @@ RSparseMatrix scalarMatrix(double value)
     return matrix;
 }
 
+RSparseMatrix diagonalMatrix(double first, double second)
+{
+    RSparseMatrix matrix;
+    matrix.setNRows(2);
+    matrix.addValue(0,0,first);
+    matrix.addValue(1,1,second);
+    return matrix;
+}
+
 RMatrixSolverConf solverConf()
 {
     RMatrixSolverConf conf(RMatrixSolverConf::CG);
@@ -44,6 +53,25 @@ Integrator oscillator(double damping,
                       { force[0] = forceMagnitude; });
 }
 
+Integrator twoModeOscillator(double rhoInfinity)
+{
+    Integrator::Options options;
+    options.method = Integrator::Method::GeneralizedAlpha;
+    options.rhoInfinity = rhoInfinity;
+    return Integrator(diagonalMatrix(1.0,1.0),diagonalMatrix(0.0,0.0),
+                      diagonalMatrix(4.0,4.0e6),solverConf(),options,
+                      [](double, const RStructuralDynamicsState &, RRVector &force)
+                      {
+                          force[0] = 0.0;
+                          force[1] = 0.0;
+                      });
+}
+
+double modalEnergy(const RStructuralDynamicsState &state, int mode, double stiffness)
+{
+    return 0.5*(state.v[mode]*state.v[mode]+stiffness*state.q[mode]*state.q[mode]);
+}
+
 void advance(Integrator &integrator, double dt, int steps)
 {
     for (int i=0; i<steps; ++i)
@@ -64,6 +92,9 @@ private slots:
     void forceStepAndWork();
     void dampedVibrationAndDissipation();
     void generalizedAlpha();
+    void generalizedAlphaLowFrequencyConvergence_data();
+    void generalizedAlphaLowFrequencyConvergence();
+    void generalizedAlphaAttenuatesHighModeAndPreservesLowMode();
     void centralDifference();
     void centralDifferenceStabilityGuard();
     void trialRejectAndCheckpoint();
@@ -134,6 +165,67 @@ void TestStructuralDynamicsIntegrator::generalizedAlpha()
     QVERIFY(std::abs(noDamping.acceptedState().energyBalanceResidual) < 1.0e-10);
     QVERIFY(std::abs(numericalDamping.acceptedState().q[0]-std::cos(2.0)) < 0.003);
     QVERIFY(std::isfinite(numericalDamping.acceptedState().energyBalanceResidual));
+}
+
+void TestStructuralDynamicsIntegrator::generalizedAlphaLowFrequencyConvergence_data()
+{
+    QTest::addColumn<double>("rhoInfinity");
+    QTest::newRow("rho-0.0") << 0.0;
+    QTest::newRow("rho-0.3") << 0.3;
+    QTest::newRow("rho-0.7") << 0.7;
+    QTest::newRow("rho-1.0") << 1.0;
+}
+
+void TestStructuralDynamicsIntegrator::generalizedAlphaLowFrequencyConvergence()
+{
+    QFETCH(double,rhoInfinity);
+    auto coarse = oscillator(0.0,Integrator::Method::GeneralizedAlpha,0.0,rhoInfinity);
+    auto fine = oscillator(0.0,Integrator::Method::GeneralizedAlpha,0.0,rhoInfinity);
+    coarse.initialize(RRVector(1,1.0),RRVector(1,0.0));
+    fine.initialize(RRVector(1,1.0),RRVector(1,0.0));
+    // Use the same fine step as the separate two-mode accuracy benchmark.
+    // The rho=0 scheme has a larger O(dt^2) error constant; dt=0.02 does
+    // not meet the 5e-4 absolute bound even though it converges quadratically.
+    advance(coarse,0.02,50);
+    advance(fine,0.01,100);
+
+    const double exact = std::cos(2.0);
+    const double coarseError = std::abs(coarse.acceptedState().q[0]-exact);
+    const double fineError = std::abs(fine.acceptedState().q[0]-exact);
+    QVERIFY(fineError > 0.0);
+    const double refinementRatio = coarseError/fineError;
+    QVERIFY2(refinementRatio > 3.7,
+             qPrintable(QString("rhoInfinity=%1, error refinement ratio=%2")
+                            .arg(rhoInfinity).arg(refinementRatio)));
+    QVERIFY2(fineError < 5.0e-4,
+             qPrintable(QString("rhoInfinity=%1, fine-step displacement error=%2")
+                            .arg(rhoInfinity).arg(fineError)));
+}
+
+void TestStructuralDynamicsIntegrator::generalizedAlphaAttenuatesHighModeAndPreservesLowMode()
+{
+    auto numericalDamping = twoModeOscillator(0.3);
+    auto noNumericalDamping = twoModeOscillator(1.0);
+    RRVector initialDisplacement(2,0.0);
+    initialDisplacement[0] = 1.0;
+    initialDisplacement[1] = 0.001;
+    RRVector initialVelocity(2,0.0);
+    numericalDamping.initialize(initialDisplacement,initialVelocity);
+    noNumericalDamping.initialize(initialDisplacement,initialVelocity);
+
+    const double initialHighModeEnergy = modalEnergy(numericalDamping.acceptedState(),1,4.0e6);
+    advance(numericalDamping,0.01,100);
+    advance(noNumericalDamping,0.01,100);
+
+    const auto &dampedState = numericalDamping.acceptedState();
+    const auto &undampedState = noNumericalDamping.acceptedState();
+    const double attenuatedHighModeEnergy = modalEnergy(dampedState,1,4.0e6);
+    const double preservedHighModeEnergy = modalEnergy(undampedState,1,4.0e6);
+    const double lowModeError = std::abs(dampedState.q[0]-std::cos(2.0));
+
+    QVERIFY(lowModeError < 5.0e-4);
+    QVERIFY(attenuatedHighModeEnergy/initialHighModeEnergy < 1.0e-6);
+    QVERIFY(std::abs(preservedHighModeEnergy/initialHighModeEnergy-1.0) < 1.0e-8);
 }
 
 void TestStructuralDynamicsIntegrator::centralDifference()

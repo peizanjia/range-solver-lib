@@ -18,6 +18,18 @@ namespace
 
 constexpr double axisymmetricFullAngle = 2.0*3.14159265358979323846;
 
+bool finiteStressVector(const RRVector &vector)
+{
+    for (uint i=0;i<vector.getNRows();i++)
+    {
+        if (!std::isfinite(vector[i]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 RDofType translationDof(uint component)
 {
     R_ERROR_ASSERT(component < 3);
@@ -1878,10 +1890,51 @@ void RSolverStress::solveStressStrain()
         const RMatrixSolverType solverType = this->nLinearConstraintEquations > 0
                                            ? RMatrixSolverConf::GMRES
                                            : RMatrixSolverConf::CG;
-        RMatrixSolver matrixSolver(this->pModel->getMatrixSolverConf(solverType));
-        matrixSolver.solve(this->A,this->b,this->x,
+        const RMatrixSolverConf &matrixSolverConf = this->pModel->getMatrixSolverConf(solverType);
+        RMatrixSolver matrixSolver(matrixSolverConf);
+        RRVector candidate;
+        matrixSolver.solve(this->A,this->b,candidate,
                            this->nLinearConstraintEquations > 0 ? R_MATRIX_PRECONDITIONER_NONE : R_MATRIX_PRECONDITIONER_JACOBI,
                            this->nLinearConstraintEquations > 0 ? 1 : 3);
+
+        if (candidate.getNRows() != this->b.getNRows() || !finiteStressVector(candidate))
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Structural stress solve returned invalid or non-finite displacements.");
+        }
+
+        RRVector residual;
+        RSparseMatrix::mlt(this->A,candidate,residual);
+        if (residual.getNRows() != this->b.getNRows())
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Structural stress residual has an invalid dimension.");
+        }
+        for (uint i=0;i<residual.getNRows();i++)
+        {
+            residual[i] -= this->b[i];
+        }
+
+        const double residualNorm = RRVector::euclideanNorm(residual);
+        const double rightHandSideNorm = RRVector::euclideanNorm(this->b);
+        const double configuredTolerance = matrixSolverConf.getSolverCvgValue();
+        if (!std::isfinite(residualNorm) || !std::isfinite(rightHandSideNorm) ||
+            !std::isfinite(configuredTolerance) || configuredTolerance < 0.0)
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Structural stress solve produced a non-finite residual or convergence tolerance.");
+        }
+
+        const double relativeTolerance = std::max(1.0e-8,configuredTolerance);
+        const double allowedResidual = relativeTolerance*rightHandSideNorm+1.0e-12;
+        if (!std::isfinite(allowedResidual) || residualNorm > allowedResidual)
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Structural stress solve did not converge (residual %g, allowed %g).",
+                         residualNorm,allowedResidual);
+        }
+
+        this->x = candidate;
         RLogger::unindent();
     }
     catch (const RError &error)

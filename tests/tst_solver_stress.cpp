@@ -1102,6 +1102,7 @@ private slots:
     void modalAxialBar_data();
     void modalAxialBar();
     void staticTrussBar();
+    void staticTrussRejectsUnderiteratedCg();
     void staticQuadraticTrussBar();
     void staticBeamBending_data();
     void staticBeamBending();
@@ -1133,6 +1134,7 @@ private slots:
     void prescribedDisplacementIsAppliedInLocalFrame();
     void contradictingConstraintsAreReported();
     void linearConstraintCouplesTrussNodes();
+    void linearConstraintRejectsUnderiteratedGmres();
     void affineMpcPreservesPhysicalUnits();
     void contradictoryLinearConstraintsAreReported();
     void secondOrderTrussMatchesOneStepNewmark();
@@ -1673,6 +1675,23 @@ void TestSolverStress::staticTrussBar()
     double reaction = nodeValue(model,R_VARIABLE_FORCE,0,0);
     QVERIFY2(std::fabs(reaction+tipForce) < 0.01*tipForce,
              qPrintable(QString("Reaction = %1 N, expected %2 N").arg(reaction).arg(-tipForce)));
+}
+
+//! A finite but underiterated CG result must not be published as a static solve.
+void TestSolverStress::staticTrussRejectsUnderiteratedCg()
+{
+    RModel model = buildTruss(1000.0);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+    RMatrixSolverConf &cg = model.getMatrixSolverConf(RMatrixSolverConf::CG);
+    cg.setNOuterIterations(1);
+    cg.setSolverCvgValue(1.0e-14);
+    cg.setOutputFrequency(0);
+
+    QString solverError;
+    QVERIFY2(!runSolver(model,solverError),"Underiterated CG result was accepted as a static stress solve.");
+    QVERIFY2(solverError.contains("did not converge",Qt::CaseInsensitive),qPrintable(solverError));
+    QVERIFY(!std::isfinite(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,nSlices)));
+    QVERIFY(!std::isfinite(elementValue(model,R_VARIABLE_STRESS_NORMAL,0)));
 }
 
 //! A truss bar has the same axial modes as the solid one.
@@ -2394,6 +2413,30 @@ void TestSolverStress::linearConstraintCouplesTrussNodes()
              qPrintable(QString("MPC residual = %1").arg(tip-previous)));
     QVERIFY2(std::fabs(tip-expected) < 2.0e-5*expected,
              qPrintable(QString("MPC tip = %1, expected %2").arg(tip).arg(expected)));
+}
+
+//! The GMRES/MPC path must apply the same residual check before publishing.
+void TestSolverStress::linearConstraintRejectsUnderiteratedGmres()
+{
+    RModel model = buildTruss(1000.0);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+    RMatrixSolverConf &gmres = model.getMatrixSolverConf(RMatrixSolverConf::GMRES);
+    gmres.setNInnerIterations(1);
+    gmres.setNOuterIterations(1);
+    gmres.setSolverCvgValue(1.0e-14);
+    gmres.setOutputFrequency(0);
+
+    RLinearConstraint constraint;
+    constraint.id = "tie-last-segment-underiterated";
+    constraint.name = "Equal tip displacement";
+    constraint.terms = {{{nSlices,RDofType::UX},1.0},{{nSlices-1,RDofType::UX},-1.0}};
+    model.getProblemSetup().getStructuralInteractionSetup().getLinearConstraints().push_back(constraint);
+
+    QString solverError;
+    QVERIFY2(!runSolver(model,solverError),"Underiterated GMRES/MPC result was accepted as a static stress solve.");
+    QVERIFY2(solverError.contains("did not converge",Qt::CaseInsensitive),qPrintable(solverError));
+    QVERIFY(!std::isfinite(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,nSlices)));
+    QVERIFY(!std::isfinite(elementValue(model,R_VARIABLE_STRESS_NORMAL,0)));
 }
 
 void TestSolverStress::contradictoryLinearConstraintsAreReported()

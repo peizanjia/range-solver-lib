@@ -3,6 +3,69 @@
 
 #include "reigenvaluesolver.h"
 
+namespace
+{
+
+double stableEuclideanNorm(const RRVector &vector)
+{
+    double norm = 0.0;
+    for (uint i=0;i<vector.getNRows();i++)
+    {
+        if (!std::isfinite(vector[i]))
+        {
+            return std::numeric_limits<double>::infinity();
+        }
+        norm = std::hypot(norm,vector[i]);
+    }
+    return norm;
+}
+
+double generalizedRelativeResidual(const RSparseMatrix &M,
+                                   const RSparseMatrix &K,
+                                   const RRVector &phi,
+                                   double lambda)
+{
+    if (!std::isfinite(lambda))
+    {
+        return std::numeric_limits<double>::infinity();
+    }
+
+    RRVector kPhi,mPhi;
+    RSparseMatrix::mlt(K,phi,kPhi);
+    RSparseMatrix::mlt(M,phi,mPhi);
+
+    RRVector residual(kPhi);
+    for (uint i=0;i<kPhi.getNRows();i++)
+    {
+        if (!std::isfinite(kPhi[i]) || !std::isfinite(mPhi[i]))
+        {
+            return std::numeric_limits<double>::infinity();
+        }
+        residual[i] -= lambda*mPhi[i];
+        if (!std::isfinite(residual[i]))
+        {
+            return std::numeric_limits<double>::infinity();
+        }
+    }
+
+    const double kNorm = stableEuclideanNorm(kPhi);
+    const double mNorm = stableEuclideanNorm(mPhi);
+    const double residualNorm = stableEuclideanNorm(residual);
+    const double denominator = kNorm + std::fabs(lambda)*mNorm;
+    if (!std::isfinite(kNorm) || !std::isfinite(mNorm) ||
+        !std::isfinite(residualNorm) || !std::isfinite(denominator) || denominator <= 0.0)
+    {
+        return std::numeric_limits<double>::infinity();
+    }
+
+    const double relativeResidual = residualNorm/denominator;
+    return std::isfinite(relativeResidual)
+         ? relativeResidual
+         : std::numeric_limits<double>::infinity();
+}
+
+}
+
 #define R_EIS_PYTHAG(a,b) (std::sqrt ((a)*(a) + (b)*(b)))
 #define R_ASSERT(_condition) { if (!(_condition)) { RLogger::unindent(); R_ERROR_ASSERT(_condition); } }
 
@@ -260,6 +323,10 @@ void REigenValueSolver::solveSubspaceIteration(const RSparseMatrix &M, const RSp
 
     uint nIterations = std::max(this->eigenValueSolverConf.getNIterations(),uint(1));
     double convergenceValue = this->eigenValueSolverConf.getSolverCvgValue();
+    if (!std::isfinite(convergenceValue) || convergenceValue < 0.0)
+    {
+        throw RError(RError::Type::Application,R_ERROR_REF,"Invalid eigenvalue convergence tolerance.");
+    }
 
     RRVector x(n,0.0);
     RRVector y(n,0.0);
@@ -269,6 +336,10 @@ void REigenValueSolver::solveSubspaceIteration(const RSparseMatrix &M, const RSp
     // eigen values and is the first thing to reduce when a run takes too long.
     RLogger::info("Extracting %u eigen values from a subspace of %u vectors - up to %u iterations of %u linear solves each.\n",
                   nEigen,m,nIterations,m);
+
+    bool converged = false;
+    double lastChange = std::numeric_limits<double>::infinity();
+    double lastResidual = std::numeric_limits<double>::infinity();
 
     for (uint it=0;it<nIterations;it++)
     {
@@ -307,6 +378,12 @@ void REigenValueSolver::solveSubspaceIteration(const RSparseMatrix &M, const RSp
         {
             RLogger::unindent();
             throw RError(RError::Type::Application,R_ERROR_REF,"Subspace collapsed - no independent direction is left.");
+        }
+        if (mKept < nEigen)
+        {
+            RLogger::unindent();
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Subspace retained only %u independent directions for %u requested eigen pairs.",mKept,nEigen);
         }
 
         // Rayleigh-Ritz projection onto the subspace spanned by Y.
@@ -385,6 +462,15 @@ void REigenValueSolver::solveSubspaceIteration(const RSparseMatrix &M, const RSp
         RRMatrix Z;
         REigenValueSolver::jacobiEigen(A,thetaRitz,Z);
 
+        for (uint i=0;i<mKept;i++)
+        {
+            if (!std::isfinite(thetaRitz[i]))
+            {
+                RLogger::unindent();
+                throw RError(RError::Type::Application,R_ERROR_REF,"Subspace iteration produced a non-finite Ritz eigenvalue.");
+            }
+        }
+
         // Order the Ritz pairs by ascending eigen value.
         std::vector<uint> order(mKept);
         for (uint i=0;i<mKept;i++)
@@ -425,8 +511,8 @@ void REigenValueSolver::solveSubspaceIteration(const RSparseMatrix &M, const RSp
         // Ritz values may stabilize before their vectors do. Require both the
         // requested eigenvalue change and a generalized residual for every
         // wanted pair; modal damping depends on the vectors themselves.
-        bool converged = (it > 0);
-        uint nWanted = std::min(nEigen,mKept);
+        bool iterationConverged = (it > 0);
+        uint nWanted = nEigen;
         double maxChange = 0.0;
         double maxResidual = 0.0;
         const double residualTolerance = std::max(1.0e-8,convergenceValue);
@@ -434,25 +520,26 @@ void REigenValueSolver::solveSubspaceIteration(const RSparseMatrix &M, const RSp
         {
             double scale = std::max(std::fabs(theta[j]),RConstants::eps);
             double change = std::fabs(theta[j]-thetaOld[j]) / scale;
+            if (!std::isfinite(change))
+            {
+                RLogger::unindent();
+                throw RError(RError::Type::Application,R_ERROR_REF,"Subspace iteration produced a non-finite eigenvalue change.");
+            }
             maxChange = std::max(maxChange,change);
             if (change > convergenceValue)
             {
-                converged = false;
+                iterationConverged = false;
             }
             for (uint i=0;i<n;i++) x[i] = X[i][j];
-            RRVector kx,mx;
-            RSparseMatrix::mlt(K,x,kx);
-            RSparseMatrix::mlt(M,x,mx);
-            RRVector residual(kx);
-            for (uint i=0;i<n;i++) residual[i] -= theta[j]*mx[i];
-            const double denominator = RRVector::euclideanNorm(kx) +
-                std::fabs(theta[j])*RRVector::euclideanNorm(mx);
-            const double relativeResidual = denominator > 0.0
-                ? RRVector::euclideanNorm(residual)/denominator
-                : std::numeric_limits<double>::infinity();
-            if (!std::isfinite(relativeResidual) || relativeResidual > residualTolerance)
+            const double relativeResidual = generalizedRelativeResidual(M,K,x,theta[j]);
+            if (!std::isfinite(relativeResidual))
             {
-                converged = false;
+                RLogger::unindent();
+                throw RError(RError::Type::Application,R_ERROR_REF,"Subspace iteration produced a non-finite generalized residual.");
+            }
+            if (relativeResidual > residualTolerance)
+            {
+                iterationConverged = false;
             }
             maxResidual = std::max(maxResidual,relativeResidual);
         }
@@ -462,27 +549,33 @@ void REigenValueSolver::solveSubspaceIteration(const RSparseMatrix &M, const RSp
                           maxChange,convergenceValue,maxResidual,residualTolerance);
         }
 
+        lastChange = maxChange;
+        lastResidual = maxResidual;
         thetaOld = theta;
 
         RLogger::unindent();
 
-        if (converged)
+        if (iterationConverged)
         {
+            converged = true;
             break;
         }
-        if (it + 1 == nIterations)
-        {
-            RLogger::warning("Subspace iteration did not converge in %u iterations - eigenvalue change %g (required %g), "
-                             "generalized residual %g (required %g). Extracting fewer modes or raising the iteration limit may be needed.\n",
-                             nIterations,maxChange,convergenceValue,maxResidual,residualTolerance);
-        }
+    }
+
+    if (!converged)
+    {
+        throw RError(RError::Type::Application,R_ERROR_REF,
+                     "Subspace iteration did not converge in %u iterations - eigenvalue change %g (required %g), "
+                     "generalized residual %g (required %g).",
+                     nIterations,lastChange,convergenceValue,lastResidual,std::max(1.0e-8,convergenceValue));
     }
 
     uint nFound = std::min(nEigen,uint(theta.size()));
 
     if (nFound < nEigen)
     {
-        RLogger::warning("Only %u of the %u requested eigen values could be extracted - the subspace lost independent directions.\n",nFound,nEigen);
+        throw RError(RError::Type::Application,R_ERROR_REF,
+                     "Only %u of the %u requested eigen pairs could be extracted.",nFound,nEigen);
     }
 
     d.resize(nFound,0.0);
@@ -517,8 +610,16 @@ void REigenValueSolver::solveInversePowerIteration(const RSparseMatrix &M, const
 
     uint nIterations = std::max(this->eigenValueSolverConf.getNIterations(),uint(1));
     double convergenceValue = this->eigenValueSolverConf.getSolverCvgValue();
+    if (!std::isfinite(convergenceValue) || convergenceValue < 0.0)
+    {
+        throw RError(RError::Type::Application,R_ERROR_REF,"Invalid eigenvalue convergence tolerance.");
+    }
+    const double residualTolerance = std::max(1.0e-8,convergenceValue);
 
     double lambda = 0.0;
+    bool converged = false;
+    double lastChange = std::numeric_limits<double>::infinity();
+    double lastResidual = std::numeric_limits<double>::infinity();
     RRVector b(n,0.0);
     RRVector y(n,0.0);
 
@@ -555,25 +656,56 @@ void REigenValueSolver::solveInversePowerIteration(const RSparseMatrix &M, const
         double numerator = RRVector::dot(x,kx);
         double denominator = RRVector::dot(x,mx);
 
-        if (std::fabs(denominator) < RConstants::eps)
+        if (!std::isfinite(numerator) || !std::isfinite(denominator) ||
+            std::fabs(denominator) < RConstants::eps)
         {
             RLogger::unindent();
             throw RError(RError::Type::Application,R_ERROR_REF,
-                         "Projected mass is zero - check that every computable entity has a density.");
+                         "Projected mass or stiffness is invalid - check that every computable entity has a density.");
         }
 
         double lambdaNew = numerator / denominator;
-        double change = std::fabs(lambdaNew-lambda) / std::max(std::fabs(lambdaNew),RConstants::eps);
+        if (!std::isfinite(lambdaNew))
+        {
+            RLogger::unindent();
+            throw RError(RError::Type::Application,R_ERROR_REF,"Inverse power iteration produced a non-finite eigenvalue.");
+        }
+        double change = it > 0
+                      ? std::fabs(lambdaNew-lambda) / std::max(std::fabs(lambdaNew),RConstants::eps)
+                      : std::numeric_limits<double>::infinity();
+        if (it > 0 && !std::isfinite(change))
+        {
+            RLogger::unindent();
+            throw RError(RError::Type::Application,R_ERROR_REF,"Inverse power iteration produced a non-finite eigenvalue change.");
+        }
+        const double relativeResidual = generalizedRelativeResidual(M,K,x,lambdaNew);
+        if (!std::isfinite(relativeResidual))
+        {
+            RLogger::unindent();
+            throw RError(RError::Type::Application,R_ERROR_REF,"Inverse power iteration produced a non-finite generalized residual.");
+        }
 
-        RLogger::info("Eigen value = %g, convergence rate = %g\n",lambdaNew,change);
+        RLogger::info("Eigen value = %g, convergence rate = %g, generalized residual = %g\n",
+                      lambdaNew,change,relativeResidual);
         RLogger::unindent();
 
+        lastChange = change;
+        lastResidual = relativeResidual;
         lambda = lambdaNew;
 
-        if (it > 0 && change < convergenceValue)
+        if (it > 0 && change <= convergenceValue && relativeResidual <= residualTolerance)
         {
+            converged = true;
             break;
         }
+    }
+
+    if (!converged)
+    {
+        throw RError(RError::Type::Application,R_ERROR_REF,
+                     "Inverse power iteration did not converge in %u iterations - eigenvalue change %g (required %g), "
+                     "generalized residual %g (required %g).",
+                     nIterations,lastChange,convergenceValue,lastResidual,residualTolerance);
     }
 
     d.resize(1,0.0);
