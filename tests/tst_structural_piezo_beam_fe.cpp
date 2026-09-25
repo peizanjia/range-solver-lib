@@ -387,6 +387,17 @@ void TestStructuralPiezoBeamFE::candidatePublicationAndRollback()
     QCOMPARE(model.getVariable(model.findVariable(R_VARIABLE_DISPLACEMENT)).getValue(0,0),42.0);
     QCOMPARE(model.findVariable(R_VARIABLE_ROTATION),uint(RConstants::eod));
 
+    // A later invalid batch entry cannot publish an earlier valid output.
+    RVariable stagedRotation(R_VARIABLE_ROTATION,R_VARIABLE_APPLY_NODE);
+    stagedRotation.resize(3,model.getNNodes());
+    RVariable invalidType;
+    QVERIFY(rejects([&]() {
+        model.upsertVariablesAtomic({stagedRotation,invalidType});
+    }));
+    QCOMPARE(model.getNVariables(),priorVariables);
+    QCOMPARE(model.findVariable(R_VARIABLE_ROTATION),uint(RConstants::eod));
+    QCOMPARE(model.getVariable(model.findVariable(R_VARIABLE_DISPLACEMENT)).getValue(0,0),42.0);
+
     RStructuralPiezoBeamFEAdapter::publish(model,input,result);
     QCOMPARE(model.findVariable(R_VARIABLE_DISPLACEMENT),uint(0));
     const RVariable &displacement = model.getVariable(model.findVariable(R_VARIABLE_DISPLACEMENT));

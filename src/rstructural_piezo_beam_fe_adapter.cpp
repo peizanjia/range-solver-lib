@@ -715,9 +715,9 @@ std::vector<double> multiply(const RSparseMatrix &matrix,const std::vector<doubl
     return std::vector<double>(product.begin(),product.end());
 }
 
-void storeVariable(RModel &model,RVariableType type,RVariableApplyType applyType,
-                   uint vectors,uint values,const std::vector<double> &data,
-                   const QString &units)
+RVariable makeOutputVariable(const RModel &model,RVariableType type,
+                             RVariableApplyType applyType,uint vectors,uint values,
+                             const std::vector<double> &data,const QString &units)
 {
     if (data.size()!=std::size_t(vectors)*values)
         fail(QStringLiteral("BEAM1 piezo output variable has inconsistent dimensions."));
@@ -734,10 +734,7 @@ void storeVariable(RModel &model,RVariableType type,RVariableApplyType applyType
     for (uint vector=0;vector<vectors;vector++)
         for (uint value=0;value<values;value++)
             variable.setValue(vector,value,data[std::size_t(vector)*values+value]);
-    if (existing==RConstants::eod)
-        model.addVariable(variable);
-    else
-        model.setVariable(existing,variable);
+    return variable;
 }
 
 }
@@ -1182,13 +1179,17 @@ void RStructuralPiezoBeamFEAdapter::publish(
         chargeOutput[element] = result.patchCharges[patch];
     }
 
-    // Every candidate field is staged locally and checked before the first model mutation.
-    storeVariable(model,R_VARIABLE_DISPLACEMENT,R_VARIABLE_APPLY_NODE,3,uint(nNodes),
-                  displacementOutput,QStringLiteral("m"));
-    storeVariable(model,R_VARIABLE_ROTATION,R_VARIABLE_APPLY_NODE,3,uint(nNodes),
-                  rotationOutput,QStringLiteral("rad"));
-    storeVariable(model,R_VARIABLE_ELECTRIC_POTENTIAL,R_VARIABLE_APPLY_ELEMENT,1,
-                  model.getNElements(),potentialOutput,QStringLiteral("V (patch voltage difference)"));
-    storeVariable(model,R_VARIABLE_ELECTRIC_CHARGE,R_VARIABLE_APPLY_ELEMENT,1,
-                  model.getNElements(),chargeOutput,QStringLiteral("C"));
+    // Construct every output before atomically replacing the model result set.
+    const std::vector<RVariable> outputs = {
+        makeOutputVariable(model,R_VARIABLE_DISPLACEMENT,R_VARIABLE_APPLY_NODE,3,uint(nNodes),
+                           displacementOutput,QStringLiteral("m")),
+        makeOutputVariable(model,R_VARIABLE_ROTATION,R_VARIABLE_APPLY_NODE,3,uint(nNodes),
+                           rotationOutput,QStringLiteral("rad")),
+        makeOutputVariable(model,R_VARIABLE_ELECTRIC_POTENTIAL,R_VARIABLE_APPLY_ELEMENT,1,
+                           model.getNElements(),potentialOutput,
+                           QStringLiteral("V (patch voltage difference)")),
+        makeOutputVariable(model,R_VARIABLE_ELECTRIC_CHARGE,R_VARIABLE_APPLY_ELEMENT,1,
+                           model.getNElements(),chargeOutput,QStringLiteral("C"))
+    };
+    model.upsertVariablesAtomic(outputs);
 }
