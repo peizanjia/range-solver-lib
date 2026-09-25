@@ -50,6 +50,7 @@ set(range_solver_lib_tests
     tst_structural_thermal_control
     tst_structural_thermo_coupled_1d
     tst_structural_thermo_coupled_fe_adapter
+    tst_structural_thermo_monolithic_1d
 )
 
 foreach(test_name IN LISTS range_solver_lib_tests)
