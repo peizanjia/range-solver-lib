@@ -22,6 +22,16 @@ class RStructuralThermalFEAdapter
             RModel &model,
             const RStructuralThermalControlScheduler &scheduler,
             const RStructuralThermalControlState &accepted);
+        //! Atomically publish one same-mesh model and scheduler state bundle.
+        static void writeCheckpoint(
+            const QString &fileName,const RModel &model,
+            const RStructuralThermalControlScheduler &scheduler,
+            const RStructuralThermalControlState &accepted);
+        //! Validate the complete bundle before replacing either output.
+        static void readCheckpoint(
+            const QString &fileName,RModel &model,
+            const RStructuralThermalControlScheduler &scheduler,
+            RStructuralThermalControlState &accepted);
 };
 
 #endif // RSTRUCTURAL_THERMAL_FE_ADAPTER_H

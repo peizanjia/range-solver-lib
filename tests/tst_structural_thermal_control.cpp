@@ -1,5 +1,6 @@
 #include <QtTest>
 #include <QTemporaryDir>
+#include <QFile>
 
 #include <algorithm>
 #include <cmath>
@@ -298,6 +299,23 @@ void TestStructuralThermalControl::pointHeaterControlsTransientHeatAndStressFE()
               diskResumedModel,scheduler,diskState); }
     catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
     catch (const std::exception &error) { QFAIL(error.what()); }
+    const QString bundleFile = checkpointDirectory.filePath(QStringLiteral("accepted.tfec"));
+    RModel bundledModel;
+    RStructuralThermalControlState bundledState;
+    try
+    {
+        RStructuralThermalFEAdapter::writeCheckpoint(bundleFile,model,scheduler,second.candidate);
+        RStructuralThermalFEAdapter::readCheckpoint(
+            bundleFile,bundledModel,scheduler,bundledState);
+    }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
+    QVERIFY(sameState(bundledState,second.candidate));
+    RStructuralThermalControlScheduler::Result bundledContinuation;
+    try { bundledContinuation = RStructuralThermalFEAdapter::advance(
+              bundledModel,scheduler,bundledState); }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
 
     const double acceptedTemperature =
         model.getVariable(model.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1);
@@ -323,6 +341,27 @@ void TestStructuralThermalControl::pointHeaterControlsTransientHeatAndStressFE()
     QCOMPARE(retry.candidate.completedMechanicalMacrosteps,quint64(3));
     QCOMPARE(retry.channels[0].appliedEnergyJoules,2.0);
     QVERIFY(sameState(diskContinuation.candidate,retry.candidate));
+    QVERIFY(sameState(bundledContinuation.candidate,retry.candidate));
+    QFile corruptBundle(bundleFile);
+    QVERIFY(corruptBundle.open(QIODevice::ReadWrite));
+    QVERIFY(corruptBundle.seek(8));
+    const QByteArray originalByte = corruptBundle.read(1);
+    QCOMPARE(originalByte.size(),1);
+    QVERIFY(corruptBundle.seek(8));
+    QCOMPARE(corruptBundle.write(QByteArray(1,char(originalByte[0] ^ 1))),qint64(1));
+    corruptBundle.close();
+    const auto intactBundledState = bundledState;
+    const double intactBundledTemperature = bundledModel.getVariable(
+        bundledModel.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1);
+    bool rejectedCorruption = false;
+    try { RStructuralThermalFEAdapter::readCheckpoint(
+              bundleFile,bundledModel,scheduler,bundledState); }
+    catch (const std::exception &) { rejectedCorruption = true; }
+    QVERIFY(rejectedCorruption);
+    QVERIFY(sameState(bundledState,intactBundledState));
+    QCOMPARE(bundledModel.getVariable(
+                 bundledModel.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1),
+             intactBundledTemperature);
 
     const auto restored = scheduler.deserialize(serializedState);
     RStructuralThermalControlScheduler::Result resumed;

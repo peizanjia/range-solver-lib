@@ -8,6 +8,9 @@
 #include <QSet>
 #include <QCryptographicHash>
 #include <QDataStream>
+#include <QFile>
+#include <QSaveFile>
+#include <QTemporaryDir>
 
 #include <rml_model.h>
 #include <rml_structural_interaction.h>
@@ -270,4 +273,85 @@ RStructuralThermalControlScheduler::Result RStructuralThermalFEAdapter::advance(
             "Thermal FE macrostep changed the bound reference mesh.");
     model = candidateModel;
     return result;
+}
+
+void RStructuralThermalFEAdapter::writeCheckpoint(
+    const QString &fileName,const RModel &model,
+    const RStructuralThermalControlScheduler &scheduler,
+    const RStructuralThermalControlState &accepted)
+{
+    require(!fileName.isEmpty(),"Thermal FE checkpoint requires a file name.");
+    (void)heaterPointElements(model,scheduler.getConfig());
+    verifyAcceptedPlant(capture(model),accepted.plant);
+    const QByteArray stateBytes = scheduler.serialize(accepted);
+    QTemporaryDir scratch;
+    if (!scratch.isValid())
+        throw std::runtime_error("Could not create a thermal checkpoint staging directory.");
+    const QString modelPath = scratch.filePath(
+        QStringLiteral("model.") + RModel::getDefaultFileExtension(true));
+    model.write(modelPath,false);
+    QFile modelFile(modelPath);
+    if (!modelFile.open(QIODevice::ReadOnly))
+        throw std::runtime_error("Could not read the staged thermal FE model.");
+    const QByteArray modelBytes = modelFile.readAll();
+    if (modelBytes.isEmpty())
+        throw std::runtime_error("The staged thermal FE model is empty.");
+
+    QByteArray payload;
+    QDataStream stream(&payload,QIODevice::WriteOnly);
+    stream.setVersion(QDataStream::Qt_6_0);
+    stream.setByteOrder(QDataStream::BigEndian);
+    stream << quint32(0x54464543) << quint32(1) << modelBytes << stateBytes;
+    if (stream.status() != QDataStream::Ok)
+        throw std::runtime_error("Could not encode the thermal FE checkpoint.");
+    const QByteArray digest = QCryptographicHash::hash(payload,QCryptographicHash::Sha256);
+    QSaveFile output(fileName);
+    if (!output.open(QIODevice::WriteOnly) ||
+        output.write(payload) != payload.size() ||
+        output.write(digest) != digest.size() || !output.commit())
+        throw std::runtime_error("Could not atomically publish the thermal FE checkpoint.");
+}
+
+void RStructuralThermalFEAdapter::readCheckpoint(
+    const QString &fileName,RModel &model,
+    const RStructuralThermalControlScheduler &scheduler,
+    RStructuralThermalControlState &accepted)
+{
+    QFile input(fileName);
+    if (!input.open(QIODevice::ReadOnly) || input.size() < 40 ||
+        input.size() > 1024LL*1024LL*1024LL)
+        throw std::invalid_argument("Thermal FE checkpoint is missing or has an invalid size.");
+    const QByteArray bytes = input.readAll();
+    if (bytes.size() != input.size())
+        throw std::runtime_error("Could not read the complete thermal FE checkpoint.");
+    const QByteArray payload = bytes.left(bytes.size()-32);
+    const QByteArray digest = bytes.right(32);
+    if (QCryptographicHash::hash(payload,QCryptographicHash::Sha256) != digest)
+        throw std::invalid_argument("Thermal FE checkpoint checksum differs from its content.");
+    QDataStream stream(payload);
+    stream.setVersion(QDataStream::Qt_6_0);
+    stream.setByteOrder(QDataStream::BigEndian);
+    quint32 magic = 0,version = 0;
+    QByteArray modelBytes,stateBytes;
+    stream >> magic >> version >> modelBytes >> stateBytes;
+    if (stream.status() != QDataStream::Ok || !stream.atEnd() ||
+        magic != 0x54464543 || version != 1 || modelBytes.isEmpty() || stateBytes.isEmpty())
+        throw std::invalid_argument("Thermal FE checkpoint structure or version is invalid.");
+    const auto restoredState = scheduler.deserialize(stateBytes);
+    QTemporaryDir scratch;
+    if (!scratch.isValid())
+        throw std::runtime_error("Could not create a thermal checkpoint restore directory.");
+    const QString modelPath = scratch.filePath(
+        QStringLiteral("model.") + RModel::getDefaultFileExtension(true));
+    QFile modelFile(modelPath);
+    if (!modelFile.open(QIODevice::WriteOnly) ||
+        modelFile.write(modelBytes) != modelBytes.size())
+        throw std::runtime_error("Could not stage the thermal FE model for restoration.");
+    modelFile.close();
+    RModel restoredModel;
+    restoredModel.read(modelPath);
+    (void)heaterPointElements(restoredModel,scheduler.getConfig());
+    verifyAcceptedPlant(capture(restoredModel),restoredState.plant);
+    model = restoredModel;
+    accepted = restoredState;
 }
