@@ -59,7 +59,7 @@ struct RStructuralThermoMonolithic1DOptions
     double thermalRelativeResidualTolerance = 1.0e-10;
 };
 
-//! Candidate results and independently certified physical residuals.
+//! Candidate results with physical residuals freshly reassembled from the candidate.
 struct RStructuralThermoMonolithic1DResult
 {
     //! Candidate state; the caller commits only after this function returns.

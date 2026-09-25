@@ -773,8 +773,21 @@ RStructuralThermoMonolithic1DResult RStructuralThermoMonolithic1D::step(
             }
             if (allTemperaturesPositive(trial))
             {
-                const Evaluation trialEvaluation = evaluate(model,acceptedState,conditions,
-                    options,validated,trial,false);
+                Evaluation trialEvaluation;
+                try
+                {
+                    trialEvaluation = evaluate(model,acceptedState,conditions,
+                        options,validated,trial,false);
+                }
+                catch (const std::runtime_error &)
+                {
+                    // A finite Newton correction can still produce an
+                    // overflowing residual or energy diagnostic at this
+                    // trial scale. Reject that trial and continue the bounded
+                    // backtracking sequence; the next scale may be evaluable.
+                    stepScale *= 0.5;
+                    continue;
+                }
                 const double trialMerit = merit(trialEvaluation);
                 if (trialMerit <= 1.0 ||
                     trialMerit < currentMerit*(1.0-1.0e-4*stepScale))

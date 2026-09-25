@@ -34,6 +34,20 @@ RStructuralThermoMonolithic1DModel makeModel(double length = 1.0,
     return model;
 }
 
+RStructuralThermoMonolithic1DModel makeTwoMemberSeriesModel()
+{
+    auto model = makeModel(1.0,1.0,1000.0,0.001,1.0,10.0,0.0,2000.0);
+    model.nodeCoordinatesMetres = {0.0,1.0,2.0};
+    RStructuralThermoMonolithic1DMember left = model.members.front();
+    RStructuralThermoMonolithic1DMember right = left;
+    left.node0 = 0;
+    left.node1 = 1;
+    right.node0 = 1;
+    right.node1 = 2;
+    model.members = {left,right};
+    return model;
+}
+
 RStructuralThermoMonolithic1DState uniformState(double temperature = 300.0)
 {
     return {{temperature,temperature},{0.0,0.0}};
@@ -74,6 +88,8 @@ private slots:
     void zeroExpansionDecouplesThermalAndMechanicalFields();
     void prescribedTemperatureReportsBoundaryHeat();
     void optionalKelvinVoigtDissipationConservesHeat();
+    void freeTwoMemberThermoelasticDissipationMatchesIndependentRoot();
+    void overflowingNewtonTrialBacktracksToFiniteCandidate();
     void failedNewtonPublishesNoCandidate();
     void unattainableCoolingNeverPublishesNonpositiveTemperature();
 };
@@ -195,6 +211,109 @@ void TestStructuralThermoMonolithic1D::optionalKelvinVoigtDissipationConservesHe
     QVERIFY(near(withHeatFeedback.nextState.temperatureKelvin[0],300.002));
     QVERIFY(near(withHeatFeedback.nextState.temperatureKelvin[1],300.002));
     QVERIFY(std::abs(withHeatFeedback.thermalEnergyBalanceResidualJoules) <= 1.0e-10);
+}
+
+void TestStructuralThermoMonolithic1D::freeTwoMemberThermoelasticDissipationMatchesIndependentRoot()
+{
+    const auto model = makeTwoMemberSeriesModel();
+    const RStructuralThermoMonolithic1DState accepted{
+        {300.0,300.0,300.0},{0.0,0.0,0.0}};
+    RStructuralThermoMonolithic1DConditions load;
+    load.mechanicalForceNewtons = {0.0,0.0,10.0};
+    load.displacementPrescribed = {true,false,false};
+    load.prescribedDisplacementMetres = {0.0,0.0,0.0};
+    load.heatPowerWatts = {0.0,0.0,0.0};
+    load.temperaturePrescribed = {false,false,false};
+    load.prescribedTemperatureKelvin = {300.0,300.0,300.0};
+    auto stepOptions = options(2.0);
+    stepOptions.heatKelvinVoigtDissipation = true;
+    stepOptions.mechanicalAbsoluteResidualToleranceNewtons = 1.0e-12;
+    stepOptions.mechanicalRelativeResidualTolerance = 1.0e-13;
+    stepOptions.thermalAbsoluteResidualToleranceWatts = 1.0e-12;
+    stepOptions.thermalRelativeResidualTolerance = 1.0e-13;
+
+    const auto result = RStructuralThermoMonolithic1D::step(
+        model,accepted,load,stepOptions);
+
+    // An independent scalar reduction follows from equal member force/strain
+    // and uniform temperature in the two-member series chain. It checks the
+    // shared-node assembly and the thermal-to-free-displacement Newton block.
+    const auto &member = model.members.front();
+    const double length = model.nodeCoordinatesMetres[1]-model.nodeCoordinatesMetres[0];
+    const double forcePerArea = load.mechanicalForceNewtons.back()/member.areaSquareMetres;
+    const double heatQuadratic = member.youngModulusPascals*member.expansionPerKelvin*
+        member.kelvinVoigtViscosityPascalSeconds/
+        (member.densityKilogramsPerCubicMetre*
+         member.specificHeatJoulesPerKilogramKelvin*length*length*stepOptions.timeStepSeconds);
+    const double linear = (member.youngModulusPascals+
+        member.kelvinVoigtViscosityPascalSeconds/stepOptions.timeStepSeconds)/length+
+        model.referenceTemperatureKelvin*member.youngModulusPascals*
+        member.youngModulusPascals*member.expansionPerKelvin*member.expansionPerKelvin/
+        (member.densityKilogramsPerCubicMetre*
+         member.specificHeatJoulesPerKilogramKelvin*length);
+    const double discriminant = linear*linear-4.0*heatQuadratic*forcePerArea;
+    QVERIFY(discriminant > 0.0);
+    const double memberExtension = 2.0*forcePerArea/
+        (linear+std::sqrt(discriminant));
+    const double expectedTemperatureChange =
+        (member.kelvinVoigtViscosityPascalSeconds*memberExtension*memberExtension/
+             (length*stepOptions.timeStepSeconds)-
+         model.referenceTemperatureKelvin*member.youngModulusPascals*
+             member.expansionPerKelvin*memberExtension)/
+        (member.densityKilogramsPerCubicMetre*
+         member.specificHeatJoulesPerKilogramKelvin*length);
+    const double memberDissipatedEnergy = member.kelvinVoigtViscosityPascalSeconds*
+        member.areaSquareMetres*length*
+        std::pow(memberExtension/(length*stepOptions.timeStepSeconds),2)*
+        stepOptions.timeStepSeconds;
+
+    QVERIFY(near(result.nextState.axialDisplacementMetres[1],memberExtension));
+    QVERIFY(near(result.nextState.axialDisplacementMetres[2],2.0*memberExtension));
+    for (double temperature : result.nextState.temperatureKelvin)
+    {
+        QVERIFY(near(temperature,300.0+expectedTemperatureChange));
+    }
+    for (double force : result.memberAxialForceNewtons)
+    {
+        QVERIFY(near(force,load.mechanicalForceNewtons.back()));
+    }
+    for (double energy : result.memberDissipatedEnergyJoules)
+    {
+        QVERIFY(near(energy,memberDissipatedEnergy));
+    }
+    QVERIFY(near(result.viscousDissipationEnergyJoules,2.0*memberDissipatedEnergy));
+    QVERIFY(near(result.dissipationHeatEnergyJoules,2.0*memberDissipatedEnergy));
+    QVERIFY(near(result.thermalEnergyChangeJoules,
+                 member.densityKilogramsPerCubicMetre*
+                     member.specificHeatJoulesPerKilogramKelvin*
+                     member.areaSquareMetres*2.0*length*expectedTemperatureChange));
+    QVERIFY(std::abs(result.thermalEnergyBalanceResidualJoules) <= 1.0e-9);
+    QVERIFY(result.newtonIterations > 0);
+    QVERIFY(result.newtonIterations <= 8);
+}
+
+void TestStructuralThermoMonolithic1D::overflowingNewtonTrialBacktracksToFiniteCandidate()
+{
+    const auto model = makeModel(1.0,1.0,1000.0,0.0,1.0,10.0,0.0,1.0);
+    const auto accepted = uniformState();
+    auto load = conditions();
+    load.displacementPrescribed[0] = true;
+    load.mechanicalForceNewtons[1] = 1.5e157;
+    auto bounded = options();
+    bounded.maximumNewtonIterations = 1;
+    bounded.maximumLineSearchSteps = 2;
+    bounded.mechanicalAbsoluteResidualToleranceNewtons = 1.0e157;
+
+    const auto result = RStructuralThermoMonolithic1D::step(
+        model,accepted,load,bounded);
+    const double fullNewtonDisplacement = load.mechanicalForceNewtons[1]/
+        (model.members[0].areaSquareMetres*(model.members[0].youngModulusPascals+
+         model.members[0].kelvinVoigtViscosityPascalSeconds/bounded.timeStepSeconds));
+    QVERIFY(near(result.nextState.axialDisplacementMetres[1]/fullNewtonDisplacement,0.5));
+    QCOMPARE(result.newtonIterations,1U);
+    QVERIFY(std::isfinite(result.memberDissipatedEnergyJoules[0]));
+    QVERIFY(result.mechanicalResidualNormNewtons <=
+            bounded.mechanicalAbsoluteResidualToleranceNewtons);
 }
 
 void TestStructuralThermoMonolithic1D::failedNewtonPublishesNoCandidate()
