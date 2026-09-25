@@ -1,4 +1,5 @@
 #include <QtTest>
+#include <QTemporaryDir>
 
 #include <algorithm>
 #include <cmath>
@@ -188,7 +189,33 @@ private slots:
     void observationsUseStableNodeAndSensorIds();
     void pointHeaterControlsTransientHeatAndStressFE();
     void legacyPointHeatBoundaryActuallyAppliesWatts();
+    void pointThermalMassActuallyStoresHeat();
 };
+
+void TestStructuralThermalControl::pointThermalMassActuallyStoresHeat()
+{
+    RModel model = thermalFeRod();
+    model.getPoint(1).setVolume(1.0);
+    model.getPoint(1).setMaterial(model.getLine(0).getMaterial());
+    RBoundaryCondition heater(R_BOUNDARY_CONDITION_HEAT);
+    setComponent(heater,R_VARIABLE_HEAT,2.0);
+    model.getPoint(1).addBoundaryCondition(heater);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_HEAT));
+    RTimeSolver &time = model.getTimeSolver();
+    time.setEnabled(true);
+    time.setInputNTimeSteps(1);
+    time.setInputStartTime(0.0);
+    time.setInputTimeStepSize(1.0);
+    time.setTimeMarchApproximation(R_TIME_MARCH_BACKWARD);
+    RSolver solver(model,QString(),QString());
+    try { solver.run(); }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
+    // The base rod row has C/dt + K = 2 W/K; the added point contributes
+    // rho*c*V/dt = 3 W/K. Two watts therefore raise the free node by 0.4 K.
+    QVERIFY(std::abs(model.getVariable(model.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1)-
+                     293.55) < 1.0e-8);
+}
 
 void TestStructuralThermalControl::legacyPointHeatBoundaryActuallyAppliesWatts()
 {
@@ -251,6 +278,26 @@ void TestStructuralThermalControl::pointHeaterControlsTransientHeatAndStressFE()
 
     RModel resumedModel(model);
     const QByteArray serializedState = scheduler.serialize(second.candidate);
+    QTemporaryDir checkpointDirectory;
+    QVERIFY(checkpointDirectory.isValid());
+    const QString checkpointFile = checkpointDirectory.filePath(
+        QStringLiteral("thermal-fe.") + RModel::getDefaultFileExtension(true));
+    RModel diskResumedModel;
+    try
+    {
+        QCOMPARE(model.write(checkpointFile,false),checkpointFile);
+        diskResumedModel.read(checkpointFile);
+    }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
+    QCOMPARE(diskResumedModel.getTimeSolver().getComputedTime(),
+             model.getTimeSolver().getComputedTime());
+    const auto diskState = scheduler.deserialize(serializedState);
+    RStructuralThermalControlScheduler::Result diskContinuation;
+    try { diskContinuation = RStructuralThermalFEAdapter::advance(
+              diskResumedModel,scheduler,diskState); }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
 
     const double acceptedTemperature =
         model.getVariable(model.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1);
@@ -275,6 +322,7 @@ void TestStructuralThermalControl::pointHeaterControlsTransientHeatAndStressFE()
     catch (const std::exception &error) { QFAIL(error.what()); }
     QCOMPARE(retry.candidate.completedMechanicalMacrosteps,quint64(3));
     QCOMPARE(retry.channels[0].appliedEnergyJoules,2.0);
+    QVERIFY(sameState(diskContinuation.candidate,retry.candidate));
 
     const auto restored = scheduler.deserialize(serializedState);
     RStructuralThermalControlScheduler::Result resumed;

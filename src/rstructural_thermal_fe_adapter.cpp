@@ -242,7 +242,16 @@ RStructuralThermalControlScheduler::Result RStructuralThermalFEAdapter::advance(
         time.setCurrentTimeStep(0);
         time.setComputedTime(time.getCurrentTime());
         heat.setControlledPointHeat(powers);
-        heat.run(accepted.completedMechanicalMacrosteps == 0 && substep == 0,0);
+        // Each invocation uses a fresh solver. Recompute its geometric scales
+        // on every FE substep, while retaining the last accepted temperature
+        // except for a genuinely new run. RSolverGeneric treats its first
+        // execution and first physical time step as separate concepts.
+        const bool newRun = accepted.completedMechanicalMacrosteps == 0 && substep == 0;
+        const bool originalRestart = candidateModel.getProblemSetup().getRestart();
+        if (!newRun)
+            candidateModel.getProblemSetup().setRestart(true);
+        heat.run(true,0);
+        candidateModel.getProblemSetup().setRestart(originalRestart);
         require(heat.hasConverged(),"Controlled thermal FE substep did not converge.");
         if (solveMechanical)
         {
