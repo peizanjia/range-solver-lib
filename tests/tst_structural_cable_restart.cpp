@@ -21,10 +21,12 @@
 #include <rml_structural_cable_setup.h>
 #include <rml_structural_dynamics_restart_data.h>
 #include <rml_structural_dynamics_setup.h>
+#include <rml_time_solver.h>
 #include <rml_variable.h>
 
 #include "rsolver.h"
 #include "rstructural_cable_model_adapter.h"
+#include "rstructural_cable_dynamics_restart_adapter.h"
 
 namespace
 {
@@ -282,6 +284,7 @@ private slots:
     void persistedSplitRunMatchesFullVibration();
     void changedCableSetupRejectsRestart();
     void changedAcceptedStepOrTimeRejectsRestart();
+    void alteredSmallComponentBesideLargeValueRejectsRestore();
     void rejectedCandidateDoesNotAdvanceAcceptedCableCheckpoint();
     void enabledStructuralControlIsRejectedByCableAdapter();
 };
@@ -438,6 +441,49 @@ void TestStructuralCableRestart::changedAcceptedStepOrTimeRejectsRestart()
     QVERIFY2(error.contains("accepted time step",Qt::CaseInsensitive),qPrintable(error));
 }
 
+void TestStructuralCableRestart::alteredSmallComponentBesideLargeValueRejectsRestore()
+{
+    RModel model = makeVibratingCable(1);
+    QString error;
+    QVERIFY2(solve(model,error),qPrintable(error));
+    RStructuralDynamicsRestartData &checkpoint =
+        model.getProblemSetup().getStructuralDynamicsRestartData();
+    QVERIFY(checkpoint.available);
+
+    // Model a large, unchanged component alongside a small result value. A
+    // vector-wide relative tolerance would accept the 1e-3 corruption below
+    // because its scale is set by 1e6, although that error is large for the
+    // affected component.
+    checkpoint.q[0] = 1.0e6;
+    std::vector<double> displacements = checkpoint.q;
+    std::vector<double> velocities = checkpoint.v;
+    std::vector<double> accelerations = checkpoint.a;
+    displacements[3] += 1.0e-3;
+
+    // restoreAcceptedState validates that the attempted step follows the
+    // accepted checkpoint. Extend the completed one-step clock by one trial
+    // time so the test reaches the component comparison itself.
+    RTimeSolver &trialClock = model.getTimeSolver();
+    trialClock.getTimes().push_back(checkpoint.time+timeStep);
+    trialClock.setCurrentTimeStep(checkpoint.completedSteps);
+
+    QString failureMessage;
+    try
+    {
+        RStructuralCableDynamicsRestartAdapter::restoreAcceptedState(
+            model,checkpoint.systemFingerprint,checkpoint.externalForce,
+            displacements,velocities,accelerations);
+    }
+    catch (const RError &failure)
+    {
+        failureMessage = failure.getMessage();
+    }
+    QVERIFY2(failureMessage.contains("displacement differs",Qt::CaseInsensitive),
+             qPrintable(failureMessage.isEmpty()
+                            ? QStringLiteral("A changed small displacement component must not be masked by a large component.")
+                            : failureMessage));
+}
+
 void TestStructuralCableRestart::rejectedCandidateDoesNotAdvanceAcceptedCableCheckpoint()
 {
     RModel acceptedModel = makeVibratingCable(1);
@@ -485,5 +531,5 @@ void TestStructuralCableRestart::enabledStructuralControlIsRejectedByCableAdapte
     QVERIFY(rejected);
 }
 
-QTEST_MAIN(TestStructuralCableRestart)
+QTEST_APPLESS_MAIN(TestStructuralCableRestart)
 #include "tst_structural_cable_restart.moc"

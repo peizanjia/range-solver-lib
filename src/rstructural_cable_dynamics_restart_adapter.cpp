@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <limits>
 #include <utility>
 
 #include <QCryptographicHash>
@@ -62,14 +61,7 @@ std::vector<RStructuralDofRef> translationalDofs(uint nodeCount)
     return dofs;
 }
 
-double vectorScale(const std::vector<double> &values)
-{
-    double scale = 0.0;
-    for (double value : values) scale = std::max(scale,std::fabs(value));
-    return std::max(scale,1.0e-14);
-}
-
-void requireCloseVectors(const std::vector<double> &stored,
+void requireEqualVectors(const std::vector<double> &stored,
                          const std::vector<double> &checkpoint,
                          const char *description)
 {
@@ -78,13 +70,14 @@ void requireCloseVectors(const std::vector<double> &stored,
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                      "Cable transient restart %s length does not match its checkpoint.",description);
     }
-    const double scale = std::max(vectorScale(stored),vectorScale(checkpoint));
-    const double tolerance = 2.0e-6*scale +
-        64.0*std::numeric_limits<double>::epsilon()*scale;
+    // The checkpoint and RVariable values are both persisted with 17
+    // significant digits in ASCII and exactly in binary. Unmodified doubles
+    // therefore round-trip exactly; a vector-wide tolerance could hide a
+    // corrupted small component beside an unrelated large component.
     for (std::size_t i=0;i<stored.size();i++)
     {
         if (!std::isfinite(stored[i]) || !std::isfinite(checkpoint[i]) ||
-            std::fabs(stored[i]-checkpoint[i]) > tolerance)
+            stored[i] != checkpoint[i])
         {
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                          "Cable transient restart %s differs from its accepted checkpoint.",description);
@@ -111,7 +104,7 @@ void validateCheckpoint(const RModel &model,
     {
         fail("Cable transient restart checkpoint does not match its mesh, DOF order or cable system fingerprint.");
     }
-    requireCloseVectors(checkpoint.externalForce,externalForces,"external force");
+    requireEqualVectors(checkpoint.externalForce,externalForces,"external force");
 
     const double configuredDt =
         model.getProblemSetup().getStructuralDynamicsSetup().getTimeStep();
@@ -231,12 +224,13 @@ void RStructuralCableDynamicsRestartAdapter::restoreAcceptedState(
 
     validateCheckpoint(model,systemFingerprint,externalForces);
     validateAcceptedIndexAndTime(model,checkpoint);
-    requireCloseVectors(displacements,checkpoint.q,"displacement");
-    requireCloseVectors(velocities,checkpoint.v,"velocity");
-    requireCloseVectors(accelerations,checkpoint.a,"acceleration");
+    requireEqualVectors(displacements,checkpoint.q,"displacement");
+    requireEqualVectors(velocities,checkpoint.v,"velocity");
+    requireEqualVectors(accelerations,checkpoint.a,"acceleration");
 
-    // ASCII model results may be rounded for display. The checkpoint stores
-    // 17-digit accepted state and is the authoritative continuation state.
+    // The result fields and checkpoint share round-trip-safe ASCII precision
+    // and exact binary persistence. Once matched, use the checkpoint as the
+    // authoritative accepted state for continuation.
     displacements = checkpoint.q;
     velocities = checkpoint.v;
     accelerations = checkpoint.a;
