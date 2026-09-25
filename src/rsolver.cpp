@@ -1014,11 +1014,17 @@ void RSolver::setStructuralControlCallback(const QString &controllerId,
                                            const QString &controllerRevision,
                                           StructuralControlCallback callback)
 {
-    if ((this->pModel->getProblemSetup().getStructuralCableSetup().enabled ||
-         this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled) && callback)
+    const bool cableDynamics =
+        this->pModel->getProblemSetup().getStructuralCableSetup().enabled &&
+        this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
+    const bool unsupportedSpecializedMode =
+        this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled ||
+        (this->pModel->getProblemSetup().getStructuralCableSetup().enabled &&
+         !cableDynamics);
+    if (unsupportedSpecializedMode && callback)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Structural control callbacks are unsupported in static cable/piezo mode.");
+                     "Structural control callbacks are supported only for transient cable NodalForce v1.");
     }
     this->structuralControllerId = controllerId;
     this->structuralControllerRevision = controllerRevision;
@@ -1031,11 +1037,17 @@ void RSolver::setStructuralControlCallback(const QString &controllerId,
 
 void RSolver::setStructuralControlStepObserver(StructuralControlStepObserver observer)
 {
-    if ((this->pModel->getProblemSetup().getStructuralCableSetup().enabled ||
-         this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled) && observer)
+    const bool cableDynamics =
+        this->pModel->getProblemSetup().getStructuralCableSetup().enabled &&
+        this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
+    const bool unsupportedSpecializedMode =
+        this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled ||
+        (this->pModel->getProblemSetup().getStructuralCableSetup().enabled &&
+         !cableDynamics);
+    if (unsupportedSpecializedMode && observer)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Structural control observers are unsupported in static cable/piezo mode.");
+                     "Structural control observers are supported only for transient cable NodalForce v1.");
     }
     this->structuralControlStepObserver = std::move(observer);
     auto it = this->solvers.find(R_PROBLEM_STRESS);
@@ -1095,11 +1107,17 @@ void RSolver::run()
         // Recheck because the referenced RModel remains mutable after _init().
         RStructuralCableModelAdapter::validate(*this->pModel);
         RStructuralPiezoModelAdapter::validate(*this->pModel);
-        if (this->structuralSupportResponseObserver || this->structuralControlCallback ||
-            this->structuralControlStepObserver)
+        const bool cableDynamics =
+            this->pModel->getProblemSetup().getStructuralCableSetup().enabled &&
+            this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
+        const bool cableControlEnabled = cableDynamics &&
+            this->pModel->getProblemSetup().getStructuralControlSetup().enabled;
+        if (this->structuralSupportResponseObserver ||
+            ((this->structuralControlCallback || this->structuralControlStepObserver) &&
+             !cableControlEnabled))
         {
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                         "Structural support/control observers are unsupported in static cable/piezo mode.");
+                         "Structural support response and control are supported only for transient cable NodalForce v1.");
         }
     }
     RParallelExecutionContext parallelContext(this->pModel->getProblemSetup().getParallelExecutionConfig());

@@ -14,10 +14,12 @@
 #include <rml_structural_dynamics_restart_data.h>
 #include <rml_structural_dynamics_setup.h>
 #include <rml_structural_cable_setup.h>
+#include <rml_structural_interaction.h>
 #include <rml_variable.h>
 
 #include "rstructural_cable_model_adapter.h"
 #include "rstructural_cable_dynamics_restart_adapter.h"
+#include "rstructural_cable_kernel.h"
 #include "rstructural_static_truss_model.h"
 
 namespace
@@ -57,6 +59,80 @@ void validateDynamicsSetup(const RStructuralDynamicsSetup &setup)
     }
 }
 
+void validateCableControlCatalog(const RModel &model,bool dynamics)
+{
+    const RStructuralControlSetup &control =
+        model.getProblemSetup().getStructuralControlSetup();
+    if (!control.enabled) return;
+    if (!dynamics)
+        fail("Static cable mode does not support Stage-6 structural control.");
+    control.validate();
+
+    const RStructuralInteractionSetup &interaction =
+        model.getProblemSetup().getStructuralInteractionSetup();
+    const RStructuralValidationReport report = interaction.validate(model);
+    if (report.hasErrors())
+    {
+        for (const RStructuralDiagnostic &diagnostic : report.getDiagnostics())
+        {
+            if (diagnostic.severity == RStructuralDiagnosticSeverity::Error)
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Cable control catalog is invalid (%s): %s",
+                             diagnostic.objectId.toUtf8().constData(),
+                             diagnostic.message.toUtf8().constData());
+            }
+        }
+        fail("Cable control catalog is invalid.");
+    }
+    if (interaction.getActuators().empty())
+        fail("Enabled cable control requires at least one point-node global NodalForce actuator.");
+
+    for (const RStructuralActuator &actuator : interaction.getActuators())
+    {
+        if (actuator.type != RStructuralActuatorType::NodalForce ||
+            actuator.target.scope != RStructuralTargetScope::Node ||
+            actuator.frame != RStructuralFrame::Global)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable control actuator '%s' requires point-node global NodalForce v1.",
+                         actuator.id.toUtf8().constData());
+        }
+        if (actuator.variable != R_VARIABLE_FORCE &&
+            actuator.variable != R_VARIABLE_FORCE_X &&
+            actuator.variable != R_VARIABLE_FORCE_Y &&
+            actuator.variable != R_VARIABLE_FORCE_Z)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable control actuator '%s' command must be a physical NodalForce component.",
+                         actuator.id.toUtf8().constData());
+        }
+    }
+    for (const RStructuralSensor &sensor : interaction.getSensors())
+    {
+        if (sensor.target.scope != RStructuralTargetScope::Node ||
+            sensor.aggregation != RStructuralSensorAggregation::Point ||
+            sensor.frame != RStructuralFrame::Global ||
+            (sensor.quantity != RStructuralSensorQuantity::Displacement &&
+             sensor.quantity != RStructuralSensorQuantity::Velocity &&
+             sensor.quantity != RStructuralSensorQuantity::Acceleration))
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable control sensor '%s' requires point-node global displacement, velocity or acceleration v1.",
+                         sensor.id.toUtf8().constData());
+        }
+    }
+}
+
+void clearControlCatalogForTrussExtraction(RModel &model)
+{
+    model.getProblemSetup().getStructuralControlSetup() = RStructuralControlSetup();
+    RStructuralInteractionSetup &interaction =
+        model.getProblemSetup().getStructuralInteractionSetup();
+    interaction.getActuators().clear();
+    interaction.getSensors().clear();
+}
+
 CableModelData buildCableModelData(const RModel &model, bool dynamics)
 {
     const RProblemSetup &problemSetup = model.getProblemSetup();
@@ -68,10 +144,6 @@ CableModelData buildCableModelData(const RModel &model, bool dynamics)
     if (problemSetup.getStructuralPiezoSetup().enabled)
     {
         fail("Structural cable and piezo modes cannot be enabled together.");
-    }
-    if (problemSetup.getStructuralControlSetup().enabled)
-    {
-        fail("Structural cable mode does not yet support Stage-6 structural control.");
     }
     setup.validate(model);
 
@@ -85,18 +157,22 @@ CableModelData buildCableModelData(const RModel &model, bool dynamics)
     {
         fail("Static cable mode does not support second-order dynamics.");
     }
+    validateCableControlCatalog(model,dynamics);
 
     CableModelData data;
     if (dynamics &&
         (problemSetup.getRestart() ||
-         problemSetup.getStructuralDynamicsRestartData().available))
+         problemSetup.getStructuralDynamicsRestartData().available ||
+         problemSetup.getStructuralControlSetup().enabled))
     {
-        // The shared static truss extractor intentionally rejects restart
-        // records. Build physical FE data from a local clean copy so the
-        // accepted checkpoint stays intact on the live model.
+        // The shared static truss extractor intentionally rejects restart and
+        // Stage-6 interaction data. Build physical FE data from a local clean
+        // copy while retaining every accepted value on the live model.
         RModel physicalModel(model);
         physicalModel.getProblemSetup().setRestart(false);
         physicalModel.getProblemSetup().getStructuralDynamicsRestartData().clear();
+        if (problemSetup.getStructuralControlSetup().enabled)
+            clearControlCatalogForTrussExtraction(physicalModel);
         data.common = RStructuralStaticTrussModel::build(physicalModel,true,false);
     }
     else
@@ -342,6 +418,83 @@ QString cableDynamicsSystemFingerprint(const RModel &model,
         data.common.deadNodalLoads,options);
 }
 
+std::vector<double> totalCableExternalForces(
+    const CableModelData &data,const std::vector<double> &additionalNodalForces)
+{
+    std::vector<double> forces = data.common.deadNodalLoads;
+    if (!additionalNodalForces.empty() &&
+        additionalNodalForces.size() != forces.size())
+    {
+        fail("Cable transient additional nodal-force vector does not match the xyz DOF count.");
+    }
+    for (std::size_t dof=0;dof<additionalNodalForces.size();dof++)
+    {
+        const double controlForce = additionalNodalForces[dof];
+        if (!std::isfinite(controlForce))
+            fail("Cable transient additional nodal force is non-finite.");
+        forces[dof] += controlForce;
+        if (!std::isfinite(forces[dof]))
+            fail("Cable transient total nodal force is non-finite.");
+    }
+    return forces;
+}
+
+void refreshCableAcceptedAcceleration(
+    const CableModelData &data,
+    const std::vector<double> &displacements,
+    const std::vector<double> &externalForces,
+    std::vector<double> &accelerations)
+{
+    const std::size_t nDofs = std::size_t(3)*data.common.nodes.size();
+    if (displacements.size() != nDofs || accelerations.size() != nDofs ||
+        externalForces.size() != nDofs || data.common.prescribedMask.size() != nDofs)
+    {
+        fail("Cable transient accepted acceleration refresh received inconsistent state dimensions.");
+    }
+
+    std::vector<double> internalForces(nDofs,0.0);
+    for (const RStructuralCableEquilibriumMember &member : data.members)
+    {
+        RStructuralCableVector3 node1{},node2{};
+        for (std::size_t axis=0;axis<3;axis++)
+        {
+            node1[axis] = data.common.nodes[member.node1][axis]+
+                          displacements[std::size_t(member.node1)*3+axis];
+            node2[axis] = data.common.nodes[member.node2][axis]+
+                          displacements[std::size_t(member.node2)*3+axis];
+        }
+        const RStructuralCableKernelResult response = RStructuralCableKernel::evaluate(
+            node1,node2,member.referenceLength,member.initialTension,
+            member.axialRigidity);
+        const std::size_t dofs[6] = {
+            std::size_t(member.node1)*3,std::size_t(member.node1)*3+1,
+            std::size_t(member.node1)*3+2,std::size_t(member.node2)*3,
+            std::size_t(member.node2)*3+1,std::size_t(member.node2)*3+2
+        };
+        for (std::size_t local=0;local<6;local++)
+        {
+            internalForces[dofs[local]] += response.internalForce[local];
+            if (!std::isfinite(internalForces[dofs[local]]))
+                fail("Cable transient accepted internal force is non-finite during acceleration refresh.");
+        }
+    }
+
+    for (std::size_t dof=0;dof<nDofs;dof++)
+    {
+        if (data.common.prescribedMask[dof])
+        {
+            accelerations[dof] = 0.0;
+            continue;
+        }
+        const double mass = data.nodalLumpedMass[dof/3];
+        if (!std::isfinite(mass) || mass <= 0.0)
+            fail("Cable transient free DOF needs positive lumped mass for acceleration refresh.");
+        accelerations[dof] = (externalForces[dof]-internalForces[dof])/mass;
+        if (!std::isfinite(accelerations[dof]))
+            fail("Cable transient right-limit acceleration is non-finite after a control-force change.");
+    }
+}
+
 }
 
 void RStructuralCableModelAdapter::validate(const RModel &model)
@@ -362,6 +515,17 @@ void RStructuralCableModelAdapter::validate(const RModel &model)
     }
 }
 
+QString RStructuralCableModelAdapter::computeDynamicsSystemFingerprint(const RModel &model)
+{
+    const CableModelData data = buildCableModelData(model,true);
+    return cableDynamicsSystemFingerprint(model,data,cableDynamicsOptions(model));
+}
+
+std::vector<bool> RStructuralCableModelAdapter::prescribedDofMask(const RModel &model)
+{
+    return buildCableModelData(model,true).common.prescribedMask;
+}
+
 RStructuralCableEquilibriumResult RStructuralCableModelAdapter::solve(const RModel &model)
 {
     const CableModelData data = buildCableModelData(model,false);
@@ -380,7 +544,9 @@ RStructuralCableDynamicsResult RStructuralCableModelAdapter::solveDynamics(
     const RModel &model,
     const std::vector<double> &previousDisplacements,
     const std::vector<double> &previousVelocities,
-    const std::vector<double> &previousAccelerations)
+    const std::vector<double> &previousAccelerations,
+    const std::vector<double> &additionalNodalForces,
+    bool refreshAcceptedAcceleration)
 {
     const CableModelData data = buildCableModelData(model,true);
     const RStructuralCableDynamicsOptions options = cableDynamicsOptions(model);
@@ -392,11 +558,19 @@ RStructuralCableDynamicsResult RStructuralCableModelAdapter::solveDynamics(
         model,fingerprint,data.common.deadNodalLoads,
         acceptedDisplacements,acceptedVelocities,acceptedAccelerations);
 
+    const std::vector<double> externalForces =
+        totalCableExternalForces(data,additionalNodalForces);
+    if (refreshAcceptedAcceleration)
+    {
+        refreshCableAcceptedAcceleration(data,acceptedDisplacements,externalForces,
+                                         acceptedAccelerations);
+    }
+
     return RStructuralCableDynamicsSolver::step(
         data.common.nodes,data.members,data.nodalLumpedMass,
         acceptedDisplacements,acceptedVelocities,acceptedAccelerations,
         data.common.prescribedMask,data.common.prescribedDisplacements,
-        data.common.deadNodalLoads,options);
+        externalForces,options);
 }
 
 void RStructuralCableModelAdapter::clearResults(RModel &model)
@@ -443,11 +617,14 @@ void RStructuralCableModelAdapter::publishDynamics(
     // outputs through a clean, temporary copy in that case.
     const RProblemSetup &problemSetup = model.getProblemSetup();
     if (problemSetup.getRestart() ||
-        problemSetup.getStructuralDynamicsRestartData().available)
+        problemSetup.getStructuralDynamicsRestartData().available ||
+        problemSetup.getStructuralControlSetup().enabled)
     {
         RModel publicationModel(model);
         publicationModel.getProblemSetup().setRestart(false);
         publicationModel.getProblemSetup().getStructuralDynamicsRestartData().clear();
+        if (problemSetup.getStructuralControlSetup().enabled)
+            clearControlCatalogForTrussExtraction(publicationModel);
         RStructuralStaticTrussModel::publishMechanical(
             publicationModel,result.displacements,result.internalForces,
             result.elementTensions,true);

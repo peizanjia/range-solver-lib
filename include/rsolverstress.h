@@ -292,6 +292,8 @@ class RSolverStress : public RSolverGeneric
         void setPrescribedMotionResults(double time);
         void prepareSupportResponse();
         void prepareControlMapping();
+        void prepareCableControlMapping();
+        void solveStructuralCableDynamics();
         QString controlMappingFingerprint() const;
         QString controlCatalogFingerprint() const;
         std::vector<RStructuralControlSensorSample> sampleControlSensors(

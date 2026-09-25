@@ -1,6 +1,8 @@
 #ifndef RSTRUCTURAL_CABLE_MODEL_ADAPTER_H
 #define RSTRUCTURAL_CABLE_MODEL_ADAPTER_H
 
+#include <QString>
+
 #include "rstructural_cable_dynamics.h"
 
 class RModel;
@@ -20,7 +22,15 @@ class RStructuralCableModelAdapter
             const RModel &model,
             const std::vector<double> &previousDisplacements,
             const std::vector<double> &previousVelocities,
-            const std::vector<double> &previousAccelerations);
+            const std::vector<double> &previousAccelerations,
+            const std::vector<double> &additionalNodalForces = {},
+            bool refreshAcceptedAcceleration = false);
+
+        //! Fingerprint the exact physical data used by the cable Newmark FE path.
+        static QString computeDynamicsSystemFingerprint(const RModel &model);
+
+        //! Return the flattened xyz mask of fixed cable translations.
+        static std::vector<bool> prescribedDofMask(const RModel &model);
 
         //! Remove prior cable outputs so a failed repeat solve cannot leave a stale result.
         static void clearResults(RModel &model);

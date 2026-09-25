@@ -1095,10 +1095,36 @@ void RSolverStress::validateRunConfiguration() const
     }
     RStructuralCableModelAdapter::validate(*this->pModel);
     RStructuralPiezoModelAdapter::validate(*this->pModel);
-    if (this->supportResponseObserver || this->controlCallback || this->controlStepObserver)
+    const bool cableControlEnabled = cableDynamicsEnabled &&
+        this->pModel->getProblemSetup().getStructuralControlSetup().enabled;
+    if (this->supportResponseObserver ||
+        ((this->controlCallback || this->controlStepObserver) && !cableControlEnabled))
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Structural support/control observers are unsupported in static cable/piezo mode.");
+                     "Structural support response and control are supported only for transient cable NodalForce v1.");
+    }
+    if (cableDynamicsEnabled)
+    {
+        const RStructuralControlSetup &controlSetup =
+            this->pModel->getProblemSetup().getStructuralControlSetup();
+        if (controlSetup.enabled &&
+            (!this->controlCallback || this->controllerId != controlSetup.controllerId ||
+             this->controllerRevision.isEmpty()))
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Enabled cable control requires a matching NodalForce callback and nonempty revision fingerprint.");
+        }
+        if (!controlSetup.enabled && this->controlCallback)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Registered cable control callback requires enabled NodalForce control setup.");
+        const RStructuralDynamicsRestartData &checkpoint =
+            this->pModel->getProblemSetup().getStructuralDynamicsRestartData();
+        const bool controlEnabled = controlSetup.enabled;
+        if (checkpoint.available && controlEnabled != checkpoint.controlAvailable)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable dynamics control setup does not match the persisted accepted control ledger.");
+        }
     }
 
     const RStructuralPiezoSetup &piezoSetup =
@@ -2386,35 +2412,209 @@ void RSolverStress::prepare()
     this->applyLinearConstraints();
 }
 
+void RSolverStress::solveStructuralCableDynamics()
+{
+    if (!this->isStructuralCableDynamicsMode())
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Cable Newmark step requested outside transient TRUSS1 cable mode.");
+    RStructuralCableModelAdapter::validate(*this->pModel);
+
+    const std::size_t nDofs = std::size_t(3)*this->pModel->getNNodes();
+    std::vector<double> previousDisplacements(nDofs,0.0);
+    std::vector<double> previousVelocities(nDofs,0.0);
+    std::vector<double> previousAccelerations(nDofs,0.0);
+    for (uint node=0;node<this->pModel->getNNodes();node++)
+    {
+        previousDisplacements[3*node] = this->nodeDisplacement.x[node];
+        previousDisplacements[3*node+1] = this->nodeDisplacement.y[node];
+        previousDisplacements[3*node+2] = this->nodeDisplacement.z[node];
+        previousVelocities[3*node] = this->nodeVelocity.x[node];
+        previousVelocities[3*node+1] = this->nodeVelocity.y[node];
+        previousVelocities[3*node+2] = this->nodeVelocity.z[node];
+        previousAccelerations[3*node] = this->nodeAcceleration.x[node];
+        previousAccelerations[3*node+1] = this->nodeAcceleration.y[node];
+        previousAccelerations[3*node+2] = this->nodeAcceleration.z[node];
+    }
+
+    const RStructuralControlSetup &controlSetup =
+        this->pModel->getProblemSetup().getStructuralControlSetup();
+    if (controlSetup.enabled)
+    {
+        const double controlScales[] = {
+            this->scales.getMetre(),
+            this->scales.getKilogram(),
+            this->scales.getSecond(),
+            this->scales.findScaleFactor(R_VARIABLE_DISPLACEMENT_X),
+            this->scales.findScaleFactor(R_VARIABLE_VELOCITY_X),
+            this->scales.findScaleFactor(R_VARIABLE_ACCELERATION_X),
+            this->scales.findScaleFactor(R_VARIABLE_FORCE_X)
+        };
+        if (!std::all_of(controlScales,controlScales+sizeof(controlScales)/sizeof(controlScales[0]),
+                         [](double value){return std::isfinite(value) && value == 1.0;}))
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Transient cable NodalForce control currently requires unity metre/kilogram/second FE scales.");
+        }
+        if (!this->controlCallback)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Enabled cable structural control has no registered NodalForce provider.");
+        if (!this->controlForceMap)
+            this->prepareControlMapping();
+        if (!this->cachedControlCatalogFingerprint.isEmpty() &&
+            this->controlCatalogFingerprint() != this->cachedControlCatalogFingerprint)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable control callback changed the frozen sensor/actuator catalog.");
+
+        const double dt = this->pModel->getTimeSolver().getCurrentTimeStepSize();
+        const double timeScale = this->scales.getSecond();
+        if (!std::isfinite(dt) || dt <= 0.0 || !std::isfinite(timeScale) || timeScale <= 0.0)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable NodalForce control requires a finite positive physical time step.");
+        const double acceptedModelTime = this->pModel->getTimeSolver().getPreviousTime();
+        const double nextModelTime = this->pModel->getTimeSolver().getCurrentTime();
+        const double physicalDt = dt/timeScale;
+        if (!std::isfinite(acceptedModelTime) || !std::isfinite(nextModelTime) ||
+            std::fabs((nextModelTime-acceptedModelTime)-dt) >
+                1.0e-10*std::max({1.0,std::fabs(nextModelTime),
+                                   std::fabs(acceptedModelTime),dt}))
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable control observation time does not match the accepted Newmark interval.");
+        }
+
+        RStructuralDynamicsState accepted;
+        accepted.time = acceptedModelTime;
+        accepted.q = RRVector(previousDisplacements);
+        accepted.v = RRVector(previousVelocities);
+        accepted.a = RRVector(previousAccelerations);
+        if (!std::all_of(previousDisplacements.begin(),previousDisplacements.end(),
+                         [](double value){return std::isfinite(value);}) ||
+            !std::all_of(previousVelocities.begin(),previousVelocities.end(),
+                         [](double value){return std::isfinite(value);}) ||
+            !std::all_of(previousAccelerations.begin(),previousAccelerations.end(),
+                         [](double value){return std::isfinite(value);}))
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable control cannot observe non-finite accepted nodal kinematics.");
+        }
+        RStructuralControlObservation observation;
+        observation.acceptedTime = accepted.time/timeScale;
+        observation.nextTime = nextModelTime/timeScale;
+        observation.deterministicSeed = controlSetup.deterministicSeed;
+        observation.sensors = this->sampleControlSensors(accepted);
+        for (const RStructuralControlSensorSample &sensor : observation.sensors)
+        {
+            if (!std::isfinite(sensor.value))
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Cable control sensor '%s' observed a non-finite accepted value.",
+                             sensor.sensorId.toUtf8().constData());
+        }
+        observation.priorControllerState = this->acceptedControllerState;
+
+        const RStructuralControlDecision decision = this->controlCallback(observation);
+        if (this->controlCatalogFingerprint() != this->cachedControlCatalogFingerprint)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Structural control callback changed the frozen sensor/actuator catalog.");
+        if (this->controlMappingFingerprint() != this->cachedControlFingerprint)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable control callback changed the frozen physical system or NodalForce mapping.");
+        if (decision.requestedCommands.size() != this->activeControlCommands.size() ||
+            decision.nextControllerState.size() > 1024*1024)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable control provider returned the wrong NodalForce channel count or oversized controller state.");
+
+        const RStructuralControlConditioner::Result conditioned =
+            this->controlConditioner->advance(this->acceptedConditionerState,
+                                              decision.requestedCommands);
+        this->candidateConditionerState = conditioned.candidate;
+        std::vector<RStructuralControlCommand> applied;
+        applied.reserve(conditioned.appliedCommands.size());
+        const auto &actuators = this->pModel->getProblemSetup()
+            .getStructuralInteractionSetup().getActuators();
+        bool changed = false;
+        for (size_t i=0;i<conditioned.appliedCommands.size();i++)
+        {
+            const RStructuralControlCommand &request = conditioned.appliedCommands[i];
+            const RStructuralActuator &actuator = actuators[i];
+            if (request.actuatorId != this->activeControlCommands[i].actuatorId ||
+                !std::isfinite(request.value) || std::isnan(actuator.minimum) ||
+                std::isnan(actuator.maximum) || std::isnan(actuator.rateLimit) ||
+                actuator.minimum > actuator.maximum || actuator.rateLimit < 0.0)
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Cable NodalForce command or actuator bounds are invalid for '%s'.",
+                             actuator.id.toUtf8().constData());
+            }
+            const double previous = this->controlLedger->accepted()[i].command;
+            const double maxDelta = actuator.rateLimit*physicalDt;
+            const double lower = std::max(actuator.minimum,previous-maxDelta);
+            const double upper = std::min(actuator.maximum,previous+maxDelta);
+            if (lower > upper)
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Cable NodalForce actuator '%s' has incompatible magnitude and rate limits.",
+                             actuator.id.toUtf8().constData());
+            const double value = std::clamp(request.value,lower,upper);
+            changed = changed || value != this->activeControlCommands[i].value;
+            applied.push_back({request.actuatorId,value});
+        }
+        if (changed)
+        {
+            RRVector force(uint(nDofs),0.0);
+            this->controlForceMap->addForce(applied,force);
+            this->activeControlForce = std::move(force);
+            this->activeControlCommands = applied;
+        }
+
+        // Stage controller and conditioner state before the nonlinear solve.
+        // RSolverGeneric's accepted-step transaction restores both on failure.
+        this->candidateControllerState = decision.nextControllerState;
+        this->trialControlRecord = {};
+        this->trialControlRecord.acceptedTime = observation.acceptedTime;
+        this->trialControlRecord.nextTime = observation.nextTime;
+        this->trialControlRecord.sensors = observation.sensors;
+        this->trialControlRecord.requestedCommands = decision.requestedCommands;
+        this->trialControlRecord.conditionedCommands = conditioned.appliedCommands;
+        this->trialControlRecord.controllerStateSha256 =
+            QCryptographicHash::hash(decision.nextControllerState,
+                                     QCryptographicHash::Sha256).toHex();
+
+        std::vector<double> additionalNodalForces(nDofs,0.0);
+        for (std::size_t dof=0;dof<nDofs;dof++)
+            additionalNodalForces[dof] = this->activeControlForce[uint(dof)];
+        this->structuralCableDynamicsResultReady = false;
+        this->structuralCableDynamicsResult =
+            RStructuralCableModelAdapter::solveDynamics(
+                *this->pModel,previousDisplacements,previousVelocities,
+                previousAccelerations,additionalNodalForces,changed);
+
+        this->controlLedger->trial(*this->controlForceMap,this->activeControlCommands,
+            RRVector(previousVelocities),RRVector(this->structuralCableDynamicsResult.velocities),
+            physicalDt);
+        this->trialControlRecord.appliedChannels = this->controlLedger->candidate();
+    }
+    else
+    {
+        const RStructuralDynamicsRestartData &restartData =
+            this->pModel->getProblemSetup().getStructuralDynamicsRestartData();
+        if (restartData.available && restartData.controlAvailable)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable restart contains an accepted control ledger but no NodalForce control setup is enabled.");
+        this->structuralCableDynamicsResultReady = false;
+        this->structuralCableDynamicsResult =
+            RStructuralCableModelAdapter::solveDynamics(
+                *this->pModel,previousDisplacements,previousVelocities,
+                previousAccelerations);
+    }
+    this->structuralCableDynamicsResultReady = true;
+}
+
 void RSolverStress::solve()
 {
     try
     {
         if (this->isStructuralCableDynamicsMode())
         {
-            RStructuralCableModelAdapter::validate(*this->pModel);
-            const std::size_t nDofs = std::size_t(3)*this->pModel->getNNodes();
-            std::vector<double> previousDisplacements(nDofs,0.0);
-            std::vector<double> previousVelocities(nDofs,0.0);
-            std::vector<double> previousAccelerations(nDofs,0.0);
-            for (uint node=0;node<this->pModel->getNNodes();node++)
-            {
-                previousDisplacements[3*node] = this->nodeDisplacement.x[node];
-                previousDisplacements[3*node+1] = this->nodeDisplacement.y[node];
-                previousDisplacements[3*node+2] = this->nodeDisplacement.z[node];
-                previousVelocities[3*node] = this->nodeVelocity.x[node];
-                previousVelocities[3*node+1] = this->nodeVelocity.y[node];
-                previousVelocities[3*node+2] = this->nodeVelocity.z[node];
-                previousAccelerations[3*node] = this->nodeAcceleration.x[node];
-                previousAccelerations[3*node+1] = this->nodeAcceleration.y[node];
-                previousAccelerations[3*node+2] = this->nodeAcceleration.z[node];
-            }
-            this->structuralCableDynamicsResultReady = false;
-            this->structuralCableDynamicsResult =
-                RStructuralCableModelAdapter::solveDynamics(
-                    *this->pModel,previousDisplacements,previousVelocities,
-                    previousAccelerations);
-            this->structuralCableDynamicsResultReady = true;
+            this->solveStructuralCableDynamics();
         }
         else if (this->isStructuralCableMode())
         {
@@ -2679,6 +2879,11 @@ std::vector<RStructuralDofRef> RSolverStress::orderedPhysicalDofs() const
 void RSolverStress::prepareControlMapping()
 {
     if (this->controlForceMap) return;
+    if (this->isStructuralCableDynamicsMode())
+    {
+        this->prepareCableControlMapping();
+        return;
+    }
     const auto &catalog = this->pModel->getProblemSetup().getStructuralInteractionSetup();
     const auto &actuators = catalog.getActuators();
     const auto &sensors = catalog.getSensors();
@@ -2836,6 +3041,189 @@ void RSolverStress::prepareControlMapping()
     this->cachedControlFingerprint = this->controlMappingFingerprint();
 }
 
+void RSolverStress::prepareCableControlMapping()
+{
+    if (!this->isStructuralCableDynamicsMode())
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Full-nodal control mapping is available only for transient TRUSS1 cable mode.");
+    const auto &catalog = this->pModel->getProblemSetup().getStructuralInteractionSetup();
+    const auto &actuators = catalog.getActuators();
+    const auto &sensors = catalog.getSensors();
+    if (actuators.empty())
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Enabled cable control needs at least one point-node global NodalForce actuator.");
+
+    const uint n = 3*this->pModel->getNNodes();
+    const std::vector<bool> prescribed =
+        RStructuralCableModelAdapter::prescribedDofMask(*this->pModel);
+    if (prescribed.size() != n)
+        throw RError(RError::Type::Application,R_ERROR_REF,
+                     "Cable control map received a mismatched physical DOF mask.");
+
+    auto unitDirection = [](const RR3Vector &input,const QString &id) -> RR3Vector
+    {
+        const double norm = input.length();
+        if (!std::isfinite(norm) || norm <= 1.0e-12)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Control target '%s' needs a finite nonzero global direction.",
+                         id.toUtf8().constData());
+        return RR3Vector(input[0]/norm,input[1]/norm,input[2]/norm);
+    };
+    auto directWeights = [&prescribed,n](uint node,const RR3Vector &direction,
+                                         const QString &id,bool requireFreeDofs)
+        -> std::vector<std::pair<uint,double>>
+    {
+        if (node >= n/3)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Control target '%s' references a missing cable node.",
+                         id.toUtf8().constData());
+        std::vector<std::pair<uint,double>> weights;
+        for (uint axis=0;axis<3;axis++)
+        {
+            const double value = direction[axis];
+            if (std::fabs(value) <= 1.0e-14) continue;
+            const uint dof = 3*node+axis;
+            if (requireFreeDofs && prescribed[dof])
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Control target '%s' includes a fixed cable translation DOF.",
+                             id.toUtf8().constData());
+            weights.emplace_back(dof,value);
+        }
+        if (weights.empty())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Control target '%s' has no free global cable translation DOF.",
+                         id.toUtf8().constData());
+        return weights;
+    };
+
+    std::vector<RStructuralControlChannelMap> channels;
+    channels.reserve(actuators.size());
+    for (const RStructuralActuator &actuator : actuators)
+    {
+        if (actuator.type != RStructuralActuatorType::NodalForce ||
+            actuator.target.scope != RStructuralTargetScope::Node ||
+            actuator.frame != RStructuralFrame::Global)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable control actuator '%s' requires point-node global NodalForce v1.",
+                         actuator.id.toUtf8().constData());
+        }
+        RR3Vector direction = actuator.direction;
+        switch (actuator.variable)
+        {
+            case R_VARIABLE_FORCE_X: direction = RR3Vector(1.0,0.0,0.0); break;
+            case R_VARIABLE_FORCE_Y: direction = RR3Vector(0.0,1.0,0.0); break;
+            case R_VARIABLE_FORCE_Z: direction = RR3Vector(0.0,0.0,1.0); break;
+            case R_VARIABLE_FORCE: direction = unitDirection(direction,actuator.id); break;
+            default:
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Cable control actuator '%s' command must be a physical NodalForce component.",
+                             actuator.id.toUtf8().constData());
+        }
+        channels.push_back({actuator.id,
+            directWeights(actuator.target.nodeId,direction,actuator.id,true)});
+    }
+
+    this->controlSensors.clear();
+    this->controlSensors.reserve(sensors.size());
+    for (const RStructuralSensor &sensor : sensors)
+    {
+        if (sensor.target.scope != RStructuralTargetScope::Node ||
+            sensor.aggregation != RStructuralSensorAggregation::Point ||
+            sensor.frame != RStructuralFrame::Global ||
+            (sensor.quantity != RStructuralSensorQuantity::Displacement &&
+             sensor.quantity != RStructuralSensorQuantity::Velocity &&
+             sensor.quantity != RStructuralSensorQuantity::Acceleration))
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable control sensor '%s' requires point-node global displacement, velocity or acceleration v1.",
+                         sensor.id.toUtf8().constData());
+        }
+        const RR3Vector direction = unitDirection(sensor.direction,sensor.id);
+        this->controlSensors.push_back({sensor.id,sensor.quantity,sensor.unit,
+            directWeights(sensor.target.nodeId,direction,sensor.id,false),0.0});
+    }
+
+    this->controlForceMap.reset(new RStructuralControlForceMap(
+        n,this->scales.findScaleFactor(R_VARIABLE_FORCE_X),
+        this->scales.findScaleFactor(R_VARIABLE_VELOCITY_X),std::move(channels)));
+    this->controlLedger.reset(new RStructuralControlLedger(*this->controlForceMap));
+    std::vector<RStructuralControlConditioningPolicy> policies;
+    policies.reserve(actuators.size());
+    std::map<QString,size_t> positions;
+    for (const auto &channel : this->controlForceMap->getChannels())
+    {
+        positions.emplace(channel.actuatorId,policies.size());
+        policies.push_back({channel.actuatorId,0,1,0.0});
+    }
+    const RStructuralControlSetup &controlSetup =
+        this->pModel->getProblemSetup().getStructuralControlSetup();
+    for (const auto &configured : controlSetup.channelConditioning)
+    {
+        const auto position = positions.find(configured.actuatorId);
+        if (position == positions.end())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Control conditioner references unknown actuator '%s'.",
+                         configured.actuatorId.toUtf8().constData());
+        policies[position->second] = {configured.actuatorId,configured.delaySteps,
+                                      configured.holdSteps,configured.noiseAmplitude};
+    }
+    this->controlConditioner.reset(new RStructuralControlConditioner(
+        controlSetup.deterministicSeed,std::move(policies)));
+    this->acceptedConditionerState = this->controlConditioner->initialState();
+    this->candidateConditionerState = this->acceptedConditionerState;
+    this->acceptedControllerState.clear();
+    this->candidateControllerState.clear();
+    this->activeControlCommands.clear();
+    for (const auto &channel : this->controlForceMap->getChannels())
+        this->activeControlCommands.push_back({channel.actuatorId,0.0});
+    this->activeControlForce.resize(n,0.0);
+    this->cachedControlCatalogFingerprint = this->controlCatalogFingerprint();
+    this->cachedControlFingerprint = this->controlMappingFingerprint();
+
+    if (this->pModel->getProblemSetup().getRestart())
+    {
+        const RStructuralDynamicsRestartData &restartData =
+            this->pModel->getProblemSetup().getStructuralDynamicsRestartData();
+        if (!restartData.controlAvailable ||
+            restartData.controlProtocolVersion != controlSetup.controlProtocolVersion ||
+            restartData.controlDeterministicSeed != controlSetup.deterministicSeed ||
+            restartData.controlFingerprint != this->cachedControlFingerprint ||
+            restartData.controlChannelIds.size() != this->activeControlCommands.size())
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable control restart protocol, seed, actuator map or ledger does not match.");
+        }
+        std::vector<RStructuralControlChannelSample> samples;
+        samples.reserve(this->activeControlCommands.size());
+        for (size_t i=0;i<this->activeControlCommands.size();i++)
+        {
+            if (restartData.controlChannelIds[i] != this->activeControlCommands[i].actuatorId)
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Cable control restart actuator order changed.");
+            samples.push_back({restartData.controlChannelIds[i],
+                               restartData.controlLastCommands[i],
+                               restartData.controlPowers[i],
+                               restartData.cumulativeControlWork[i]});
+            this->activeControlCommands[i].value = restartData.controlLastCommands[i];
+        }
+        this->controlLedger->restore(samples);
+        const RStructuralControlStateEnvelope envelope =
+            RStructuralControlStateEnvelope::deserialize(restartData.controlControllerState);
+        this->acceptedControllerState = envelope.controllerState;
+        this->candidateControllerState = this->acceptedControllerState;
+        this->acceptedConditionerState = this->controlConditioner->deserialize(
+            envelope.conditionerState);
+        this->candidateConditionerState = this->acceptedConditionerState;
+        if (this->acceptedConditionerState.completedSteps != restartData.completedSteps)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable control restart conditioner step count differs from its accepted checkpoint.");
+        this->activeControlForce.fill(0.0);
+        this->controlForceMap->addForce(this->activeControlCommands,
+                                        this->activeControlForce);
+    }
+}
+
 QString RSolverStress::controlCatalogFingerprint() const
 {
     QCryptographicHash hash(QCryptographicHash::Sha256);
@@ -2909,7 +3297,15 @@ QString RSolverStress::controlMappingFingerprint() const
     hash.addData(this->controllerRevision.toUtf8()); hash.addData(";");
     hash.addData(this->controlConditioner->configurationSha256().toHex()); hash.addData(";");
     hash.addData(QByteArray::number(setup.deterministicSeed)); hash.addData(";");
-    hash.addData(this->dynamicSystemFingerprint().toUtf8()); hash.addData(";");
+    hash.addData((this->isStructuralCableDynamicsMode()
+        ? RStructuralCableModelAdapter::computeDynamicsSystemFingerprint(*this->pModel)
+        : this->dynamicSystemFingerprint()).toUtf8()); hash.addData(";");
+    if (this->isStructuralCableDynamicsMode())
+    {
+        // The exact catalog digest also binds fields which are intentionally
+        // not representable in the NodalForce map (for example named targets).
+        hash.addData(this->controlCatalogFingerprint().toUtf8()); hash.addData(";");
+    }
     const auto &actuators = this->pModel->getProblemSetup().getStructuralInteractionSetup().getActuators();
     for (size_t i=0;i<actuators.size();i++)
     {
@@ -4893,6 +5289,34 @@ void RSolverStress::store()
         }
         RStructuralCableModelAdapter::publishDynamics(
             *this->pModel,this->structuralCableDynamicsResult);
+        if (this->controlForceMap)
+        {
+            RStructuralDynamicsRestartData &checkpoint =
+                this->pModel->getProblemSetup().getStructuralDynamicsRestartData();
+            const RStructuralControlSetup &controlSetup =
+                this->pModel->getProblemSetup().getStructuralControlSetup();
+            checkpoint.controlAvailable = true;
+            checkpoint.controlProtocolVersion = controlSetup.controlProtocolVersion;
+            checkpoint.controlFingerprint = this->cachedControlFingerprint;
+            checkpoint.controlChannelIds.clear();
+            checkpoint.controlLastCommands.clear();
+            checkpoint.controlPowers.clear();
+            checkpoint.cumulativeControlWork.clear();
+            checkpoint.controlControllerState = RStructuralControlStateEnvelope{
+                this->candidateControllerState,
+                this->controlConditioner->serialize(this->candidateConditionerState)
+            }.serialize();
+            checkpoint.controlDeterministicSeed = controlSetup.deterministicSeed;
+            for (const RStructuralControlChannelSample &sample :
+                 this->controlLedger->candidate())
+            {
+                checkpoint.controlChannelIds.push_back(sample.actuatorId);
+                checkpoint.controlLastCommands.push_back(sample.command);
+                checkpoint.controlPowers.push_back(sample.endpointPower);
+                checkpoint.cumulativeControlWork.push_back(sample.cumulativeWork);
+            }
+            checkpoint.validate();
+        }
         return;
     }
     if (this->isStructuralPiezoMode())
