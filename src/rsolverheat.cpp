@@ -39,6 +39,105 @@ void requireFiniteVector(const RRVector &values, const char *name)
     }
 }
 
+double referenceMassJacobian(const RElement &element,
+                             const std::vector<RNode> &referenceNodes,
+                             uint integrationPoint,
+                             uint elementId)
+{
+    const RElementShapeFunction &shapeFunction =
+        RElement::getShapeFunction(element.getType(),integrationPoint);
+    const RRMatrix &dN = shapeFunction.getDN();
+    double characteristicLength = 0.0;
+    for (uint i=0;i<element.size();i++)
+    {
+        const RNode &first = referenceNodes[element.getNodeId(i)];
+        if (!std::isfinite(first.getX()) || !std::isfinite(first.getY()) ||
+            !std::isfinite(first.getZ()))
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Reference thermal mass has non-finite geometry on element %u.",
+                         elementId);
+        }
+        for (uint j=i+1;j<element.size();j++)
+        {
+            const RNode &second = referenceNodes[element.getNodeId(j)];
+            const double distance = std::hypot(first.getX()-second.getX(),
+                                               first.getY()-second.getY(),
+                                               first.getZ()-second.getZ());
+            if (!std::isfinite(distance))
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Reference thermal mass has non-finite geometry on element %u.",
+                             elementId);
+            }
+            characteristicLength = std::max(characteristicLength,distance);
+        }
+    }
+
+    const uint dimension = R_ELEMENT_TYPE_IS_SURFACE(element.getType()) ? 2U : 3U;
+    const double scale = std::pow(characteristicLength,double(dimension));
+    const double minimumJacobian = 128.0*std::numeric_limits<double>::epsilon()*scale;
+    if (!std::isfinite(scale) || characteristicLength <= 0.0)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Reference thermal mass has degenerate or invalid geometry on element %u.",
+                     elementId);
+    }
+
+    // Compute the geometric measure directly in global coordinates. Surface
+    // elements use the tangent cross product, avoiding an arbitrary corner
+    // frame; volumes use the signed 3D isoparametric Jacobian.
+    double detJ = 0.0;
+    const RNode &origin = referenceNodes[element.getNodeId(0)];
+    if (R_ELEMENT_TYPE_IS_SURFACE(element.getType()))
+    {
+        RR3Vector firstTangent(0.0,0.0,0.0);
+        RR3Vector secondTangent(0.0,0.0,0.0);
+        for (uint node=0;node<element.size();node++)
+        {
+            const RNode &position = referenceNodes[element.getNodeId(node)];
+            firstTangent[0] += dN[node][0]*(position.getX()-origin.getX());
+            firstTangent[1] += dN[node][0]*(position.getY()-origin.getY());
+            firstTangent[2] += dN[node][0]*(position.getZ()-origin.getZ());
+            secondTangent[0] += dN[node][1]*(position.getX()-origin.getX());
+            secondTangent[1] += dN[node][1]*(position.getY()-origin.getY());
+            secondTangent[2] += dN[node][1]*(position.getZ()-origin.getZ());
+        }
+        const double crossX = firstTangent[1]*secondTangent[2]-firstTangent[2]*secondTangent[1];
+        const double crossY = firstTangent[2]*secondTangent[0]-firstTangent[0]*secondTangent[2];
+        const double crossZ = firstTangent[0]*secondTangent[1]-firstTangent[1]*secondTangent[0];
+        detJ = std::hypot(crossX,crossY,crossZ);
+    }
+    else
+    {
+        RRMatrix jacobian(dimension,dimension);
+        jacobian.fill(0.0);
+        for (uint naturalAxis=0;naturalAxis<dimension;naturalAxis++)
+        {
+            for (uint physicalAxis=0;physicalAxis<dimension;physicalAxis++)
+            {
+                for (uint node=0;node<element.size();node++)
+                {
+                    const RNode &position = referenceNodes[element.getNodeId(node)];
+                    const double coordinate = physicalAxis == 0
+                        ? position.getX()-origin.getX()
+                        : physicalAxis == 1 ? position.getY()-origin.getY()
+                        : position.getZ()-origin.getZ();
+                    jacobian[naturalAxis][physicalAxis] += dN[node][naturalAxis]*coordinate;
+                }
+            }
+        }
+        detJ = jacobian.getDeterminant();
+    }
+    if (!std::isfinite(detJ) || detJ <= minimumJacobian)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Reference thermal mass has degenerate or invalid geometry on element %u.",
+                     elementId);
+    }
+    return detJ;
+}
+
 }
 
 RSolverHeat::RSolverHeat(RModel *pModel, const QString &modelFileName, const QString &convergenceFileName, RSolverSharedData &sharedData)
@@ -78,6 +177,11 @@ void RSolverHeat::setControlledPointHeat(
 void RSolverHeat::setReferenceLineThermalMass(bool enabled)
 {
     this->referenceLineThermalMass = enabled;
+}
+
+void RSolverHeat::setReferenceSurfaceVolumeThermalMass(bool enabled)
+{
+    this->referenceSurfaceVolumeThermalMass = enabled;
 }
 
 void RSolverHeat::findComputableElements(RProblemType problemType)
@@ -301,6 +405,41 @@ void RSolverHeat::recover()
 void RSolverHeat::prepare()
 {
     const bool timeSolverEnabled = this->pModel->getTimeSolver().getEnabled();
+    const bool useReferenceSurfaceVolumeMass = timeSolverEnabled &&
+        this->referenceSurfaceVolumeThermalMass;
+
+    // RSolverGeneric::run applies the stored displacement before a heat solve.
+    // Reconstruct the reference coordinates once, while the model is in the
+    // same scaled coordinate system used by the current-geometry assembly.
+    std::vector<RNode> referenceNodes;
+    if (useReferenceSurfaceVolumeMass)
+    {
+        referenceNodes = this->pModel->getNodes();
+        const uint displacementPosition = this->pModel->findVariable(R_VARIABLE_DISPLACEMENT);
+        if (displacementPosition != RConstants::eod)
+        {
+            const RVariable &displacement = this->pModel->getVariable(displacementPosition);
+            if (displacement.getApplyType() != R_VARIABLE_APPLY_NODE ||
+                displacement.getNValues() != this->pModel->getNNodes() ||
+                displacement.getNVectors() != 3)
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Reference thermal mass requires three-component nodal displacement data.");
+            }
+            for (uint node=0;node<this->pModel->getNNodes();node++)
+            {
+                const double ux = displacement.getValue(0,node);
+                const double uy = displacement.getValue(1,node);
+                const double uz = displacement.getValue(2,node);
+                if (!std::isfinite(ux) || !std::isfinite(uy) || !std::isfinite(uz))
+                {
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Reference thermal mass has non-finite displacement at node %u.",node);
+                }
+                referenceNodes[node].move(RR3Vector(-ux,-uy,-uz));
+            }
+        }
+    }
 
     RBVector temperatureSetValues;
     RBVector heatSetValues;
@@ -336,6 +475,40 @@ void RSolverHeat::prepare()
     this->generateMaterialVecor(RMaterialProperty::ThermalConductivity,this->elementConduction);
     this->generateMaterialVecor(RMaterialProperty::HeatCapacity,this->elementCapacity);
     this->generateMaterialVecor(RMaterialProperty::Density,this->elementDensity);
+
+    // Validate and cache the reference mass integration before entering any
+    // OpenMP element loops. Invalid reference geometry then fails the entire
+    // candidate solve before matrix assembly can partially proceed.
+    std::vector<std::vector<double>> referenceMassJacobians(this->pModel->getNElements());
+    if (useReferenceSurfaceVolumeMass)
+    {
+        auto cacheGroupJacobians = [&](const RElementGroup &group) {
+            for (uint i=0;i<group.size();i++)
+            {
+                const uint elementId = group.get(i);
+                if (!this->computableElements[elementId])
+                {
+                    continue;
+                }
+                const RElement &element = this->pModel->getElement(elementId);
+                const uint nIntegrationPoints = RElement::getNIntegrationPoints(element.getType());
+                std::vector<double> &jacobians = referenceMassJacobians[elementId];
+                jacobians.resize(nIntegrationPoints);
+                for (uint point=0;point<nIntegrationPoints;point++)
+                {
+                    jacobians[point] = referenceMassJacobian(element,referenceNodes,point,elementId);
+                }
+            }
+        };
+        for (uint i=0;i<this->pModel->getNSurfaces();i++)
+        {
+            cacheGroupJacobians(this->pModel->getSurface(i));
+        }
+        for (uint i=0;i<this->pModel->getNVolumes();i++)
+        {
+            cacheGroupJacobians(this->pModel->getVolume(i));
+        }
+    }
 
     this->pModel->convertElementToNodeVector(this->elementTemperature,temperatureSetValues,this->nodeTemperature,true);
 
@@ -579,6 +752,8 @@ void RSolverHeat::prepare()
                     const RRMatrix &dN = shapeFunc.getDN();
                     RRMatrix J, Rt;
                     double detJ = this->pModel->getElement(elementID).findJacobian(this->pModel->getNodes(),k,J,Rt);
+                    const double massDetJ = useReferenceSurfaceVolumeMass
+                        ? referenceMassJacobians[elementID][k] : detJ;
 
                     B.fill(0.0);
                     for (uint m=0;m<dN.getNRows();m++)
@@ -604,7 +779,7 @@ void RSolverHeat::prepare()
                                 Me[m][n] += N[m] * N[n]
                                          * this->elementDensity[elementID]
                                          * this->elementCapacity[elementID]
-                                         * detJ
+                                         * massDetJ
                                          * shapeFunc.getW()
                                          * surface.getThickness();
                             }
@@ -682,6 +857,8 @@ void RSolverHeat::prepare()
                     const RRMatrix &dN = shapeFunc.getDN();
                     RRMatrix J, Rt;
                     double detJ = this->pModel->getElement(elementID).findJacobian(this->pModel->getNodes(),k,J,Rt);
+                    const double massDetJ = useReferenceSurfaceVolumeMass
+                        ? referenceMassJacobians[elementID][k] : detJ;
 
                     B.fill(0.0);
                     for (uint m=0;m<dN.getNRows();m++)
@@ -707,7 +884,7 @@ void RSolverHeat::prepare()
                                 Me[m][n] += N[m] * N[n]
                                          * this->elementDensity[elementID]
                                          * this->elementCapacity[elementID]
-                                         * detJ
+                                         * massDetJ
                                          * shapeFunc.getW();
                             }
                         }

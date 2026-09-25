@@ -65,10 +65,16 @@ class RSolverHeat : public RSolverGeneric
         //! while assembling conduction on the current deformed line geometry.
         void setReferenceLineThermalMass(bool enabled);
 
+        //! For transient surface/volume heat solves, integrate thermal capacity
+        //! over the undeformed geometry while retaining current-geometry
+        //! conduction and heat flux.
+        void setReferenceSurfaceVolumeThermalMass(bool enabled);
+
     protected:
 
         std::vector<std::pair<uint,double>> controlledPointHeat;
         bool referenceLineThermalMass = false;
+        bool referenceSurfaceVolumeThermalMass = false;
 
         void findComputableElements(RProblemType problemType) override;
 

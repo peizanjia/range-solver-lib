@@ -41,6 +41,7 @@ set(range_solver_lib_tests
     tst_structural_dynamics_parallel_repro
     tst_structural_temperature_field
     tst_structural_heat_certification
+    tst_structural_reference_thermal_mass
     tst_structural_cable_dynamics
     tst_structural_piezo_coupled_1d
     tst_structural_heat_stress_coupling
