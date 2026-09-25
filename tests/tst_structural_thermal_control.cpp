@@ -192,7 +192,49 @@ private slots:
     void legacyPointHeatBoundaryActuallyAppliesWatts();
     void pointThermalMassActuallyStoresHeat();
     void multirateFeSubstepsPreserveTemperature();
+    void versionedModelSetupDrivesActualFe();
 };
+
+void TestStructuralThermalControl::versionedModelSetupDrivesActualFe()
+{
+    RModel model = thermalFeRod();
+    const QString node = RStructuralThermalFEAdapter::nodeId(model,1);
+    auto &setup = model.getProblemSetup().getStructuralThermalControlSetup();
+    setup.enabled = true;
+    setup.thermalSubstepSeconds = 1.0;
+    setup.thermalSubstepsPerMechanicalMacrostep = 1;
+    setup.mechanicalMacrostepsPerControllerSample = 1;
+    RStructuralThermalControlChannelSetup channel;
+    channel.actuatorId = "heater-fe";
+    channel.heaterNodeId = node;
+    channel.temperatureSensorId = "sensor-fe";
+    channel.temperatureSensorNodeId = node;
+    channel.turnOnBelowKelvin = 294.15;
+    channel.turnOffAtOrAboveKelvin = 294.15;
+    channel.onPowerWatts = 2.0;
+    channel.maximumPowerWatts = 2.0;
+    setup.channels = {channel};
+    setup.sparseObservationNodeIds = {node};
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString file = directory.filePath(
+        QStringLiteral("configured.") + RModel::getDefaultFileExtension(true));
+    RModel loaded;
+    try { model.write(file,false); loaded.read(file); }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
+    try
+    {
+        const auto scheduler = RStructuralThermalFEAdapter::schedulerFromModel(loaded);
+        const auto accepted = scheduler.initialState(RStructuralThermalFEAdapter::capture(loaded));
+        const auto result = RStructuralThermalFEAdapter::advance(loaded,scheduler,accepted);
+        QCOMPARE(result.channels[0].appliedEnergyJoules,2.0);
+        QVERIFY(std::abs(loaded.getVariable(loaded.findVariable(R_VARIABLE_TEMPERATURE))
+                             .getValue(0,1)-294.15) < 1.0e-8);
+    }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
+}
 
 void TestStructuralThermalControl::multirateFeSubstepsPreserveTemperature()
 {
@@ -299,11 +341,11 @@ void TestStructuralThermalControl::pointHeaterControlsTransientHeatAndStressFE()
     catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
     catch (const std::exception &error) { QFAIL(error.what()); }
     QCOMPARE(second.channels[0].appliedEnergyJoules,0.0);
-    // The legacy heat FE evaluates conduction and capacity on the prior
-    // accepted displaced length (1.005 m), then restores reference nodes.
+    // Conduction uses the accepted displaced length (1.005 m), while the
+    // mass-conserving rod heat capacity remains at its reference value.
     const double deformedLength = 1.005;
     const double expectedCooldown = 293.15 +
-        deformedLength/(deformedLength+1.0/deformedLength);
+        1.0/(1.0+1.0/deformedLength);
     QVERIFY(std::abs(model.getVariable(model.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1)-
                      expectedCooldown) < 1.0e-6);
     QCOMPARE(second.candidate.channels[0].cumulativeAppliedEnergyJoules,2.0);

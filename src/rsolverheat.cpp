@@ -75,6 +75,11 @@ void RSolverHeat::setControlledPointHeat(
     this->controlledPointHeat = powers;
 }
 
+void RSolverHeat::setReferenceLineThermalMass(bool enabled)
+{
+    this->referenceLineThermalMass = enabled;
+}
+
 void RSolverHeat::findComputableElements(RProblemType problemType)
 {
     RSolverGeneric::findComputableElements(problemType);
@@ -438,6 +443,37 @@ void RSolverHeat::prepare()
                 Ke.fill(0.0);
                 fe.fill(0.0);
 
+                double referenceMassRatio = 1.0;
+                if (timeSolverEnabled && this->referenceLineThermalMass)
+                {
+                    if (element.getType() != R_ELEMENT_TRUSS1 || element.size() != 2)
+                        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                     "Reference thermal mass requires two-node TRUSS1 members.");
+                    const auto &first = this->pModel->getNode(element.getNodeId(0));
+                    const auto &second = this->pModel->getNode(element.getNodeId(1));
+                    double referenceDx = second.getX()-first.getX();
+                    double referenceDy = second.getY()-first.getY();
+                    double referenceDz = second.getZ()-first.getZ();
+                    const double currentLength = std::hypot(referenceDx,referenceDy,referenceDz);
+                    const uint displacementPosition = this->pModel->findVariable(R_VARIABLE_DISPLACEMENT);
+                    if (displacementPosition != RConstants::eod)
+                    {
+                        const RVariable &displacement = this->pModel->getVariable(displacementPosition);
+                        referenceDx -= displacement.getValue(0,element.getNodeId(1))-
+                                       displacement.getValue(0,element.getNodeId(0));
+                        referenceDy -= displacement.getValue(1,element.getNodeId(1))-
+                                       displacement.getValue(1,element.getNodeId(0));
+                        referenceDz -= displacement.getValue(2,element.getNodeId(1))-
+                                       displacement.getValue(2,element.getNodeId(0));
+                    }
+                    const double referenceLength = std::hypot(referenceDx,referenceDy,referenceDz);
+                    if (!std::isfinite(currentLength) || !std::isfinite(referenceLength) ||
+                        currentLength <= 0.0 || referenceLength <= 0.0)
+                        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                     "Thermal rod has invalid current or reference length.");
+                    referenceMassRatio = referenceLength/currentLength;
+                }
+
                 for (uint k=0;k<nInp;k++)
                 {
                     const RElementShapeFunction &shapeFunc = RElement::getShapeFunction(element.getType(),k);
@@ -467,7 +503,7 @@ void RSolverHeat::prepare()
                                 Me[m][n] += N[m] * N[n]
                                          * this->elementDensity[elementID]
                                          * this->elementCapacity[elementID]
-                                         * detJ
+                                         * detJ * referenceMassRatio
                                          * shapeFunc.getW()
                                          * line.getCrossArea();
                             }

@@ -17,6 +17,8 @@ class RStructuralThermalFEAdapter
 {
     public:
         static QString nodeId(const RModel &model,unsigned int nodeIndex);
+        //! Construct the scheduler from versioned RProblemSetup configuration.
+        static RStructuralThermalControlScheduler schedulerFromModel(const RModel &model);
         static RStructuralThermalControlScheduler::Plant capture(const RModel &model);
         static RStructuralThermalControlScheduler::Result advance(
             RModel &model,

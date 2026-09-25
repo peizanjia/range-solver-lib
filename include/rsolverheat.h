@@ -61,9 +61,14 @@ class RSolverHeat : public RSolverGeneric
         //! trial heat solve. The caller owns the enclosing macrostep rollback.
         void setControlledPointHeat(const std::vector<std::pair<uint,double>> &powers);
 
+        //! For the bounded thermoelastic rod adapter, keep reference mass
+        //! while assembling conduction on the current deformed line geometry.
+        void setReferenceLineThermalMass(bool enabled);
+
     protected:
 
         std::vector<std::pair<uint,double>> controlledPointHeat;
+        bool referenceLineThermalMass = false;
 
         void findComputableElements(RProblemType problemType) override;
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -174,6 +175,42 @@ QString RStructuralThermalFEAdapter::nodeId(const RModel &model,unsigned int nod
     return prefix(model)+QString::number(nodeIndex);
 }
 
+RStructuralThermalControlScheduler RStructuralThermalFEAdapter::schedulerFromModel(
+    const RModel &model)
+{
+    const auto &setup = model.getProblemSetup().getStructuralThermalControlSetup();
+    require(setup.enabled,"Thermal FE control setup is disabled in RModel.");
+    setup.validate();
+    RStructuralThermalControlConfig config;
+    config.thermalSubstepSeconds = setup.thermalSubstepSeconds;
+    config.thermalSubstepsPerMechanicalMacrostep =
+        setup.thermalSubstepsPerMechanicalMacrostep;
+    config.mechanicalMacrostepsPerControllerSample =
+        setup.mechanicalMacrostepsPerControllerSample;
+    config.sparseObservationNodeIds = setup.sparseObservationNodeIds;
+    config.channels.reserve(setup.channels.size());
+    for (const auto &source : setup.channels)
+    {
+        RStructuralThermalControlChannelConfig channel;
+        channel.actuatorId = source.actuatorId;
+        channel.heaterNodeId = source.heaterNodeId;
+        channel.temperatureSensorId = source.temperatureSensorId;
+        channel.temperatureSensorNodeId = source.temperatureSensorNodeId;
+        channel.turnOnBelowKelvin = source.turnOnBelowKelvin;
+        channel.turnOffAtOrAboveKelvin = source.turnOffAtOrAboveKelvin;
+        channel.onPowerWatts = source.onPowerWatts;
+        channel.minimumPowerWatts = source.minimumPowerWatts;
+        channel.maximumPowerWatts = source.maximumPowerWatts;
+        channel.maximumPowerSlewWattsPerSecond = source.maximumPowerSlewUnlimited
+            ? std::numeric_limits<double>::infinity()
+            : source.maximumPowerSlewWattsPerSecond;
+        config.channels.push_back(std::move(channel));
+    }
+    RStructuralThermalControlScheduler scheduler(std::move(config));
+    (void)heaterPointElements(model,scheduler.getConfig());
+    return scheduler;
+}
+
 RStructuralThermalControlScheduler::Plant RStructuralThermalFEAdapter::capture(const RModel &model)
 {
     const unsigned int temperaturePosition = model.findVariable(R_VARIABLE_TEMPERATURE);
@@ -221,6 +258,7 @@ RStructuralThermalControlScheduler::Result RStructuralThermalFEAdapter::advance(
     RModel candidateModel(model);
     RSolverSharedData candidateSharedData;
     RSolverHeat heat(&candidateModel,QString(),QString(),candidateSharedData);
+    heat.setReferenceLineThermalMass(true);
     RSolverStress stress(&candidateModel,QString(),QString(),candidateSharedData,false);
     unsigned int substep = 0;
     const double acceptedTime = model.getTimeSolver().getComputedTime();
