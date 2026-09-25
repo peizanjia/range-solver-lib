@@ -610,6 +610,39 @@ RSolverStress::RSolverStress(RModel *pModel, const QString &modelFileName, const
     }
 }
 
+bool sameControlTimeSolver(const RTimeSolver &left,const RTimeSolver &right)
+{
+    return left.getEnabled()==right.getEnabled() &&
+        left.getTimeMarchApproximation()==right.getTimeMarchApproximation() &&
+        left.getTimes()==right.getTimes() &&
+        left.getInputNTimeSteps()==right.getInputNTimeSteps() &&
+        left.getInputStartTime()==right.getInputStartTime() &&
+        left.getInputTimeStepSize()==right.getInputTimeStepSize() &&
+        left.getCurrentTimeStep()==right.getCurrentTimeStep() &&
+        left.getComputedTime()==right.getComputedTime() &&
+        left.getOutputFrequency()==right.getOutputFrequency();
+}
+
+bool sameControlSetup(const RStructuralControlSetup &left,
+                      const RStructuralControlSetup &right)
+{
+    if (left.enabled!=right.enabled ||
+        left.controlProtocolVersion!=right.controlProtocolVersion ||
+        left.controllerId!=right.controllerId ||
+        left.deterministicSeed!=right.deterministicSeed ||
+        left.channelConditioning.size()!=right.channelConditioning.size())
+        return false;
+    for (std::size_t i=0;i<left.channelConditioning.size();i++)
+    {
+        const auto &a = left.channelConditioning[i];
+        const auto &b = right.channelConditioning[i];
+        if (a.actuatorId!=b.actuatorId || a.delaySteps!=b.delaySteps ||
+            a.holdSteps!=b.holdSteps || a.noiseAmplitude!=b.noiseAmplitude)
+            return false;
+    }
+    return true;
+}
+
 namespace
 {
 
@@ -2511,7 +2544,14 @@ void RSolverStress::solveStructuralCableDynamics()
         }
         observation.priorControllerState = this->acceptedControllerState;
 
+        const RTimeSolver frozenTimeSolver = this->pModel->getTimeSolver();
+        const RStructuralControlSetup frozenControlSetup = controlSetup;
         const RStructuralControlDecision decision = this->controlCallback(observation);
+        if (!sameControlTimeSolver(frozenTimeSolver,this->pModel->getTimeSolver()) ||
+            !sameControlSetup(frozenControlSetup,
+                this->pModel->getProblemSetup().getStructuralControlSetup()))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable control callback changed the frozen time solver or control setup.");
         if (this->controlCatalogFingerprint() != this->cachedControlCatalogFingerprint)
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                          "Structural control callback changed the frozen sensor/actuator catalog.");
@@ -4273,7 +4313,14 @@ void RSolverStress::solveStructuralDynamics()
         observation.deterministicSeed = controlSetup.deterministicSeed;
         observation.sensors = this->sampleControlSensors(accepted);
         observation.priorControllerState = this->acceptedControllerState;
+        const RTimeSolver frozenTimeSolver = this->pModel->getTimeSolver();
+        const RStructuralControlSetup frozenControlSetup = controlSetup;
         const RStructuralControlDecision decision = this->controlCallback(observation);
+        if (!sameControlTimeSolver(frozenTimeSolver,this->pModel->getTimeSolver()) ||
+            !sameControlSetup(frozenControlSetup,
+                this->pModel->getProblemSetup().getStructuralControlSetup()))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Structural control callback changed the frozen time solver or control setup.");
         if (this->controlCatalogFingerprint() != this->cachedControlCatalogFingerprint)
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                          "Structural control callback changed the frozen sensor/actuator catalog.");

@@ -378,6 +378,8 @@ private slots:
     void persistedSplitControlMatchesFullRun();
     void failedStepDoesNotCommitControllerCandidate();
     void controlDefinitionChangeRejectsRestart();
+    void callbackCannotChangeAcceptedClock();
+    void callbackCannotChangeConditioningSetup();
     void unsupportedActuatorFailsClosed();
 };
 
@@ -614,6 +616,60 @@ void TestStructuralCableControl::controlDefinitionChangeRejectsRestart()
              qPrintable(error));
     QCOMPARE(resumed.getProblemSetup().getStructuralDynamicsRestartData().completedSteps,
              firstSegmentSteps);
+}
+
+void TestStructuralCableControl::callbackCannotChangeAcceptedClock()
+{
+    RModel model = makeCable(2);
+    RSolver solver(model,QString(),QString());
+    bool callbackCalled = false;
+    solver.setStructuralControlCallback(
+        QString::fromLatin1(controllerId),QStringLiteral("tamper-clock-v1"),
+        [&model,&callbackCalled](const RStructuralControlObservation &)
+        {
+            callbackCalled = true;
+            model.getTimeSolver().setCurrentTimeStep(1);
+            RStructuralControlDecision decision;
+            decision.requestedCommands.push_back({QString::fromLatin1(actuatorId),0.2});
+            return decision;
+        });
+    QString error;
+    try { solver.run(); }
+    catch (const RError &failure) { error = failure.getMessage(); }
+    QVERIFY(callbackCalled);
+    QVERIFY2(error.contains(QStringLiteral("frozen time solver"),Qt::CaseInsensitive),
+             qPrintable(error));
+    QVERIFY(!model.getProblemSetup().getStructuralDynamicsRestartData().available);
+    QCOMPARE(model.getTimeSolver().getCurrentTimeStep(),0u);
+}
+
+void TestStructuralCableControl::callbackCannotChangeConditioningSetup()
+{
+    RModel model = makeCable(1);
+    const uint originalDelay = model.getProblemSetup().getStructuralControlSetup()
+        .channelConditioning.front().delaySteps;
+    RSolver solver(model,QString(),QString());
+    bool callbackCalled = false;
+    solver.setStructuralControlCallback(
+        QString::fromLatin1(controllerId),QStringLiteral("tamper-conditioning-v1"),
+        [&model,&callbackCalled](const RStructuralControlObservation &)
+        {
+            callbackCalled = true;
+            ++model.getProblemSetup().getStructuralControlSetup()
+                .channelConditioning.front().delaySteps;
+            RStructuralControlDecision decision;
+            decision.requestedCommands.push_back({QString::fromLatin1(actuatorId),0.2});
+            return decision;
+        });
+    QString error;
+    try { solver.run(); }
+    catch (const RError &failure) { error = failure.getMessage(); }
+    QVERIFY(callbackCalled);
+    QVERIFY2(error.contains(QStringLiteral("control setup"),Qt::CaseInsensitive),
+             qPrintable(error));
+    QVERIFY(!model.getProblemSetup().getStructuralDynamicsRestartData().available);
+    QCOMPARE(model.getProblemSetup().getStructuralControlSetup()
+                 .channelConditioning.front().delaySteps,originalDelay);
 }
 
 void TestStructuralCableControl::unsupportedActuatorFailsClosed()

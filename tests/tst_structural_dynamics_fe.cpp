@@ -222,6 +222,7 @@ private slots:
     void velocityFeedbackReducesMechanicalEnergy();
     void controlRateLimitAndRestartFailClosed();
     void controlCallbackCannotMutateCatalog();
+    void controlCallbackCannotMutateClockOrConditioning();
     void conditionedDelayHoldNoiseRestartsAfterRejectedTrial();
     void rawLegacyControlStateFailsClosed();
     void twoChannelMappingIsLinearAndRestartsDeterministically();
@@ -510,6 +511,41 @@ void TestStructuralDynamicsFE::controlCallbackCannotMutateCatalog()
     QCOMPARE(model.getProblemSetup().getStructuralInteractionSetup().getActuators()[0].maximum,
              originalLimit);
     QVERIFY(!model.getProblemSetup().getStructuralDynamicsRestartData().available);
+}
+
+void TestStructuralDynamicsFE::controlCallbackCannotMutateClockOrConditioning()
+{
+    for (const bool changeClock : {true,false})
+    {
+        RModel model = makeTruss(1);
+        configureControl(model);
+        auto &conditioning = model.getProblemSetup().getStructuralControlSetup()
+            .channelConditioning;
+        conditioning.push_back({QStringLiteral("tip-x"),0,1,0.0});
+        RSolver solver(model,QString(),QString());
+        bool callbackCalled = false;
+        solver.setStructuralControlCallback(
+            "constant-force","mutating-time-or-setup-v1",
+            [&model,&callbackCalled,changeClock](const RStructuralControlObservation &)
+            {
+                callbackCalled = true;
+                if (changeClock)
+                    model.getTimeSolver().setCurrentTimeStep(1);
+                else
+                    ++model.getProblemSetup().getStructuralControlSetup()
+                        .channelConditioning.front().delaySteps;
+                return RStructuralControlDecision{{{"tip-x",1.0e4}},QByteArray()};
+            });
+        QString error;
+        try { solver.run(); }
+        catch (const RError &failure) { error = failure.getMessage(); }
+        QVERIFY(callbackCalled);
+        QVERIFY2(error.contains(QStringLiteral("frozen time solver or control setup"),
+                                Qt::CaseInsensitive),qPrintable(error));
+        QVERIFY(!model.getProblemSetup().getStructuralDynamicsRestartData().available);
+        QCOMPARE(model.getProblemSetup().getStructuralControlSetup()
+                     .channelConditioning.front().delaySteps,0u);
+    }
 }
 
 void TestStructuralDynamicsFE::conditionedDelayHoldNoiseRestartsAfterRejectedTrial()
