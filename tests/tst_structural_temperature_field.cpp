@@ -55,7 +55,56 @@ private slots:
     void rejectsOrientedConnectivityChange();
     void coupledSnapshotKeepsPhysicalIdsAndMissingFieldsExplicit();
     void coupledSnapshotUsesPersistedModelIds();
+    void coupledSnapshotReadsOptionalMotionAndThermalFields();
 };
+
+void TestStructuralTemperatureField::coupledSnapshotReadsOptionalMotionAndThermalFields()
+{
+    RModel model = mesh({"A","B","C"});
+    RVariable temperature(R_VARIABLE_TEMPERATURE,R_VARIABLE_APPLY_NODE);
+    temperature.resize(1,3);
+    for (uint i=0;i<3;i++) temperature.setValue(0,i,293.15+double(i));
+    model.addVariable(temperature);
+    RVariable velocity(R_VARIABLE_VELOCITY,R_VARIABLE_APPLY_NODE);
+    velocity.resize(3,3);
+    RVariable acceleration(R_VARIABLE_ACCELERATION,R_VARIABLE_APPLY_NODE);
+    acceleration.resize(3,3);
+    for (uint i=0;i<3;i++)
+    {
+        for (uint component=0;component<3;component++)
+        {
+            velocity.setValue(component,i,double(10*i+component));
+            acceleration.setValue(component,i,double(100*i+component));
+        }
+    }
+    model.addVariable(velocity);
+    model.addVariable(acceleration);
+    RVariable heatFlux(R_VARIABLE_HEAT_FLUX,R_VARIABLE_APPLY_ELEMENT);
+    heatFlux.resize(3,2);
+    RVariable heatSource(R_VARIABLE_HEAT,R_VARIABLE_APPLY_ELEMENT);
+    heatSource.resize(1,2);
+    for (uint i=0;i<2;i++)
+    {
+        for (uint component=0;component<3;component++)
+            heatFlux.setValue(component,i,double(10*i+component+1));
+        heatSource.setValue(0,i,double(i+5));
+    }
+    model.addVariable(heatFlux);
+    model.addVariable(heatSource);
+
+    const auto snapshot = RStructuralCoupledFieldSnapshot::capture(model);
+    const QString nodeId = QString::number(model.getNodePhysicalId(1));
+    const auto node = snapshot.selectNodes({nodeId}).front();
+    QCOMPARE(node.velocityMetresPerSecond.value(),(std::array<double,3>{10.0,11.0,12.0}));
+    QCOMPARE(node.accelerationMetresPerSecondSquared.value(),
+             (std::array<double,3>{100.0,101.0,102.0}));
+    QVERIFY(!node.displacementMetres.has_value());
+    const QString elementId = QString::number(model.getElementPhysicalId(1));
+    const auto element = snapshot.selectElements({elementId}).front();
+    QCOMPARE(element.heatFluxWattsPerSquareMetre,std::vector<double>({11.0,12.0,13.0}));
+    QCOMPARE(element.heatSourceWatts,std::vector<double>({6.0}));
+    QVERIFY(element.stressPascals.empty());
+}
 
 void TestStructuralTemperatureField::coupledSnapshotUsesPersistedModelIds()
 {
