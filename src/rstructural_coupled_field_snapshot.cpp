@@ -137,6 +137,30 @@ std::vector<Record> select(const std::vector<Record> &all,const std::vector<QStr
     });
     return selected;
 }
+
+std::vector<QString> persistedNodeIds(const RModel &model)
+{
+    std::vector<QString> ids;
+    ids.reserve(model.getNNodes());
+    for (uint i=0;i<model.getNNodes();i++)
+        ids.push_back(QString::number(model.getNodePhysicalId(i)));
+    return ids;
+}
+
+std::vector<QString> persistedElementIds(const RModel &model)
+{
+    std::vector<QString> ids;
+    ids.reserve(model.getNElements());
+    for (uint i=0;i<model.getNElements();i++)
+        ids.push_back(QString::number(model.getElementPhysicalId(i)));
+    return ids;
+}
+}
+
+RStructuralCoupledFieldSnapshot RStructuralCoupledFieldSnapshot::capture(
+    const RModel &model,const RStructuralCoupledFieldSnapshot *previous)
+{
+    return capture(model,persistedNodeIds(model),persistedElementIds(model),previous);
 }
 
 RStructuralCoupledFieldSnapshot RStructuralCoupledFieldSnapshot::capture(
@@ -239,6 +263,11 @@ void RStructuralCoupledFieldSnapshot::verifyMesh(
 {
     if (fingerprint(model,nodeIds,elementIds) != digest)
         throw std::invalid_argument("Coupled field snapshot is bound to a different physical mesh.");
+}
+
+void RStructuralCoupledFieldSnapshot::verifyMesh(const RModel &model) const
+{
+    verifyMesh(model,persistedNodeIds(model),persistedElementIds(model));
 }
 
 std::vector<RStructuralCoupledFieldSnapshot::Node>

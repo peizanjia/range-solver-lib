@@ -43,8 +43,14 @@ class RStructuralCoupledFieldSnapshot
             const std::vector<QString> &elementIds,
             const RStructuralCoupledFieldSnapshot *previous = nullptr);
 
+        //! Bind directly to physical IDs persisted by RModel (schema 1.3.17).
+        static RStructuralCoupledFieldSnapshot capture(
+            const RModel &model,
+            const RStructuralCoupledFieldSnapshot *previous = nullptr);
+
         void verifyMesh(const RModel &model,const std::vector<QString> &nodeIds,
                         const std::vector<QString> &elementIds) const;
+        void verifyMesh(const RModel &model) const;
         std::vector<Node> selectNodes(const std::vector<QString> &ids) const;
         std::vector<Element> selectElements(const std::vector<QString> &ids) const;
         const std::vector<Node> &allNodes() const { return nodes; }

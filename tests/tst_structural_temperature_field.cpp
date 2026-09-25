@@ -54,7 +54,29 @@ private slots:
     void rejectsInvalidIdsAndTemperatures();
     void rejectsOrientedConnectivityChange();
     void coupledSnapshotKeepsPhysicalIdsAndMissingFieldsExplicit();
+    void coupledSnapshotUsesPersistedModelIds();
 };
+
+void TestStructuralTemperatureField::coupledSnapshotUsesPersistedModelIds()
+{
+    RModel model = mesh({"A","B","C"});
+    model.setNodePhysicalId(0,10);
+    model.setNodePhysicalId(1,20);
+    model.setNodePhysicalId(2,30);
+    model.setElementPhysicalId(0,40);
+    model.setElementPhysicalId(1,50);
+    RVariable temperature(R_VARIABLE_TEMPERATURE,R_VARIABLE_APPLY_NODE);
+    temperature.resize(1,3);
+    for (uint i=0;i<3;i++) temperature.setValue(0,i,300.0+double(i));
+    model.addVariable(temperature);
+    const auto snapshot = RStructuralCoupledFieldSnapshot::capture(model);
+    QCOMPARE(snapshot.selectNodes({"20"})[0].temperatureKelvin,301.0);
+    QCOMPARE(snapshot.selectElements({"50"}).size(),std::size_t(1));
+    snapshot.verifyMesh(model);
+    RModel changed(model);
+    changed.setNodePhysicalId(1,21);
+    QVERIFY_EXCEPTION_THROWN(snapshot.verifyMesh(changed),std::invalid_argument);
+}
 
 void TestStructuralTemperatureField::coupledSnapshotKeepsPhysicalIdsAndMissingFieldsExplicit()
 {
