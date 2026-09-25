@@ -68,6 +68,7 @@ bool sameState(const RStructuralThermalControlState &left,
     if (left.configurationSha256 != right.configurationSha256 ||
         left.completedMechanicalMacrosteps != right.completedMechanicalMacrosteps ||
         left.completedControllerSamples != right.completedControllerSamples ||
+        left.acceptedTimeSeconds != right.acceptedTimeSeconds ||
         left.plant.size() != right.plant.size() || left.channels.size() != right.channels.size())
         return false;
     for (std::size_t i=0;i<left.plant.size();i++)
@@ -231,6 +232,30 @@ void TestStructuralThermalControl::versionedModelSetupDrivesActualFe()
         QCOMPARE(result.channels[0].appliedEnergyJoules,2.0);
         QVERIFY(std::abs(loaded.getVariable(loaded.findVariable(R_VARIABLE_TEMPERATURE))
                              .getValue(0,1)-294.15) < 1.0e-8);
+        const QString checkpoint = directory.filePath(QStringLiteral("configured.tfec"));
+        RStructuralThermalFEAdapter::writeCheckpoint(
+            checkpoint,loaded,scheduler,result.candidate);
+        RModel restored;
+        RStructuralThermalControlState restoredState;
+        RStructuralThermalFEAdapter::readConfiguredCheckpoint(
+            checkpoint,restored,restoredState);
+        QVERIFY(sameState(restoredState,result.candidate));
+        RModel conflicting(loaded);
+        conflicting.getProblemSetup().getStructuralThermalControlSetup()
+            .channels[0].turnOnBelowKelvin = 294.0;
+        bool mismatchedSetupRejected = false;
+        try { RStructuralThermalFEAdapter::writeCheckpoint(
+                  directory.filePath(QStringLiteral("wrong.tfec")),
+                  conflicting,scheduler,result.candidate); }
+        catch (const RError &) { mismatchedSetupRejected = true; }
+        catch (const std::exception &) { mismatchedSetupRejected = true; }
+        QVERIFY(mismatchedSetupRejected);
+        const auto restoredScheduler = RStructuralThermalFEAdapter::schedulerFromModel(restored);
+        const auto uninterrupted = RStructuralThermalFEAdapter::advance(
+            loaded,scheduler,result.candidate);
+        const auto resumed = RStructuralThermalFEAdapter::advance(
+            restored,restoredScheduler,restoredState);
+        QVERIFY(sameState(uninterrupted.candidate,resumed.candidate));
     }
     catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
     catch (const std::exception &error) { QFAIL(error.what()); }
@@ -349,6 +374,12 @@ void TestStructuralThermalControl::pointHeaterControlsTransientHeatAndStressFE()
     QVERIFY(std::abs(model.getVariable(model.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1)-
                      expectedCooldown) < 1.0e-6);
     QCOMPARE(second.candidate.channels[0].cumulativeAppliedEnergyJoules,2.0);
+    auto wrongClock = second.candidate;
+    wrongClock.acceptedTimeSeconds += 1.0;
+    bool clockMismatchRejected = false;
+    try { (void)RStructuralThermalFEAdapter::advance(model,scheduler,wrongClock); }
+    catch (const std::exception &) { clockMismatchRejected = true; }
+    QVERIFY(clockMismatchRejected);
 
     RModel resumedModel(model);
     const QByteArray serializedState = scheduler.serialize(second.candidate);

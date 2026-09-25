@@ -63,6 +63,7 @@ struct RStructuralThermalControlState
     QByteArray configurationSha256;
     quint64 completedMechanicalMacrosteps = 0;
     quint64 completedControllerSamples = 0;
+    double acceptedTimeSeconds = 0.0;
     std::vector<RStructuralThermoCoupled1DNodeState> plant;
     std::vector<RStructuralThermalControlChannelState> channels;
 };
@@ -142,7 +143,8 @@ class RStructuralThermalControlScheduler
 
         explicit RStructuralThermalControlScheduler(RStructuralThermalControlConfig config);
 
-        RStructuralThermalControlState initialState(const Plant &initialPlant) const;
+        RStructuralThermalControlState initialState(
+            const Plant &initialPlant,double initialTimeSeconds = 0.0) const;
         Result advance(const RStructuralThermalControlState &accepted,
                        const SubstepFunction &advanceSubstep) const;
 

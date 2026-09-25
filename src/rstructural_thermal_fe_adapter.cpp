@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -24,6 +25,7 @@
 namespace
 {
 constexpr double referenceKelvin = 293.15;
+constexpr qint64 maxCheckpointBytes = 1024LL*1024LL*1024LL;
 
 QString prefix(const RModel &model)
 {
@@ -167,6 +169,27 @@ void verifyAcceptedPlant(
                 "Thermal accepted state and RModel fields disagree.");
     }
 }
+
+void verifyAcceptedClock(const RModel &model,
+                         const RStructuralThermalControlState &accepted)
+{
+    const double modelTime = model.getTimeSolver().getComputedTime();
+    require(std::isfinite(modelTime) && std::isfinite(accepted.acceptedTimeSeconds) &&
+                std::abs(modelTime-accepted.acceptedTimeSeconds) <=
+                    1.0e-10*std::max({1.0,std::abs(modelTime),
+                                     std::abs(accepted.acceptedTimeSeconds)}),
+            "Thermal FE model time differs from the accepted controller state.");
+}
+
+void verifyModelScheduler(const RModel &model,
+                          const RStructuralThermalControlScheduler &scheduler)
+{
+    if (!model.getProblemSetup().getStructuralThermalControlSetup().enabled)
+        return;
+    const auto persisted = RStructuralThermalFEAdapter::schedulerFromModel(model);
+    require(persisted.configurationSha256() == scheduler.configurationSha256(),
+            "Thermal checkpoint scheduler differs from persisted model control setup.");
+}
 }
 
 QString RStructuralThermalFEAdapter::nodeId(const RModel &model,unsigned int nodeIndex)
@@ -255,6 +278,7 @@ RStructuralThermalControlScheduler::Result RStructuralThermalFEAdapter::advance(
     const auto &config = scheduler.getConfig();
     const auto pointElements = heaterPointElements(model,config);
     verifyAcceptedPlant(capture(model),accepted.plant);
+    verifyAcceptedClock(model,accepted);
     RModel candidateModel(model);
     RSolverSharedData candidateSharedData;
     RSolverHeat heat(&candidateModel,QString(),QString(),candidateSharedData);
@@ -320,7 +344,9 @@ void RStructuralThermalFEAdapter::writeCheckpoint(
 {
     require(!fileName.isEmpty(),"Thermal FE checkpoint requires a file name.");
     (void)heaterPointElements(model,scheduler.getConfig());
+    verifyModelScheduler(model,scheduler);
     verifyAcceptedPlant(capture(model),accepted.plant);
+    verifyAcceptedClock(model,accepted);
     const QByteArray stateBytes = scheduler.serialize(accepted);
     QTemporaryDir scratch;
     if (!scratch.isValid())
@@ -329,7 +355,8 @@ void RStructuralThermalFEAdapter::writeCheckpoint(
         QStringLiteral("model.") + RModel::getDefaultFileExtension(true));
     model.write(modelPath,false);
     QFile modelFile(modelPath);
-    if (!modelFile.open(QIODevice::ReadOnly))
+    if (!modelFile.open(QIODevice::ReadOnly) ||
+        modelFile.size() <= 0 || modelFile.size() > maxCheckpointBytes)
         throw std::runtime_error("Could not read the staged thermal FE model.");
     const QByteArray modelBytes = modelFile.readAll();
     if (modelBytes.isEmpty())
@@ -343,6 +370,8 @@ void RStructuralThermalFEAdapter::writeCheckpoint(
     if (stream.status() != QDataStream::Ok)
         throw std::runtime_error("Could not encode the thermal FE checkpoint.");
     const QByteArray digest = QCryptographicHash::hash(payload,QCryptographicHash::Sha256);
+    if (payload.size() > maxCheckpointBytes-digest.size())
+        throw std::invalid_argument("Thermal FE checkpoint exceeds its readback size limit.");
     QSaveFile output(fileName);
     if (!output.open(QIODevice::WriteOnly) ||
         output.write(payload) != payload.size() ||
@@ -350,14 +379,16 @@ void RStructuralThermalFEAdapter::writeCheckpoint(
         throw std::runtime_error("Could not atomically publish the thermal FE checkpoint.");
 }
 
-void RStructuralThermalFEAdapter::readCheckpoint(
+namespace
+{
+void readCheckpointImpl(
     const QString &fileName,RModel &model,
-    const RStructuralThermalControlScheduler &scheduler,
+    const RStructuralThermalControlScheduler *requiredScheduler,
     RStructuralThermalControlState &accepted)
 {
     QFile input(fileName);
     if (!input.open(QIODevice::ReadOnly) || input.size() < 40 ||
-        input.size() > 1024LL*1024LL*1024LL)
+        input.size() > maxCheckpointBytes)
         throw std::invalid_argument("Thermal FE checkpoint is missing or has an invalid size.");
     const QByteArray bytes = input.readAll();
     if (bytes.size() != input.size())
@@ -375,7 +406,6 @@ void RStructuralThermalFEAdapter::readCheckpoint(
     if (stream.status() != QDataStream::Ok || !stream.atEnd() ||
         magic != 0x54464543 || version != 1 || modelBytes.isEmpty() || stateBytes.isEmpty())
         throw std::invalid_argument("Thermal FE checkpoint structure or version is invalid.");
-    const auto restoredState = scheduler.deserialize(stateBytes);
     QTemporaryDir scratch;
     if (!scratch.isValid())
         throw std::runtime_error("Could not create a thermal checkpoint restore directory.");
@@ -388,8 +418,32 @@ void RStructuralThermalFEAdapter::readCheckpoint(
     modelFile.close();
     RModel restoredModel;
     restoredModel.read(modelPath);
+    std::optional<RStructuralThermalControlScheduler> modelScheduler;
+    if (!requiredScheduler)
+        modelScheduler.emplace(RStructuralThermalFEAdapter::schedulerFromModel(restoredModel));
+    const auto &scheduler = requiredScheduler ? *requiredScheduler : *modelScheduler;
+    const auto restoredState = scheduler.deserialize(stateBytes);
     (void)heaterPointElements(restoredModel,scheduler.getConfig());
-    verifyAcceptedPlant(capture(restoredModel),restoredState.plant);
+    verifyModelScheduler(restoredModel,scheduler);
+    verifyAcceptedPlant(RStructuralThermalFEAdapter::capture(restoredModel),
+                        restoredState.plant);
+    verifyAcceptedClock(restoredModel,restoredState);
     model = restoredModel;
     accepted = restoredState;
+}
+}
+
+void RStructuralThermalFEAdapter::readCheckpoint(
+    const QString &fileName,RModel &model,
+    const RStructuralThermalControlScheduler &scheduler,
+    RStructuralThermalControlState &accepted)
+{
+    readCheckpointImpl(fileName,model,&scheduler,accepted);
+}
+
+void RStructuralThermalFEAdapter::readConfiguredCheckpoint(
+    const QString &fileName,RModel &model,
+    RStructuralThermalControlState &accepted)
+{
+    readCheckpointImpl(fileName,model,nullptr,accepted);
 }

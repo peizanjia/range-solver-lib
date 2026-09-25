@@ -34,6 +34,10 @@ class RStructuralThermalFEAdapter
             const QString &fileName,RModel &model,
             const RStructuralThermalControlScheduler &scheduler,
             RStructuralThermalControlState &accepted);
+        //! Restore using the scheduler configuration persisted in RModel.
+        static void readConfiguredCheckpoint(
+            const QString &fileName,RModel &model,
+            RStructuralThermalControlState &accepted);
 };
 
 #endif // RSTRUCTURAL_THERMAL_FE_ADAPTER_H

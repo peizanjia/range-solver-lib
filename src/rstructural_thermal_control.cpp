@@ -14,7 +14,7 @@
 namespace
 {
 constexpr quint32 stateMagic = 0x52544843u; // RTHC
-constexpr quint32 stateVersion = 1u;
+constexpr quint32 stateVersion = 2u;
 constexpr qsizetype stateDigestBytes = 32;
 constexpr qsizetype maxStateBytes = 64 * 1024 * 1024;
 constexpr quint32 maxStateRecords = 1000000u;
@@ -167,11 +167,14 @@ RStructuralThermalControlScheduler::RStructuralThermalControlScheduler(
 }
 
 RStructuralThermalControlState RStructuralThermalControlScheduler::initialState(
-    const Plant &initialPlant) const
+    const Plant &initialPlant,double initialTimeSeconds) const
 {
     validatePlant(initialPlant);
+    if (!std::isfinite(initialTimeSeconds))
+        throw std::invalid_argument("Thermal control initial time must be finite seconds.");
     RStructuralThermalControlState state;
     state.configurationSha256 = digest;
+    state.acceptedTimeSeconds = initialTimeSeconds;
     state.plant = initialPlant;
     sortPlant(state.plant);
     for (const auto &channel : config.channels)
@@ -187,6 +190,8 @@ void RStructuralThermalControlScheduler::validateState(
 {
     if (state.configurationSha256 != digest || state.channels.size() != config.channels.size())
         throw std::invalid_argument("Thermal control state is bound to a different configuration.");
+    if (!std::isfinite(state.acceptedTimeSeconds))
+        throw std::invalid_argument("Thermal control accepted time is non-finite.");
     const quint64 expectedSamples =
         state.completedMechanicalMacrosteps/config.mechanicalMacrostepsPerControllerSample +
         (state.completedMechanicalMacrosteps%config.mechanicalMacrostepsPerControllerSample != 0 ? 1u : 0u);
@@ -385,6 +390,10 @@ RStructuralThermalControlScheduler::Result RStructuralThermalControlScheduler::a
         result.channels[i].appliedAveragePowerWatts =
             result.channels[i].appliedEnergyJoules/macrostepSeconds;
     result.candidate.plant = std::move(workingPlant);
+    result.candidate.acceptedTimeSeconds = accepted.acceptedTimeSeconds+macrostepSeconds;
+    if (!std::isfinite(result.candidate.acceptedTimeSeconds) ||
+        result.candidate.acceptedTimeSeconds <= accepted.acceptedTimeSeconds)
+        throw std::overflow_error("Thermal control accepted time cannot advance in finite precision.");
     ++result.candidate.completedMechanicalMacrosteps;
     for (std::size_t i=0;i<config.channels.size();i++)
         validateChannelState(result.candidate.channels[i],config.channels[i]);
@@ -402,6 +411,7 @@ QByteArray RStructuralThermalControlScheduler::serialize(
     configureStream(stream);
     stream << stateMagic << stateVersion << state.configurationSha256
            << state.completedMechanicalMacrosteps << state.completedControllerSamples
+           << state.acceptedTimeSeconds
            << quint32(state.plant.size());
     for (const auto &node : state.plant)
         stream << node.nodeId << node.temperatureKelvin << node.axialDisplacement;
@@ -435,8 +445,15 @@ RStructuralThermalControlState RStructuralThermalControlScheduler::deserialize(
     RStructuralThermalControlState state;
     quint32 nodeCount = 0;
     stream >> magic >> version >> state.configurationSha256
-           >> state.completedMechanicalMacrosteps >> state.completedControllerSamples >> nodeCount;
-    if (stream.status() != QDataStream::Ok || magic != stateMagic || version != stateVersion ||
+           >> state.completedMechanicalMacrosteps >> state.completedControllerSamples;
+    if (version == stateVersion)
+        stream >> state.acceptedTimeSeconds;
+    else if (version == 1u)
+        state.acceptedTimeSeconds = double(state.completedMechanicalMacrosteps) *
+            config.thermalSubstepSeconds * config.thermalSubstepsPerMechanicalMacrostep;
+    stream >> nodeCount;
+    if (stream.status() != QDataStream::Ok || magic != stateMagic ||
+        (version != stateVersion && version != 1u) ||
         nodeCount == 0 || nodeCount > maxStateRecords)
         throw std::invalid_argument("Thermal control state header is invalid or truncated.");
     state.plant.resize(nodeCount);
