@@ -13,6 +13,7 @@ private slots:
     void copyAndAssignment();
     void frameVariablesUseCorrectDimensions();
     void beamSectionScalesWithLength();
+    void electrodeChargeUsesCoulombScale();
 };
 
 void TestScales::defaultsAreUnity()
@@ -114,6 +115,30 @@ void TestScales::beamSectionScalesWithLength()
     QCOMPARE(line.getSectionModulusY(),5.0e-4);
     QCOMPARE(line.getSectionModulusZ(),6.0e-4);
     QCOMPARE(line.getTorsionalSectionModulus(),7.0e-4);
+}
+
+void TestScales::electrodeChargeUsesCoulombScale()
+{
+    RScales scales;
+    scales.setAmpere(2.0);
+    scales.setSecond(3.0);
+    scales.setMetre(0.5);
+    scales.setKilogram(7.0);
+    QCOMPARE(scales.findScaleFactor(R_VARIABLE_ELECTRIC_CHARGE),6.0);
+    RModel model;
+    model.setNNodes(1);
+    RElement point(R_ELEMENT_POINT);
+    point.setNodeId(0,0);
+    model.addElement(point,true,0);
+    const uint position = model.addVariable(R_VARIABLE_ELECTRIC_CHARGE);
+    RVariable &charge = model.getVariable(position);
+    charge.setApplyType(R_VARIABLE_APPLY_ELEMENT);
+    charge.resize(1,1);
+    charge.setValue(0,0,-0.125);
+    scales.downscale(model);
+    QCOMPARE(charge.getValue(0,0),-0.75);
+    scales.upscale(model);
+    QCOMPARE(charge.getValue(0,0),-0.125);
 }
 
 QTEST_APPLESS_MAIN(TestScales)

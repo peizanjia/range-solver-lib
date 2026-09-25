@@ -1,583 +1,86 @@
-#include <algorithm>
-#include <array>
 #include <cmath>
-#include <limits>
-#include <set>
 #include <vector>
 
 #include <rbl_error.h>
 
-#include <rml_element_group.h>
-#include <rml_line.h>
 #include <rml_model.h>
-#include <rml_point.h>
-#include <rml_problem_setup.h>
 #include <rml_structural_cable_setup.h>
-#include <rml_structural_control_setup.h>
-#include <rml_structural_dynamics_restart_data.h>
-#include <rml_structural_dynamics_setup.h>
-#include <rml_structural_interaction.h>
-#include <rml_time_solver.h>
-#include <rml_variable.h>
 
 #include "rstructural_cable_model_adapter.h"
+#include "rstructural_static_truss_model.h"
 
 namespace
 {
 
-constexpr double referenceTemperature = 293.15;
-
 struct CableModelData
 {
-    std::vector<RStructuralCableVector3> nodes;
+    RStructuralStaticTrussModelData common;
     std::vector<RStructuralCableEquilibriumMember> members;
-    std::vector<uint> memberElementIds;
-    std::vector<double> memberAreas;
-    std::vector<bool> prescribedMask;
-    std::vector<double> prescribedDisplacements;
-    std::vector<double> deadNodalLoads;
 };
 
-[[noreturn]] void fail(const QString &message)
+[[noreturn]] void fail(const char *message)
 {
-    const QByteArray utf8 = message.toUtf8();
-    throw RError(RError::Type::InvalidInput,R_ERROR_REF,"%s",utf8.constData());
-}
-
-bool finitePositive(double value)
-{
-    return std::isfinite(value) && value > 0.0;
-}
-
-double staticComponentValue(const RConditionComponent &component,
-                            const QString &description)
-{
-    if (component.size() != 1)
-    {
-        fail(QString("Cable static mode requires one constant value for %1.").arg(description));
-    }
-    const double value = component.getValue(0);
-    if (!std::isfinite(value))
-    {
-        fail(QString("Cable static mode requires a finite value for %1.").arg(description));
-    }
-    return value;
-}
-
-void validateEnvironmentConditions(const RElementGroup &group, uint groupId)
-{
-    for (uint conditionPosition=0;
-         conditionPosition<group.getNEnvironmentConditions();
-         conditionPosition++)
-    {
-        const REnvironmentCondition &condition = group.getEnvironmentCondition(conditionPosition);
-        switch (condition.getType())
-        {
-            case R_ENVIRONMENT_CONDITION_G_ACCELERATION:
-            {
-                for (uint componentPosition=0;componentPosition<condition.size();componentPosition++)
-                {
-                    const RConditionComponent &component = condition.getComponent(componentPosition);
-                    const RVariableType type = component.getType();
-                    if (type != R_VARIABLE_G_ACCELERATION_X &&
-                        type != R_VARIABLE_G_ACCELERATION_Y &&
-                        type != R_VARIABLE_G_ACCELERATION_Z)
-                    {
-                        fail(QString("Cable static mode does not support gravity component '%1' on group %2.")
-                                 .arg(RVariable::getName(type)).arg(groupId));
-                    }
-                    if (!component.getEnabled())
-                    {
-                        continue;
-                    }
-                    const double value = staticComponentValue(
-                        component,
-                        QString("gravity component '%1' on group %2")
-                            .arg(RVariable::getName(type)).arg(groupId));
-                    if (value != 0.0)
-                    {
-                        fail(QString("Cable static mode requires enabled gravity components to be zero on group %1.")
-                                 .arg(groupId));
-                    }
-                }
-                break;
-            }
-            case R_ENVIRONMENT_CONDITION_TEMPERATURE:
-            {
-                for (uint componentPosition=0;componentPosition<condition.size();componentPosition++)
-                {
-                    const RConditionComponent &component = condition.getComponent(componentPosition);
-                    if (component.getType() != R_VARIABLE_TEMPERATURE)
-                    {
-                        fail(QString("Cable static mode does not support temperature component '%1' on group %2.")
-                                 .arg(RVariable::getName(component.getType())).arg(groupId));
-                    }
-                    if (!component.getEnabled())
-                    {
-                        continue;
-                    }
-                    const double value = staticComponentValue(
-                        component,QString("temperature on group %1").arg(groupId));
-                    const double tolerance = 1.0e-12*referenceTemperature;
-                    if (std::fabs(value-referenceTemperature) > tolerance)
-                    {
-                        fail(QString("Cable static mode is isothermal at 293.15 K; group %1 has a different temperature.")
-                                 .arg(groupId));
-                    }
-                }
-                break;
-            }
-            default:
-                fail(QString("Cable static mode does not support environment condition '%1' on group %2.")
-                         .arg(REnvironmentCondition::getName(condition.getType())).arg(groupId));
-        }
-    }
-}
-
-std::vector<uint> uniqueGroupNodes(const RModel &model,
-                                  const RElementGroup &group)
-{
-    std::set<uint> uniqueNodes;
-    for (uint i=0;i<group.size();i++)
-    {
-        const uint elementId = group.get(i);
-        if (elementId >= model.getNElements())
-        {
-            fail(QString("Cable boundary group references invalid element %1.").arg(elementId));
-        }
-        const RElement &element = model.getElement(elementId);
-        for (uint localNode=0;localNode<element.size();localNode++)
-        {
-            const uint nodeId = element.getNodeId(localNode);
-            if (nodeId >= model.getNNodes())
-            {
-                fail(QString("Cable element %1 references invalid node %2.").arg(elementId).arg(nodeId));
-            }
-            uniqueNodes.insert(nodeId);
-        }
-    }
-    return std::vector<uint>(uniqueNodes.begin(),uniqueNodes.end());
-}
-
-void prescribe(CableModelData &data, uint node, uint component, double value)
-{
-    const std::size_t dof = std::size_t(3)*node+component;
-    if (dof >= data.prescribedMask.size())
-    {
-        fail("Cable displacement condition addresses an invalid node component.");
-    }
-    if (data.prescribedMask[dof])
-    {
-        const double previous = data.prescribedDisplacements[dof];
-        const double tolerance = 1.0e-12*std::max(1.0,std::max(std::fabs(previous),std::fabs(value)));
-        if (std::fabs(previous-value) > tolerance)
-        {
-            fail(QString("Contradictory cable displacement prescriptions at node %1, component %2.")
-                     .arg(node).arg(component));
-        }
-        return;
-    }
-    data.prescribedMask[dof] = true;
-    data.prescribedDisplacements[dof] = value;
-}
-
-void addDeadLoad(CableModelData &data, uint node, uint component, double value)
-{
-    const std::size_t dof = std::size_t(3)*node+component;
-    if (dof >= data.deadNodalLoads.size())
-    {
-        fail("Cable point force addresses an invalid node component.");
-    }
-    data.deadNodalLoads[dof] += value;
-    if (!std::isfinite(data.deadNodalLoads[dof]))
-    {
-        fail("Combined cable point forces are non-finite.");
-    }
-}
-
-void applyBoundaryCondition(REntityGroupType groupType,
-                            const RBoundaryCondition &condition,
-                            const std::vector<uint> &nodes,
-                            CableModelData &data,
-                            uint groupId)
-{
-    const RBoundaryConditionType type = condition.getType();
-    const bool displacement = type == R_BOUNDARY_CONDITION_DISPLACEMENT;
-    const bool force = type == R_BOUNDARY_CONDITION_FORCE;
-    if (!displacement && !force)
-    {
-        fail(QString("Cable mode does not support boundary condition '%1' on group %2.")
-                 .arg(RBoundaryCondition::getName(type)).arg(groupId));
-    }
-    if (groupType != R_ENTITY_GROUP_POINT && groupType != R_ENTITY_GROUP_LINE)
-    {
-        fail(QString("Cable mode supports displacement conditions only on point/line groups; group %1 is unsupported.")
-                 .arg(groupId));
-    }
-    if (force && groupType != R_ENTITY_GROUP_POINT)
-    {
-        fail(QString("Cable mode supports dead nodal FORCE only on point groups; line group %1 is unsupported.")
-                 .arg(groupId));
-    }
-    if (condition.getHasLocalDirection())
-    {
-        fail(QString("Cable mode does not support local-frame boundary conditions on group %1.").arg(groupId));
-    }
-    if (nodes.empty())
-    {
-        fail(QString("Cable boundary condition on empty group %1 would have no effect.").arg(groupId));
-    }
-
-    bool foundEnabledComponent = false;
-    for (uint i=0;i<condition.size();i++)
-    {
-        const RConditionComponent &component = condition.getComponent(i);
-        if (!component.getEnabled())
-        {
-            continue;
-        }
-        foundEnabledComponent = true;
-        uint axis = RConstants::eod;
-        if (displacement)
-        {
-            if (component.getType() == R_VARIABLE_DISPLACEMENT_X) axis = 0;
-            else if (component.getType() == R_VARIABLE_DISPLACEMENT_Y) axis = 1;
-            else if (component.getType() == R_VARIABLE_DISPLACEMENT_Z) axis = 2;
-            else
-                fail(QString("Cable mode does not support displacement component '%1' on group %2.")
-                         .arg(RVariable::getName(component.getType())).arg(groupId));
-        }
-        else
-        {
-            if (component.getType() == R_VARIABLE_FORCE_X) axis = 0;
-            else if (component.getType() == R_VARIABLE_FORCE_Y) axis = 1;
-            else if (component.getType() == R_VARIABLE_FORCE_Z) axis = 2;
-            else
-                fail(QString("Cable mode does not support force component '%1' on group %2.")
-                         .arg(RVariable::getName(component.getType())).arg(groupId));
-        }
-
-        const double value = staticComponentValue(
-            component,
-            QString("%1 component on group %2")
-                .arg(RVariable::getName(component.getType())).arg(groupId));
-        if (displacement)
-        {
-            for (uint node : nodes)
-            {
-                prescribe(data,node,axis,value);
-            }
-        }
-        else
-        {
-            const double nodalValue = value/double(nodes.size());
-            if (!std::isfinite(nodalValue))
-            {
-                fail(QString("Cable point force on group %1 cannot be divided over its nodes.").arg(groupId));
-            }
-            for (uint node : nodes)
-            {
-                addDeadLoad(data,node,axis,nodalValue);
-            }
-        }
-    }
-    if (!foundEnabledComponent)
-    {
-        return;
-    }
+    throw RError(RError::Type::InvalidInput,R_ERROR_REF,"%s",message);
 }
 
 CableModelData buildCableModelData(const RModel &model)
 {
-    const RStructuralCableSetup &setup = model.getProblemSetup().getStructuralCableSetup();
+    const RProblemSetup &problemSetup = model.getProblemSetup();
+    const RStructuralCableSetup &setup = problemSetup.getStructuralCableSetup();
     if (!setup.enabled)
     {
         fail("Cable model adapter requires an enabled structural cable setup.");
     }
+    if (problemSetup.getStructuralPiezoSetup().enabled)
+    {
+        fail("Structural cable and piezo modes cannot be enabled together.");
+    }
     setup.validate(model);
 
-    if (model.getProblemTaskTree().getProblemTypeMask() != R_PROBLEM_STRESS)
-    {
-        fail("Enabled structural cable mode requires a static R_PROBLEM_STRESS-only task.");
-    }
-    if (model.getTimeSolver().getEnabled())
-    {
-        fail("Enabled structural cable mode does not support the legacy time solver.");
-    }
-    const RProblemSetup &problemSetup = model.getProblemSetup();
-    if (problemSetup.getRestart())
-    {
-        fail("Enabled structural cable mode does not support restart.");
-    }
-    if (problemSetup.getStructuralDynamicsSetup().getEnabled())
-    {
-        fail("Enabled structural cable mode does not support second-order dynamics.");
-    }
-    const RStructuralDynamicsRestartData &restartData = problemSetup.getStructuralDynamicsRestartData();
-    if (restartData.available)
-    {
-        fail("Enabled structural cable mode does not support structural restart data.");
-    }
-    const RStructuralControlSetup &control = problemSetup.getStructuralControlSetup();
-    if (control.enabled || !control.controllerId.isEmpty() || !control.channelConditioning.empty())
-    {
-        fail("Enabled structural cable mode does not support structural control setup.");
-    }
-    const RStructuralInteractionSetup &interaction = problemSetup.getStructuralInteractionSetup();
-    if (!interaction.getLinearConstraints().empty() || !interaction.getCouplings().empty() ||
-        !interaction.getSensors().empty() || !interaction.getActuators().empty() ||
-        !interaction.getPrescribedMotions().empty())
-    {
-        fail("Enabled structural cable mode does not support MPCs, couplings, sensors, actuators or prescribed motion.");
-    }
-    if (model.findVariable(R_VARIABLE_TEMPERATURE) != RConstants::eod)
-    {
-        fail("Enabled structural cable mode is isothermal at 293.15 K and does not accept a temperature field.");
-    }
-    if (model.getNNodes() == 0)
-    {
-        fail("Enabled structural cable mode requires at least one node.");
-    }
-
     CableModelData data;
-    data.nodes.resize(model.getNNodes());
-    for (uint node=0;node<model.getNNodes();node++)
-    {
-        const RNode &rNode = model.getNode(node);
-        data.nodes[node] = {{rNode.getX(),rNode.getY(),rNode.getZ()}};
-        for (double coordinate : data.nodes[node])
-        {
-            if (!std::isfinite(coordinate))
-            {
-                fail(QString("Cable node %1 has a non-finite reference coordinate.").arg(node));
-            }
-        }
-    }
+    data.common = RStructuralStaticTrussModel::build(model);
 
-    const uint nElements = model.getNElements();
-    std::vector<uint> lineOwnerCount(nElements,0);
-    std::vector<double> areaByElement(nElements,0.0);
-    std::vector<double> modulusByElement(nElements,0.0);
-    for (uint lineId=0;lineId<model.getNLines();lineId++)
-    {
-        const RLine &line = model.getLine(lineId);
-        if (line.empty())
-        {
-            continue;
-        }
-        const double area = line.getCrossArea();
-        if (!finitePositive(area))
-        {
-            fail(QString("Cable line group %1 requires a finite positive cross-sectional area.").arg(lineId));
-        }
-        const RMaterial &material = line.getMaterial();
-        const uint modulusPosition = material.findPosition(RMaterialProperty::ModulusOfElasiticity);
-        if (modulusPosition >= material.size())
-        {
-            fail(QString("Cable line group %1 has no Young's modulus.").arg(lineId));
-        }
-        const RMaterialProperty &modulusProperty = material.get(modulusPosition);
-        if (modulusProperty.size() == 0)
-        {
-            fail(QString("Cable line group %1 has an empty Young's modulus table.").arg(lineId));
-        }
-        const double youngModulus = modulusProperty.get(referenceTemperature);
-        if (!finitePositive(youngModulus))
-        {
-            fail(QString("Cable line group %1 requires a finite positive Young's modulus at 293.15 K.").arg(lineId));
-        }
-        const double axialRigidity = area*youngModulus;
-        if (!finitePositive(axialRigidity))
-        {
-            fail(QString("Cable line group %1 has invalid axial rigidity EA.").arg(lineId));
-        }
-        for (uint member=0;member<line.size();member++)
-        {
-            const uint elementId = line.get(member);
-            if (elementId >= nElements)
-            {
-                fail(QString("Cable line group %1 references invalid element %2.").arg(lineId).arg(elementId));
-            }
-            const RElement &element = model.getElement(elementId);
-            if (element.getType() != R_ELEMENT_TRUSS1)
-            {
-                fail(QString("Every cable line member must be TRUSS1; element %1 is '%2'.")
-                         .arg(elementId).arg(RElement::getName(element.getType())));
-            }
-            lineOwnerCount[elementId]++;
-            areaByElement[elementId] = area;
-            modulusByElement[elementId] = youngModulus;
-        }
-    }
-
-    std::vector<const RStructuralCableMember*> cableByElement(nElements,nullptr);
+    std::vector<const RStructuralCableMember*> setupByElement(model.getNElements(),nullptr);
     for (const RStructuralCableMember &member : setup.members)
     {
-        if (member.elementId >= nElements)
+        if (member.elementId >= setupByElement.size())
         {
-            fail(QString("Cable setup references invalid element %1.").arg(member.elementId));
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable setup references invalid element %u.",member.elementId);
         }
-        cableByElement[member.elementId] = &member;
+        if (setupByElement[member.elementId])
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable setup configures element %u more than once.",member.elementId);
+        }
+        setupByElement[member.elementId] = &member;
     }
 
-    uint nonPointElementCount = 0;
-    for (uint elementId=0;elementId<nElements;elementId++)
+    data.members.reserve(data.common.members.size());
+    for (const RStructuralStaticTrussMember &member : data.common.members)
     {
-        const RElement &element = model.getElement(elementId);
-        if (element.getType() == R_ELEMENT_POINT)
+        const RStructuralCableMember *cableMember = setupByElement[member.elementId];
+        if (!cableMember)
         {
-            if (lineOwnerCount[elementId] != 0)
-            {
-                fail(QString("Point element %1 cannot be owned by a cable line group.").arg(elementId));
-            }
-            continue;
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable TRUSS1 element %u has no explicit cable setup record.",member.elementId);
         }
-        nonPointElementCount++;
-        if (element.getType() != R_ELEMENT_TRUSS1)
+        RStructuralCableEquilibriumMember equilibriumMember;
+        equilibriumMember.node1 = member.node1;
+        equilibriumMember.node2 = member.node2;
+        // The per-cable setup referenceLength is constitutive L0. The shared
+        // member referenceLength remains the imported geometric mesh length.
+        equilibriumMember.referenceLength = cableMember->referenceLength;
+        equilibriumMember.initialTension = cableMember->initialTension;
+        equilibriumMember.axialRigidity = member.area*member.youngModulus;
+        if (!std::isfinite(equilibriumMember.axialRigidity) || equilibriumMember.axialRigidity <= 0.0)
         {
-            fail(QString("Cable mode only supports TRUSS1 nonpoint elements; element %1 is '%2'.")
-                     .arg(elementId).arg(RElement::getName(element.getType())));
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable TRUSS1 element %u has invalid axial rigidity EA.",member.elementId);
         }
-        if (lineOwnerCount[elementId] != 1)
-        {
-            fail(QString("Cable TRUSS1 element %1 must be uniquely owned by one line group.").arg(elementId));
-        }
-        if (!cableByElement[elementId])
-        {
-            fail(QString("Cable TRUSS1 element %1 has no explicit cable setup record.").arg(elementId));
-        }
-        if (!finitePositive(areaByElement[elementId]) || !finitePositive(modulusByElement[elementId]))
-        {
-            fail(QString("Cable TRUSS1 element %1 has no usable area/material assignment.").arg(elementId));
-        }
+        data.members.push_back(equilibriumMember);
     }
-    if (nonPointElementCount == 0 || nonPointElementCount != setup.members.size())
-    {
-        fail("Cable setup must configure every nonpoint element exactly once.");
-    }
-
-    data.members.reserve(setup.members.size());
-    data.memberElementIds.reserve(setup.members.size());
-    data.memberAreas.reserve(setup.members.size());
-    for (const RStructuralCableMember &member : setup.members)
-    {
-        const RElement &element = model.getElement(member.elementId);
-        if (element.size() != 2)
-        {
-            fail(QString("Cable TRUSS1 element %1 must have two nodes.").arg(member.elementId));
-        }
-        const uint node1 = element.getNodeId(0);
-        const uint node2 = element.getNodeId(1);
-        if (node1 >= model.getNNodes() || node2 >= model.getNNodes() || node1 == node2)
-        {
-            fail(QString("Cable TRUSS1 element %1 has invalid node connectivity.").arg(member.elementId));
-        }
-        const double axialRigidity = areaByElement[member.elementId]*modulusByElement[member.elementId];
-        RStructuralCableEquilibriumMember cableMember;
-        cableMember.node1 = node1;
-        cableMember.node2 = node2;
-        cableMember.referenceLength = member.referenceLength;
-        cableMember.initialTension = member.initialTension;
-        cableMember.axialRigidity = axialRigidity;
-        data.members.push_back(cableMember);
-        data.memberElementIds.push_back(member.elementId);
-        data.memberAreas.push_back(areaByElement[member.elementId]);
-    }
-
-    const std::size_t nDofs = std::size_t(3)*model.getNNodes();
-    data.prescribedMask.assign(nDofs,false);
-    data.prescribedDisplacements.assign(nDofs,0.0);
-    data.deadNodalLoads.assign(nDofs,0.0);
-    for (uint groupId=0;groupId<model.getNElementGroups();groupId++)
-    {
-        const RElementGroup *group = model.getElementGroupPtr(groupId);
-        if (!group)
-        {
-            continue;
-        }
-        // Element groups carry default gravity and temperature conditions. Cable
-        // mode accepts only the isothermal reference state and zero enabled
-        // gravity, since the legacy stress solver applies gravity to line self
-        // weight even when no explicit WEIGHT boundary condition is present.
-        validateEnvironmentConditions(*group,groupId);
-        if (group->getNInitialConditions() != 0)
-        {
-            fail(QString("Cable static mode does not support initial conditions on group %1.").arg(groupId));
-        }
-        if (group->getNBoundaryConditions() == 0)
-        {
-            continue;
-        }
-        const REntityGroupType groupType = model.getEntityGroupType(groupId);
-        const std::vector<uint> nodes = uniqueGroupNodes(model,*group);
-        for (uint bcPosition=0;bcPosition<group->getNBoundaryConditions();bcPosition++)
-        {
-            applyBoundaryCondition(groupType,group->getBoundaryCondition(bcPosition),
-                                   nodes,data,groupId);
-        }
-    }
-
     return data;
-}
-
-void setVariableRange(RVariable &variable, const std::vector<double> &values)
-{
-    if (values.empty())
-    {
-        variable.getVariableData().setMinMaxDisplayValue(0.0,0.0);
-        return;
-    }
-    const auto bounds = std::minmax_element(values.begin(),values.end());
-    variable.getVariableData().setMinMaxDisplayValue(*bounds.first,*bounds.second);
-}
-
-void storeScalar(RModel &model,
-                 RVariableType type,
-                 const std::vector<double> &values)
-{
-    uint position = model.findVariable(type);
-    if (position == RConstants::eod)
-    {
-        position = model.addVariable(type);
-    }
-    RVariable &variable = model.getVariable(position);
-    variable.setApplyType(R_VARIABLE_APPLY_ELEMENT);
-    variable.resize(1,uint(values.size()));
-    for (uint i=0;i<values.size();i++)
-    {
-        variable.setValue(0,i,values[i]);
-    }
-    setVariableRange(variable,values);
-}
-
-void storeVector(RModel &model,
-                 RVariableType type,
-                 uint nNodes,
-                 const std::vector<double> &values,
-                 bool magnitudeRange)
-{
-    uint position = model.findVariable(type);
-    if (position == RConstants::eod)
-    {
-        position = model.addVariable(type);
-    }
-    RVariable &variable = model.getVariable(position);
-    variable.setApplyType(R_VARIABLE_APPLY_NODE);
-    variable.resize(3,nNodes);
-    std::vector<double> rangeValues;
-    rangeValues.reserve(nNodes);
-    for (uint node=0;node<nNodes;node++)
-    {
-        const double x = values[3*node];
-        const double y = values[3*node+1];
-        const double z = values[3*node+2];
-        variable.setValue(0,node,x);
-        variable.setValue(1,node,y);
-        variable.setValue(2,node,z);
-        rangeValues.push_back(magnitudeRange ? std::hypot(std::hypot(x,y),z)
-                                             : std::max(std::fabs(x),std::max(std::fabs(y),std::fabs(z))));
-    }
-    setVariableRange(variable,rangeValues);
 }
 
 }
@@ -601,36 +104,13 @@ RStructuralCableEquilibriumResult RStructuralCableModelAdapter::solve(const RMod
     options.absForceTol = setup.absoluteForceTolerance;
     options.relForceTol = setup.relativeForceTolerance;
     return RStructuralCableEquilibriumSolver::solve(
-        data.nodes,data.members,data.prescribedMask,data.prescribedDisplacements,
-        data.deadNodalLoads,options);
+        data.common.nodes,data.members,data.common.prescribedMask,
+        data.common.prescribedDisplacements,data.common.deadNodalLoads,options);
 }
 
 void RStructuralCableModelAdapter::clearResults(RModel &model)
 {
-    const RVariableType outputTypes[] =
-    {
-        R_VARIABLE_DISPLACEMENT,
-        R_VARIABLE_ROTATION,
-        R_VARIABLE_FORCE,
-        R_VARIABLE_MOMENT,
-        R_VARIABLE_STRESS_X,
-        R_VARIABLE_STRESS_Y,
-        R_VARIABLE_STRESS_Z,
-        R_VARIABLE_STRESS_YZ,
-        R_VARIABLE_STRESS_XZ,
-        R_VARIABLE_STRESS_XY,
-        R_VARIABLE_STRESS_VON_MISES,
-        R_VARIABLE_STRESS_NORMAL,
-        R_VARIABLE_STRESS_SHEAR
-    };
-    for (RVariableType type : outputTypes)
-    {
-        const uint position = model.findVariable(type);
-        if (position != RConstants::eod)
-        {
-            model.removeVariable(position);
-        }
-    }
+    RStructuralStaticTrussModel::clearResults(model);
 }
 
 void RStructuralCableModelAdapter::publish(
@@ -638,45 +118,19 @@ void RStructuralCableModelAdapter::publish(
     const RStructuralCableEquilibriumResult &result)
 {
     const CableModelData data = buildCableModelData(model);
-    const std::size_t expectedDofs = std::size_t(3)*model.getNNodes();
-    if (result.displacements.size() != expectedDofs || result.internalForces.size() != expectedDofs ||
-        result.elementTensions.size() != data.members.size())
+    if (result.elementTensions.size() != data.common.members.size())
     {
-        fail("Converged cable response dimensions do not match the current model.");
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Converged cable tension count does not match the current model.");
     }
-    for (double value : result.displacements)
+    for (double tension : result.elementTensions)
     {
-        if (!std::isfinite(value)) fail("Converged cable displacement contains a non-finite value.");
-    }
-    for (double value : result.internalForces)
-    {
-        if (!std::isfinite(value)) fail("Converged cable internal force contains a non-finite value.");
-    }
-    for (double value : result.elementTensions)
-    {
-        if (!finitePositive(value) && value != 0.0)
-            fail("Converged cable member tension must be finite and nonnegative.");
-    }
-
-    std::vector<double> normalStress(model.getNElements(),0.0);
-    std::vector<double> vonMisesStress(model.getNElements(),0.0);
-    std::vector<double> localStressX(model.getNElements(),0.0);
-    for (std::size_t member=0;member<result.elementTensions.size();member++)
-    {
-        const uint elementId = data.memberElementIds[member];
-        const double stress = result.elementTensions[member]/data.memberAreas[member];
-        if (!std::isfinite(stress))
+        if (!std::isfinite(tension) || tension < 0.0)
         {
-            fail(QString("Cable stress recovery is non-finite for element %1.").arg(elementId));
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Converged cable member tension must be finite and nonnegative.");
         }
-        normalStress[elementId] = stress;
-        vonMisesStress[elementId] = std::fabs(stress);
-        localStressX[elementId] = stress;
     }
-
-    storeVector(model,R_VARIABLE_DISPLACEMENT,model.getNNodes(),result.displacements,true);
-    storeVector(model,R_VARIABLE_FORCE,model.getNNodes(),result.internalForces,false);
-    storeScalar(model,R_VARIABLE_STRESS_NORMAL,normalStress);
-    storeScalar(model,R_VARIABLE_STRESS_VON_MISES,vonMisesStress);
-    storeScalar(model,R_VARIABLE_STRESS_X,localStressX);
+    RStructuralStaticTrussModel::publishMechanical(
+        model,result.displacements,result.internalForces,result.elementTensions);
 }

@@ -12,6 +12,7 @@
 #include "rstructural_control_protocol.h"
 #include "rstructural_control_conditioner.h"
 #include "rstructural_cable_model_adapter.h"
+#include "rstructural_piezo_model_adapter.h"
 #include "rsolvergeneric.h"
 
 class RStructuralDynamicsIntegrator;
@@ -141,6 +142,9 @@ class RSolverStress : public RSolverGeneric
         RStructuralCableEquilibriumResult structuralCableResult;
         bool structuralCableResultReady = false;
         bool structuralCableModeAtConstruction = false;
+        RStructuralPiezoModelResult structuralPiezoResult;
+        bool structuralPiezoResultReady = false;
+        bool structuralPiezoModeAtConstruction = false;
         struct ControlSensorMap
         {
             QString id;
@@ -200,7 +204,7 @@ class RSolverStress : public RSolverGeneric
         //! Update scales.
         void updateScales() override;
 
-        //! Cable mode has its own validated TRUSS1 topology and bypasses the
+        //! Specialized static modes validate TRUSS1 topology and bypass the
         //! legacy material-driven computability scan.
         void findComputableElements(RProblemType problemType) override;
 
@@ -245,6 +249,8 @@ class RSolverStress : public RSolverGeneric
         void statistics() override;
 
         bool isStructuralCableMode() const;
+        bool isStructuralPiezoMode() const;
+        bool isSpecializedStaticTrussMode() const;
 
         //! Local rotations are built from the constraints themselves, see
         //! generateLocalConstraints(), so the generic geometric pass is not used.

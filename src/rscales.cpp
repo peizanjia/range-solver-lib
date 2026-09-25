@@ -69,6 +69,7 @@ double RScales::findScaleFactor(RVariableType variableType) const
         case R_VARIABLE_ACOUSTIC_PARTICLE_VELOCITY:
             return this->metre/this->second;
         case R_VARIABLE_CHARGE_DENSITY:
+        case R_VARIABLE_ELECTRIC_CHARGE:
             return this->ampere*this->second;
         case R_VARIABLE_CONVECTION_COEFFICIENT:
             return this->kilogram*this->kelvin/std::pow(this->second,3);

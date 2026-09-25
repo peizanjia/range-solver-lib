@@ -260,6 +260,43 @@ RModel makeLoadedSlackCable()
     return model;
 }
 
+RModel makeFixedTwoMemberCableWithReversedSetupOrder()
+{
+    RModel model;
+    model.setNNodes(4);
+    model.getNode(0).set(0.0,0.0,0.0);
+    model.getNode(1).set(1.0,0.0,0.0);
+    model.getNode(2).set(3.0,0.0,0.0);
+    model.getNode(3).set(5.0,0.0,0.0);
+
+    RElement first(R_ELEMENT_TRUSS1);
+    first.setNodeId(0,0);
+    first.setNodeId(1,1);
+    model.addElement(first,true,0);
+    RElement second(R_ELEMENT_TRUSS1);
+    second.setNodeId(0,2);
+    second.setNodeId(1,3);
+    model.addElement(second,true,0);
+    assignCableMaterial(model.getLine(0),0.5,1000.0);
+
+    for (uint node=0;node<4;node++)
+    {
+        addPointElement(model,node,node);
+        model.getPoint(node).addBoundaryCondition(
+            displacementCondition({{true,true,true}},{{0.0,0.0,0.0}}));
+    }
+    setZeroGravity(model);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS));
+    RStructuralCableSetup &setup = model.getProblemSetup().getStructuralCableSetup();
+    setup.enabled = true;
+    // The setup order is deliberately opposite to element order and each
+    // member has a different initial tension to detect accidental index reuse.
+    addCableMember(setup,1,2.0,13.0);
+    addCableMember(setup,0,1.0,5.0);
+    setup.bindToModel(model);
+    return model;
+}
+
 double nodeValue(const RModel &model, RVariableType type, uint component, uint node)
 {
     const uint position = model.findVariable(type);
@@ -299,6 +336,8 @@ private slots:
     void directSharedTemperatureMustBeReferenceTemperature();
     void nonReferenceEnvironmentTemperatureRejected();
     void nonzeroEnvironmentGravityRejected();
+    void cableMembersFollowElementIdsWhenSetupOrderIsReversed();
+    void cableAndPiezoModesCannotBeEnabledTogether();
 };
 
 void TestStructuralCableFE::axialExtensionAndStressMatchAnalyticSolution()
@@ -533,6 +572,44 @@ void TestStructuralCableFE::nonzeroEnvironmentGravityRejected()
     catch (const RError &error)
     {
         rejected = error.getMessage().contains("gravity components to be zero",Qt::CaseInsensitive);
+    }
+    QVERIFY(rejected);
+    QVERIFY(model.findVariable(R_VARIABLE_DISPLACEMENT) == RConstants::eod);
+}
+
+void TestStructuralCableFE::cableMembersFollowElementIdsWhenSetupOrderIsReversed()
+{
+    RModel model = makeFixedTwoMemberCableWithReversedSetupOrder();
+    try
+    {
+        RSolver solver(model,QString(),QString());
+        solver.run();
+    }
+    catch (const RError &error)
+    {
+        const QByteArray message = error.getMessage().toUtf8();
+        QFAIL(message.constData());
+    }
+
+    QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_NORMAL,0)-10.0) < 1.0e-9);
+    QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_NORMAL,1)-26.0) < 1.0e-9);
+    QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_X,0)-10.0) < 1.0e-9);
+    QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_X,1)-26.0) < 1.0e-9);
+}
+
+void TestStructuralCableFE::cableAndPiezoModesCannotBeEnabledTogether()
+{
+    RModel model = makeAxialCable();
+    model.getProblemSetup().getStructuralPiezoSetup().enabled = true;
+
+    bool rejected = false;
+    try
+    {
+        RSolver solver(model,QString(),QString());
+    }
+    catch (const RError &error)
+    {
+        rejected = error.getMessage().contains("cannot be enabled together",Qt::CaseInsensitive);
     }
     QVERIFY(rejected);
     QVERIFY(model.findVariable(R_VARIABLE_DISPLACEMENT) == RConstants::eod);

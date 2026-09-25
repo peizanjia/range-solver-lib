@@ -33,6 +33,8 @@ qt_add_library(range-solver-lib
         src/rstructural_cable_kernel.cpp
         src/rstructural_cable_equilibrium.cpp
         src/rstructural_cable_model_adapter.cpp
+        src/rstructural_static_truss_model.cpp
+        src/rstructural_piezo_model_adapter.cpp
         src/rstructural_piezo_kernel.cpp
         src/rstructural_control_force_map.cpp
         src/rstructural_control_conditioner.cpp
@@ -71,6 +73,8 @@ qt_add_library(range-solver-lib
         include/rstructural_cable_kernel.h
         include/rstructural_cable_equilibrium.h
         include/rstructural_cable_model_adapter.h
+        include/rstructural_static_truss_model.h
+        include/rstructural_piezo_model_adapter.h
         include/rstructural_piezo_kernel.h
         include/rstructural_control_force_map.h
         include/rstructural_control_conditioner.h

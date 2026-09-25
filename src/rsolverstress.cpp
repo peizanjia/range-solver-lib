@@ -13,6 +13,7 @@
 #include "rstructural_dynamics_integrator.h"
 #include "rstructural_control_force_map.h"
 #include "rstructural_cable_model_adapter.h"
+#include "rstructural_static_truss_model.h"
 
 namespace
 {
@@ -583,14 +584,17 @@ RSolverStress::RSolverStress(RModel *pModel, const QString &modelFileName, const
     this->problemType = modalAnalysis ? R_PROBLEM_STRESS_MODAL : R_PROBLEM_STRESS;
     this->structuralCableModeAtConstruction =
         this->pModel->getProblemSetup().getStructuralCableSetup().enabled;
-    if (this->structuralCableModeAtConstruction)
+    this->structuralPiezoModeAtConstruction =
+        this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled;
+    if (this->structuralCableModeAtConstruction || this->structuralPiezoModeAtConstruction)
     {
         if (modalAnalysis)
         {
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                         "Enabled structural cable mode requires a non-modal static stress solver.");
+                         "Enabled structural cable/piezo mode requires a non-modal static stress solver.");
         }
         RStructuralCableModelAdapter::validate(*this->pModel);
+        RStructuralPiezoModelAdapter::validate(*this->pModel);
     }
 }
 
@@ -774,10 +778,10 @@ void RSolverStress::setControlCallback(
     const QString &id, const QString &revision,
     std::function<RStructuralControlDecision(const RStructuralControlObservation &)> callback)
 {
-    if (this->isStructuralCableMode() && callback)
+    if (this->isSpecializedStaticTrussMode() && callback)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Structural control callbacks are unsupported in static cable mode.");
+                     "Structural control callbacks are unsupported in static cable/piezo mode.");
     }
     this->controllerId = id;
     this->controllerRevision = revision;
@@ -787,10 +791,10 @@ void RSolverStress::setControlCallback(
 void RSolverStress::setControlStepObserver(
     std::function<void(const RStructuralControlStepRecord &)> observer)
 {
-    if (this->isStructuralCableMode() && observer)
+    if (this->isSpecializedStaticTrussMode() && observer)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Structural control observers are unsupported in static cable mode.");
+                     "Structural control observers are unsupported in static cable/piezo mode.");
     }
     this->controlStepObserver = std::move(observer);
 }
@@ -809,10 +813,10 @@ QString RSolverStress::getPendingControlObserverFailure() const
 void RSolverStress::setSupportResponseObserver(
     std::function<void(const std::vector<RStructuralSupportSample> &)> observer)
 {
-    if (this->isStructuralCableMode() && observer)
+    if (this->isSpecializedStaticTrussMode() && observer)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Structural support-response observers are unsupported in static cable mode.");
+                     "Structural support-response observers are unsupported in static cable/piezo mode.");
     }
     this->supportResponseObserver = std::move(observer);
 }
@@ -828,31 +832,38 @@ bool RSolverStress::hasConverged() const
     {
         return this->structuralCableResultReady;
     }
+    if (this->isStructuralPiezoMode())
+    {
+        return this->structuralPiezoResultReady;
+    }
     return true;
 }
 
 void RSolverStress::validateRunConfiguration() const
 {
     const bool cableEnabled = this->pModel->getProblemSetup().getStructuralCableSetup().enabled;
-    if (cableEnabled != this->structuralCableModeAtConstruction)
+    const bool piezoEnabled = this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled;
+    if (cableEnabled != this->structuralCableModeAtConstruction ||
+        piezoEnabled != this->structuralPiezoModeAtConstruction)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Structural cable mode cannot be enabled or disabled after constructing RSolverStress.");
+                     "Structural cable/piezo mode cannot be enabled or disabled after constructing RSolverStress.");
     }
-    if (!cableEnabled)
+    if (!cableEnabled && !piezoEnabled)
     {
         return;
     }
     if (this->problemType != R_PROBLEM_STRESS)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Enabled structural cable mode requires a non-modal static stress solver.");
+                     "Enabled structural cable/piezo mode requires a non-modal static stress solver.");
     }
     RStructuralCableModelAdapter::validate(*this->pModel);
+    RStructuralPiezoModelAdapter::validate(*this->pModel);
     if (this->supportResponseObserver || this->controlCallback || this->controlStepObserver)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Structural support/control observers are unsupported in static cable mode.");
+                     "Structural support/control observers are unsupported in static cable/piezo mode.");
     }
 
     const RRVector &sharedTemperature = this->pSharedData->findData("element-temperature");
@@ -860,7 +871,7 @@ void RSolverStress::validateRunConfiguration() const
         sharedTemperature.getNRows() != this->pModel->getNElements())
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Static cable mode requires one reference temperature per model element.");
+                     "Static cable/piezo mode requires one reference temperature per model element.");
     }
     for (uint element=0;element<sharedTemperature.getNRows();element++)
     {
@@ -868,7 +879,7 @@ void RSolverStress::validateRunConfiguration() const
         if (!std::isfinite(temperature) || std::fabs(temperature-293.15) > 1.0e-10)
         {
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                         "Static cable mode is isothermal at 293.15 K; shared element temperature is unsupported.");
+                         "Static cable/piezo mode is isothermal at 293.15 K; shared element temperature is unsupported.");
         }
     }
 }
@@ -884,7 +895,7 @@ void RSolverStress::initialize()
 
 void RSolverStress::updateScales()
 {
-    if (this->isStructuralCableMode())
+    if (this->isSpecializedStaticTrussMode())
     {
         this->scales = RScales();
         return;
@@ -898,11 +909,23 @@ bool RSolverStress::isStructuralCableMode() const
            this->pModel->getProblemSetup().getStructuralCableSetup().enabled;
 }
 
+bool RSolverStress::isStructuralPiezoMode() const
+{
+    return this->problemType == R_PROBLEM_STRESS &&
+           this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled;
+}
+
+bool RSolverStress::isSpecializedStaticTrussMode() const
+{
+    return this->isStructuralCableMode() || this->isStructuralPiezoMode();
+}
+
 void RSolverStress::findComputableElements(RProblemType problemType)
 {
-    if (this->isStructuralCableMode())
+    if (this->isSpecializedStaticTrussMode())
     {
         RStructuralCableModelAdapter::validate(*this->pModel);
+        RStructuralPiezoModelAdapter::validate(*this->pModel);
         this->computableElements.resize(this->pModel->getNElements(),false);
         this->computableElements.fill(false);
         for (uint elementId=0;elementId<this->pModel->getNElements();elementId++)
@@ -919,12 +942,15 @@ void RSolverStress::findComputableElements(RProblemType problemType)
 
 void RSolverStress::recover()
 {
-    if (this->isStructuralCableMode())
+    if (this->isSpecializedStaticTrussMode())
     {
         RStructuralCableModelAdapter::validate(*this->pModel);
+        RStructuralPiezoModelAdapter::validate(*this->pModel);
         this->structuralCableResultReady = false;
         this->structuralCableResult = RStructuralCableEquilibriumResult();
-        RStructuralCableModelAdapter::clearResults(*this->pModel);
+        this->structuralPiezoResultReady = false;
+        this->structuralPiezoResult = RStructuralPiezoModelResult();
+        RStructuralStaticTrussModel::clearResults(*this->pModel);
         return;
     }
     this->recoverVariable(R_VARIABLE_DISPLACEMENT,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),0,this->nodeDisplacement.x,0.0);
@@ -1037,9 +1063,10 @@ void RSolverStress::recover()
 
 void RSolverStress::prepare()
 {
-    if (this->isStructuralCableMode())
+    if (this->isSpecializedStaticTrussMode())
     {
         RStructuralCableModelAdapter::validate(*this->pModel);
+        RStructuralPiezoModelAdapter::validate(*this->pModel);
         return;
     }
     const bool structuralDynamics = this->problemType == R_PROBLEM_STRESS &&
@@ -1979,6 +2006,13 @@ void RSolverStress::solve()
             this->structuralCableResultReady = false;
             this->structuralCableResult = RStructuralCableModelAdapter::solve(*this->pModel);
             this->structuralCableResultReady = true;
+        }
+        else if (this->isStructuralPiezoMode())
+        {
+            RStructuralPiezoModelAdapter::validate(*this->pModel);
+            this->structuralPiezoResultReady = false;
+            this->structuralPiezoResult = RStructuralPiezoModelAdapter::solve(*this->pModel);
+            this->structuralPiezoResultReady = true;
         }
         else if (this->problemType == R_PROBLEM_STRESS_MODAL)
         {
@@ -3632,12 +3666,12 @@ void RSolverStress::setDisplacement(const RRVector &v)
 
 void RSolverStress::process()
 {
-    if (this->isStructuralCableMode())
+    if (this->isSpecializedStaticTrussMode())
     {
-        if (!this->structuralCableResultReady)
+        if (!this->hasConverged())
         {
             throw RError(RError::Type::Application,R_ERROR_REF,
-                         "Cable results cannot be processed before equilibrium convergence.");
+                         "Static truss results cannot be processed before equilibrium convergence.");
         }
         return;
     }
@@ -4365,6 +4399,16 @@ void RSolverStress::process()
 
 void RSolverStress::store()
 {
+    if (this->isStructuralPiezoMode())
+    {
+        if (!this->structuralPiezoResultReady)
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Piezo results cannot be published before equilibrium convergence.");
+        }
+        RStructuralPiezoModelAdapter::publish(*this->pModel,this->structuralPiezoResult);
+        return;
+    }
     if (this->isStructuralCableMode())
     {
         if (!this->structuralCableResultReady)
@@ -4694,6 +4738,22 @@ void RSolverStress::store()
 
 void RSolverStress::statistics()
 {
+    if (this->isStructuralPiezoMode())
+    {
+        if (!this->structuralPiezoResultReady)
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Piezo statistics require a converged equilibrium.");
+        }
+        RLogger::info("Piezo static equilibrium converged: free-residual=%g electric-enthalpy=%g\n",
+                      this->structuralPiezoResult.residualNorm,
+                      this->structuralPiezoResult.enthalpy);
+        this->printStats(R_VARIABLE_DISPLACEMENT);
+        this->printStats(R_VARIABLE_STRESS_VON_MISES);
+        this->printStats(R_VARIABLE_FORCE);
+        this->printStats(R_VARIABLE_ELECTRIC_CHARGE);
+        return;
+    }
     if (this->isStructuralCableMode())
     {
         if (!this->structuralCableResultReady)

@@ -28,6 +28,7 @@ set(range_solver_lib_tests
     tst_structural_cable_equilibrium
     tst_structural_cable_fe
     tst_structural_piezo_kernel
+    tst_structural_piezo_fe
     tst_structural_control_force_map
     tst_structural_control_conditioner
     tst_structural_dynamics_fe
