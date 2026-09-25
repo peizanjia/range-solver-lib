@@ -57,6 +57,32 @@ bool RSolverHeat::hasConverged() const
     return this->solveCertified;
 }
 
+void RSolverHeat::setControlledPointHeat(
+    const std::vector<std::pair<uint,double>> &powers)
+{
+    std::vector<bool> seen(this->pModel->getNElements(),false);
+    for (const auto &power : powers)
+    {
+        if (power.first >= this->pModel->getNElements() ||
+            this->pModel->getElement(power.first).getType() != R_ELEMENT_POINT ||
+            !std::isfinite(power.second) || power.second < 0.0 || seen[power.first])
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Controlled heat requires unique POINT elements and finite nonnegative W inputs.");
+        }
+        seen[power.first] = true;
+    }
+    this->controlledPointHeat = powers;
+}
+
+void RSolverHeat::findComputableElements(RProblemType problemType)
+{
+    RSolverGeneric::findComputableElements(problemType);
+    if (problemType == R_PROBLEM_HEAT)
+        for (const auto &power : this->controlledPointHeat)
+            this->computableElements[power.first] = true;
+}
+
 void RSolverHeat::validateRunConfiguration() const
 {
     // RSolverGeneric calls this before every run, before recovery or assembly
@@ -290,6 +316,13 @@ void RSolverHeat::prepare()
     // entity - it is spread over the entity measure to give the source density
     // the assembly below integrates.
     this->generateHeatVector(this->elementHeat,heatSetValues);
+    for (const auto &power : this->controlledPointHeat)
+    {
+        this->elementHeat[power.first] += power.second;
+        if (!std::isfinite(this->elementHeat[power.first]))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Controlled point heat plus existing heat input is non-finite.");
+    }
     // Heat rate per unit area / volume are boundary conditions only - they are
     // applied to surface and volume elements respectively, where the source
     // term is already integrated over the element measure.
@@ -343,7 +376,6 @@ void RSolverHeat::prepare()
 
                 const RElement &element = this->pModel->getElement(elementID);
                 R_ERROR_ASSERT(R_ELEMENT_TYPE_IS_POINT(element.getType()));
-                uint nInp = RElement::getNIntegrationPoints(element.getType());
                 RRMatrix Me(element.size(),element.size());
                 RRMatrix Ke(element.size(),element.size());
                 RRVector fe(element.size());
@@ -352,32 +384,12 @@ void RSolverHeat::prepare()
                 Ke.fill(0.0);
                 fe.fill(0.0);
 
-                for (uint k=0;k<nInp;k++)
-                {
-                    const RElementShapeFunction &shapeFunc = RElement::getShapeFunction(element.getType(),k);
-                    const RRVector &N = shapeFunc.getN();
-                    RRMatrix J, Rt;
-                    double detJ = this->pModel->getElement(elementID).findJacobian(this->pModel->getNodes(),k,J,Rt);
-
-                    for (unsigned m=0;m<element.size();m++)
-                    {
-                        for (unsigned n=0;n<element.size();n++)
-                        {
-                            // Mass
-                            if (timeSolverEnabled)
-                            {
-                                Me[m][n] += N[m] * N[n]
-                                         * this->elementDensity[elementID]
-                                         * this->elementCapacity[elementID]
-                                         * detJ
-                                         * shapeFunc.getW()
-                                         * point.getVolume();
-                            }
-                        }
-                        // Force
-                        fe[m] += (this->elementHeat[elementID] + this->elementJouleHeat[elementID]) * N[m] * detJ * shapeFunc.getW();
-                    }
-                }
+                // POINT has one node and no shape-function integration points.
+                // Its heat condition is a total W input (not a density).
+                if (timeSolverEnabled)
+                    Me[0][0] = this->elementDensity[elementID] *
+                               this->elementCapacity[elementID] * point.getVolume();
+                fe[0] = this->elementHeat[elementID] + this->elementJouleHeat[elementID];
                 this->assemblyMatrix(elementID,Me,Ke,fe,Ap[uint(omp_get_thread_num())],bp[uint(omp_get_thread_num())]);
             }
             catch (const RError &rError)

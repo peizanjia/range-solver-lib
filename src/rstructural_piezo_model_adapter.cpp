@@ -12,6 +12,8 @@
 #include <rbl_rvector.h>
 
 #include <rml_matrix_solver_conf.h>
+#include <rml_line.h>
+#include <rml_material_property.h>
 #include <rml_model.h>
 #include <rml_problem_setup.h>
 #include <rml_structural_cable_setup.h>
@@ -72,7 +74,11 @@ PiezoModelData buildPiezoModelData(const RModel &model)
 
     setup.validate(model);
     PiezoModelData data;
-    data.truss = RStructuralStaticTrussModel::build(model);
+    const bool thermalPiezo = model.getProblemTaskTree().getProblemTypeMask() ==
+        (R_PROBLEM_HEAT | R_PROBLEM_STRESS);
+    if (thermalPiezo && setup.electricalMode != RStructuralPiezoElectricalMode::NodalPotential)
+        fail("Heat->Piezo supports only the nodal-potential coupled rod mode.");
+    data.truss = RStructuralStaticTrussModel::build(model,false,thermalPiezo);
     if (setup.ports.size() != data.truss.members.size())
         fail("Piezo setup must configure exactly one terminal port for every TRUSS1 member.");
 
@@ -117,8 +123,40 @@ double vectorNorm(const std::array<double,3> &value)
     return std::hypot(std::hypot(value[0],value[1]),value[2]);
 }
 
+double integratedThermalStrain(const RMaterialProperty &alpha,double currentKelvin)
+{
+    constexpr double referenceKelvin = 293.15;
+    if (alpha.empty() || !std::isfinite(currentKelvin) || currentKelvin < 0.0)
+        fail("Heat->Piezo requires a finite nodal absolute temperature and a nonempty alpha table.");
+    const double low = std::min(referenceKelvin,currentKelvin);
+    const double high = std::max(referenceKelvin,currentKelvin);
+    double previous = low;
+    double integral = 0.0;
+    for (uint point=0;point<alpha.size();point++)
+    {
+        const double knot = alpha.getKey(point);
+        if (!std::isfinite(knot)) fail("Heat->Piezo alpha table has a non-finite temperature key.");
+        if (knot <= previous || knot >= high) continue;
+        const double left = alpha.get(previous);
+        const double right = alpha.get(knot);
+        if (!std::isfinite(left) || !std::isfinite(right))
+            fail("Heat->Piezo alpha table has a non-finite coefficient.");
+        integral += 0.5*(left+right)*(knot-previous);
+        previous = knot;
+    }
+    const double left = alpha.get(previous);
+    const double right = alpha.get(high);
+    if (!std::isfinite(left) || !std::isfinite(right))
+        fail("Heat->Piezo alpha table has a non-finite coefficient.");
+    integral += 0.5*(left+right)*(high-previous);
+    const double strain = (currentKelvin >= referenceKelvin ? 1.0 : -1.0)*integral;
+    if (!std::isfinite(strain)) fail("Heat->Piezo integrated thermal strain is non-finite.");
+    return strain;
+}
+
 CoupledPiezoModelData buildCoupledPiezoModelData(const RModel &model,
-                                                const PiezoModelData &data)
+                                                const PiezoModelData &data,
+                                                bool useCurrentThermalField = false)
 {
     if (data.truss.nodes.empty() || data.truss.members.empty())
         fail("Nodal-potential piezo mode requires at least one node and TRUSS1 member.");
@@ -139,6 +177,19 @@ CoupledPiezoModelData buildCoupledPiezoModelData(const RModel &model,
     input.prescribedDisplacements.assign(nNodes,0.0);
     input.potentialPrescribed.assign(nNodes,false);
     input.prescribedPotentials.assign(nNodes,0.0);
+
+    const RVariable *temperature = nullptr;
+    if (useCurrentThermalField &&
+        model.getProblemTaskTree().getProblemTypeMask() == (R_PROBLEM_HEAT | R_PROBLEM_STRESS))
+    {
+        const uint position = model.findVariable(R_VARIABLE_TEMPERATURE);
+        if (position == RConstants::eod)
+            fail("Heat->Piezo requires the converged nodal heat result before the piezo solve.");
+        temperature = &model.getVariable(position);
+        if (temperature->getApplyType() != R_VARIABLE_APPLY_NODE ||
+            temperature->getNVectors() != 1 || temperature->getNValues() != model.getNNodes())
+            fail("Heat->Piezo requires one absolute-kelvin temperature per current mesh node.");
+    }
 
     double geometryScale = 1.0;
     for (const auto &node : data.truss.nodes)
@@ -181,6 +232,34 @@ CoupledPiezoModelData buildCoupledPiezoModelData(const RModel &model,
         coupledMember.youngModulus = member.youngModulus;
         coupledMember.coupling = port.coupling;
         coupledMember.permittivity = port.permittivity;
+        if (temperature)
+        {
+            const double first = temperature->getValue(0,member.node1);
+            const double second = temperature->getValue(0,member.node2);
+            if (!std::isfinite(first) || !std::isfinite(second) || first < 0.0 || second < 0.0)
+                fail("Heat->Piezo encountered invalid nodal absolute temperature.");
+            const double meanTemperature = 0.5*(first+second);
+            const RMaterial *material = nullptr;
+            for (uint lineId=0;lineId<model.getNLines();lineId++)
+            {
+                const RLine &line = model.getLine(lineId);
+                for (uint local=0;local<line.size();local++)
+                    if (line.get(local) == member.elementId)
+                        material = &line.getMaterial();
+            }
+            if (!material) fail("Heat->Piezo member has no line material.");
+            const uint alphaPosition = material->findPosition(
+                RMaterialProperty::ThermalExpansionCoefficient);
+            const uint modulusPosition = material->findPosition(
+                RMaterialProperty::ModulusOfElasiticity);
+            if (alphaPosition >= material->size() || modulusPosition >= material->size())
+                fail("Heat->Piezo member requires Young modulus and thermal expansion tables.");
+            coupledMember.thermalStrain = integratedThermalStrain(
+                material->get(alphaPosition),meanTemperature);
+            coupledMember.youngModulus = material->get(modulusPosition).get(meanTemperature);
+            if (!std::isfinite(coupledMember.youngModulus) || coupledMember.youngModulus <= 0.0)
+                fail("Heat->Piezo member has invalid Young modulus at current temperature.");
+        }
         input.members.push_back(coupledMember);
         incident[member.node1] = true;
         incident[member.node2] = true;
@@ -512,7 +591,7 @@ void storeNodalScalar(RModel &model,RVariableType type,const std::vector<double>
 RStructuralPiezoModelResult solveNodalPotential(const RModel &model,
                                                 const PiezoModelData &data)
 {
-    CoupledPiezoModelData coupled = buildCoupledPiezoModelData(model,data);
+    CoupledPiezoModelData coupled = buildCoupledPiezoModelData(model,data,true);
     RStructuralPiezoCoupled1DResult solved;
     try
     {

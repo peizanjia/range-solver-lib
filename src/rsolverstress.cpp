@@ -15,6 +15,9 @@
 #include "rstructural_cable_model_adapter.h"
 #include "rstructural_static_truss_model.h"
 
+#include <rml_problem_task_item.h>
+#include <rml_structural_piezo_setup.h>
+
 namespace
 {
 
@@ -575,6 +578,11 @@ struct RSolverStress::DynamicsStepSnapshot
     QByteArray candidateControllerState;
     RStructuralControlStepRecord trialControlRecord;
     std::vector<ControlSensorMap> controlSensors;
+    RStructuralCableDynamicsResult structuralCableDynamicsResult;
+    bool structuralCableDynamicsResultReady = false;
+    bool hasCableAcceptedTime = false;
+    uint cableAcceptedTimeStep = 0;
+    double cableAcceptedComputedTime = 0.0;
 };
 
 RSolverStress::RSolverStress(RModel *pModel, const QString &modelFileName, const QString &convergenceFileName, RSolverSharedData &sharedData, bool modalAnalysis)
@@ -584,6 +592,9 @@ RSolverStress::RSolverStress(RModel *pModel, const QString &modelFileName, const
     this->problemType = modalAnalysis ? R_PROBLEM_STRESS_MODAL : R_PROBLEM_STRESS;
     this->structuralCableModeAtConstruction =
         this->pModel->getProblemSetup().getStructuralCableSetup().enabled;
+    this->structuralCableDynamicsModeAtConstruction =
+        this->structuralCableModeAtConstruction &&
+        this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
     this->structuralPiezoModeAtConstruction =
         this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled;
     if (this->structuralCableModeAtConstruction || this->structuralPiezoModeAtConstruction)
@@ -705,6 +716,16 @@ void RSolverStress::beginStepTransaction()
     snapshot->candidateControllerState = this->candidateControllerState;
     snapshot->trialControlRecord = this->trialControlRecord;
     snapshot->controlSensors = this->controlSensors;
+    snapshot->structuralCableDynamicsResult = this->structuralCableDynamicsResult;
+    snapshot->structuralCableDynamicsResultReady = this->structuralCableDynamicsResultReady;
+    if (this->isStructuralCableDynamicsMode())
+    {
+        const RTimeSolver &time = this->pModel->getTimeSolver();
+        snapshot->hasCableAcceptedTime = true;
+        snapshot->cableAcceptedTimeStep = time.getCurrentTimeStep() > 0
+            ? time.getCurrentTimeStep()-1 : 0;
+        snapshot->cableAcceptedComputedTime = time.getPreviousTime();
+    }
     this->dynamicsStepSnapshot = std::move(snapshot);
 }
 
@@ -773,6 +794,14 @@ void RSolverStress::rollbackStepTransaction()
     this->candidateControllerState = snapshot.candidateControllerState;
     this->trialControlRecord = snapshot.trialControlRecord;
     this->controlSensors = snapshot.controlSensors;
+    this->structuralCableDynamicsResult = snapshot.structuralCableDynamicsResult;
+    this->structuralCableDynamicsResultReady = snapshot.structuralCableDynamicsResultReady;
+    if (snapshot.hasCableAcceptedTime && this->isStructuralCableDynamicsMode())
+    {
+        RTimeSolver &time = this->pModel->getTimeSolver();
+        time.setCurrentTimeStep(snapshot.cableAcceptedTimeStep);
+        time.setComputedTime(snapshot.cableAcceptedComputedTime);
+    }
     this->dynamicsStepSnapshot.reset();
 }
 
@@ -877,6 +906,10 @@ bool RSolverStress::hasConverged() const
 {
     if (this->isStructuralCableMode())
     {
+        if (this->isStructuralCableDynamicsMode())
+        {
+            return this->structuralCableDynamicsResultReady;
+        }
         return this->structuralCableResultReady;
     }
     if (this->isStructuralPiezoMode())
@@ -890,11 +923,15 @@ void RSolverStress::validateRunConfiguration() const
 {
     const bool cableEnabled = this->pModel->getProblemSetup().getStructuralCableSetup().enabled;
     const bool piezoEnabled = this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled;
+    const bool cableDynamicsEnabled = cableEnabled &&
+        this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
     if (cableEnabled != this->structuralCableModeAtConstruction ||
-        piezoEnabled != this->structuralPiezoModeAtConstruction)
+        piezoEnabled != this->structuralPiezoModeAtConstruction ||
+        (cableEnabled &&
+         cableDynamicsEnabled != this->structuralCableDynamicsModeAtConstruction))
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Structural cable/piezo mode cannot be enabled or disabled after constructing RSolverStress.");
+                     "Structural cable/piezo mode cannot be enabled, disabled or switched between static and transient after constructing RSolverStress.");
     }
     if (!cableEnabled && !piezoEnabled)
     {
@@ -903,7 +940,7 @@ void RSolverStress::validateRunConfiguration() const
     if (this->problemType != R_PROBLEM_STRESS)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Enabled structural cable/piezo mode requires a non-modal static stress solver.");
+                     "Enabled structural cable/piezo mode requires a non-modal stress solver.");
     }
     RStructuralCableModelAdapter::validate(*this->pModel);
     RStructuralPiezoModelAdapter::validate(*this->pModel);
@@ -913,20 +950,30 @@ void RSolverStress::validateRunConfiguration() const
                      "Structural support/control observers are unsupported in static cable/piezo mode.");
     }
 
+    const RStructuralPiezoSetup &piezoSetup =
+        this->pModel->getProblemSetup().getStructuralPiezoSetup();
+    const bool thermalNodalPiezo = piezoEnabled &&
+        piezoSetup.electricalMode == RStructuralPiezoElectricalMode::NodalPotential &&
+        this->pModel->getProblemTaskTree().getProblemTypeMask() ==
+            (R_PROBLEM_HEAT | R_PROBLEM_STRESS);
+
     const RRVector &sharedTemperature = this->pSharedData->findData("element-temperature");
     if (sharedTemperature.getNRows() != 0 &&
         sharedTemperature.getNRows() != this->pModel->getNElements())
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Static cable/piezo mode requires one reference temperature per model element.");
+                     "Cable/piezo mode requires one element temperature per model element.");
     }
     for (uint element=0;element<sharedTemperature.getNRows();element++)
     {
         const double temperature = sharedTemperature[element];
-        if (!std::isfinite(temperature) || std::fabs(temperature-293.15) > 1.0e-10)
+        if (!std::isfinite(temperature) || temperature < 0.0 ||
+            (!thermalNodalPiezo && std::fabs(temperature-293.15) > 1.0e-10))
         {
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                         "Static cable/piezo mode is isothermal at 293.15 K; shared element temperature is unsupported.");
+                         thermalNodalPiezo
+                             ? "Heat->Piezo requires finite nonnegative absolute-kelvin element temperatures."
+                             : "Cable/piezo mode is isothermal at 293.15 K; shared element temperature is unsupported.");
         }
     }
 }
@@ -942,7 +989,7 @@ void RSolverStress::initialize()
 
 void RSolverStress::updateScales()
 {
-    if (this->isSpecializedStaticTrussMode())
+    if (this->isStructuralCableMode() || this->isStructuralPiezoMode())
     {
         this->scales = RScales();
         return;
@@ -956,6 +1003,12 @@ bool RSolverStress::isStructuralCableMode() const
            this->pModel->getProblemSetup().getStructuralCableSetup().enabled;
 }
 
+bool RSolverStress::isStructuralCableDynamicsMode() const
+{
+    return this->isStructuralCableMode() &&
+           this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
+}
+
 bool RSolverStress::isStructuralPiezoMode() const
 {
     return this->problemType == R_PROBLEM_STRESS &&
@@ -964,12 +1017,13 @@ bool RSolverStress::isStructuralPiezoMode() const
 
 bool RSolverStress::isSpecializedStaticTrussMode() const
 {
-    return this->isStructuralCableMode() || this->isStructuralPiezoMode();
+    return (this->isStructuralCableMode() && !this->isStructuralCableDynamicsMode()) ||
+           this->isStructuralPiezoMode();
 }
 
 void RSolverStress::findComputableElements(RProblemType problemType)
 {
-    if (this->isSpecializedStaticTrussMode())
+    if (this->isSpecializedStaticTrussMode() || this->isStructuralCableDynamicsMode())
     {
         RStructuralCableModelAdapter::validate(*this->pModel);
         RStructuralPiezoModelAdapter::validate(*this->pModel);
@@ -989,6 +1043,31 @@ void RSolverStress::findComputableElements(RProblemType problemType)
 
 void RSolverStress::recover()
 {
+    if (this->isStructuralCableDynamicsMode())
+    {
+        RStructuralCableModelAdapter::validate(*this->pModel);
+        this->recoverVariable(R_VARIABLE_DISPLACEMENT,R_VARIABLE_APPLY_NODE,
+                              this->pModel->getNNodes(),0,this->nodeDisplacement.x,0.0);
+        this->recoverVariable(R_VARIABLE_DISPLACEMENT,R_VARIABLE_APPLY_NODE,
+                              this->pModel->getNNodes(),1,this->nodeDisplacement.y,0.0);
+        this->recoverVariable(R_VARIABLE_DISPLACEMENT,R_VARIABLE_APPLY_NODE,
+                              this->pModel->getNNodes(),2,this->nodeDisplacement.z,0.0);
+        this->recoverVariable(R_VARIABLE_VELOCITY,R_VARIABLE_APPLY_NODE,
+                              this->pModel->getNNodes(),0,this->nodeVelocity.x,0.0);
+        this->recoverVariable(R_VARIABLE_VELOCITY,R_VARIABLE_APPLY_NODE,
+                              this->pModel->getNNodes(),1,this->nodeVelocity.y,0.0);
+        this->recoverVariable(R_VARIABLE_VELOCITY,R_VARIABLE_APPLY_NODE,
+                              this->pModel->getNNodes(),2,this->nodeVelocity.z,0.0);
+        this->recoverVariable(R_VARIABLE_ACCELERATION,R_VARIABLE_APPLY_NODE,
+                              this->pModel->getNNodes(),0,this->nodeAcceleration.x,0.0);
+        this->recoverVariable(R_VARIABLE_ACCELERATION,R_VARIABLE_APPLY_NODE,
+                              this->pModel->getNNodes(),1,this->nodeAcceleration.y,0.0);
+        this->recoverVariable(R_VARIABLE_ACCELERATION,R_VARIABLE_APPLY_NODE,
+                              this->pModel->getNNodes(),2,this->nodeAcceleration.z,0.0);
+        this->structuralCableDynamicsResultReady = false;
+        this->structuralCableDynamicsResult = RStructuralCableDynamicsResult();
+        return;
+    }
     if (this->isSpecializedStaticTrussMode())
     {
         RStructuralCableModelAdapter::validate(*this->pModel);
@@ -1113,6 +1192,11 @@ void RSolverStress::recover()
 
 void RSolverStress::prepare()
 {
+    if (this->isStructuralCableDynamicsMode())
+    {
+        RStructuralCableModelAdapter::validate(*this->pModel);
+        return;
+    }
     if (this->isSpecializedStaticTrussMode())
     {
         RStructuralCableModelAdapter::validate(*this->pModel);
@@ -2074,7 +2158,33 @@ void RSolverStress::solve()
 {
     try
     {
-        if (this->isStructuralCableMode())
+        if (this->isStructuralCableDynamicsMode())
+        {
+            RStructuralCableModelAdapter::validate(*this->pModel);
+            const std::size_t nDofs = std::size_t(3)*this->pModel->getNNodes();
+            std::vector<double> previousDisplacements(nDofs,0.0);
+            std::vector<double> previousVelocities(nDofs,0.0);
+            std::vector<double> previousAccelerations(nDofs,0.0);
+            for (uint node=0;node<this->pModel->getNNodes();node++)
+            {
+                previousDisplacements[3*node] = this->nodeDisplacement.x[node];
+                previousDisplacements[3*node+1] = this->nodeDisplacement.y[node];
+                previousDisplacements[3*node+2] = this->nodeDisplacement.z[node];
+                previousVelocities[3*node] = this->nodeVelocity.x[node];
+                previousVelocities[3*node+1] = this->nodeVelocity.y[node];
+                previousVelocities[3*node+2] = this->nodeVelocity.z[node];
+                previousAccelerations[3*node] = this->nodeAcceleration.x[node];
+                previousAccelerations[3*node+1] = this->nodeAcceleration.y[node];
+                previousAccelerations[3*node+2] = this->nodeAcceleration.z[node];
+            }
+            this->structuralCableDynamicsResultReady = false;
+            this->structuralCableDynamicsResult =
+                RStructuralCableModelAdapter::solveDynamics(
+                    *this->pModel,previousDisplacements,previousVelocities,
+                    previousAccelerations);
+            this->structuralCableDynamicsResultReady = true;
+        }
+        else if (this->isStructuralCableMode())
         {
             RStructuralCableModelAdapter::validate(*this->pModel);
             this->structuralCableResultReady = false;
@@ -3740,12 +3850,12 @@ void RSolverStress::setDisplacement(const RRVector &v)
 
 void RSolverStress::process()
 {
-    if (this->isSpecializedStaticTrussMode())
+    if (this->isSpecializedStaticTrussMode() || this->isStructuralCableDynamicsMode())
     {
         if (!this->hasConverged())
         {
             throw RError(RError::Type::Application,R_ERROR_REF,
-                         "Static truss results cannot be processed before equilibrium convergence.");
+                         "Specialized truss results cannot be processed before solver convergence.");
         }
         return;
     }
@@ -4473,6 +4583,17 @@ void RSolverStress::process()
 
 void RSolverStress::store()
 {
+    if (this->isStructuralCableDynamicsMode())
+    {
+        if (!this->structuralCableDynamicsResultReady)
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Cable transient results cannot be published before Newton convergence.");
+        }
+        RStructuralCableModelAdapter::publishDynamics(
+            *this->pModel,this->structuralCableDynamicsResult);
+        return;
+    }
     if (this->isStructuralPiezoMode())
     {
         if (!this->structuralPiezoResultReady)
@@ -4830,6 +4951,27 @@ void RSolverStress::statistics()
     }
     if (this->isStructuralCableMode())
     {
+        if (this->isStructuralCableDynamicsMode())
+        {
+            if (!this->structuralCableDynamicsResultReady)
+            {
+                throw RError(RError::Type::Application,R_ERROR_REF,
+                             "Cable transient statistics require a converged Newmark step.");
+            }
+            RLogger::info("Cable transient step converged: iterations=%zu free-residual=%g "
+                          "strain-energy=%g kinetic-energy=%g energy-balance-error=%g\n",
+                          this->structuralCableDynamicsResult.iterations,
+                          this->structuralCableDynamicsResult.residualNorm,
+                          this->structuralCableDynamicsResult.strainEnergy,
+                          this->structuralCableDynamicsResult.kineticEnergy,
+                          this->structuralCableDynamicsResult.energyBalanceError);
+            this->printStats(R_VARIABLE_DISPLACEMENT);
+            this->printStats(R_VARIABLE_VELOCITY);
+            this->printStats(R_VARIABLE_ACCELERATION);
+            this->printStats(R_VARIABLE_STRESS_VON_MISES);
+            this->printStats(R_VARIABLE_FORCE);
+            return;
+        }
         if (!this->structuralCableResultReady)
         {
             throw RError(RError::Type::Application,R_ERROR_REF,

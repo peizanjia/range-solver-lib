@@ -5,7 +5,13 @@
 #include <limits>
 #include <stdexcept>
 
+#include <rbl_error.h>
+#include <rml_model.h>
+#include <rml_structural_interaction.h>
+
 #include "rstructural_thermal_control.h"
+#include "rstructural_thermal_fe_adapter.h"
+#include "rsolver.h"
 
 namespace
 {
@@ -84,6 +90,87 @@ bool sameState(const RStructuralThermalControlState &left,
     }
     return true;
 }
+
+void setComponent(RBoundaryCondition &condition,RVariableType type,double value)
+{
+    const uint position = condition.findComponentPosition(type);
+    if (position == RConstants::eod) throw std::logic_error("missing boundary component");
+    RConditionComponent &component = condition.getComponent(position);
+    component.setEnabled(true);
+    component.clear();
+    component.add(0.0,value);
+}
+
+RModel thermalFeRod()
+{
+    RModel model;
+    model.setNNodes(2);
+    model.getNode(0).set(0.0,0.0,0.0);
+    model.getNode(1).set(1.0,0.0,0.0);
+    RElement rod(R_ELEMENT_TRUSS1);
+    rod.setNodeId(0,0);
+    rod.setNodeId(1,1);
+    model.addElement(rod,true,0);
+    RLine &line = model.getLine(0);
+    line.setCrossArea(1.0);
+    RMaterial material(RMaterial::Solid);
+    const auto property = [&material](RMaterialProperty::Type type,double value) {
+        RMaterialProperty entry(type);
+        entry.add(293.15,value);
+        material.add(entry);
+    };
+    property(RMaterialProperty::ModulusOfElasiticity,10.0);
+    property(RMaterialProperty::PoissonRatio,0.0);
+    property(RMaterialProperty::ThermalExpansionCoefficient,0.01);
+    property(RMaterialProperty::ThermalConductivity,1.0);
+    property(RMaterialProperty::HeatCapacity,3.0);
+    property(RMaterialProperty::Density,1.0);
+    property(RMaterialProperty::Emissivity,0.0);
+    line.setMaterial(material);
+    for (uint node=0;node<2;node++)
+    {
+        RElement point(R_ELEMENT_POINT);
+        point.setNodeId(0,node);
+        model.addElement(point,true,node);
+        model.getPoint(node).setVolume(0.0);
+        RBoundaryCondition support(R_BOUNDARY_CONDITION_DISPLACEMENT);
+        if (node == 0) setComponent(support,R_VARIABLE_DISPLACEMENT_X,0.0);
+        else support.getComponent(support.findComponentPosition(
+                 R_VARIABLE_DISPLACEMENT_X)).setEnabled(false);
+        setComponent(support,R_VARIABLE_DISPLACEMENT_Y,0.0);
+        setComponent(support,R_VARIABLE_DISPLACEMENT_Z,0.0);
+        model.getPoint(node).addBoundaryCondition(support);
+    }
+    RBoundaryCondition anchorTemperature(R_BOUNDARY_CONDITION_TEMPERATURE);
+    setComponent(anchorTemperature,R_VARIABLE_TEMPERATURE,293.15);
+    model.getPoint(0).addBoundaryCondition(anchorTemperature);
+    RProblemTaskItem sequence;
+    sequence.addChild(RProblemTaskItem(R_PROBLEM_HEAT));
+    sequence.addChild(RProblemTaskItem(R_PROBLEM_STRESS));
+    model.setProblemTaskTree(sequence);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setSolverCvgValue(1.0e-12);
+
+    auto &catalog = model.getProblemSetup().getStructuralInteractionSetup();
+    RStructuralActuator actuator;
+    actuator.id = "heater-fe";
+    actuator.type = RStructuralActuatorType::HeatSource;
+    actuator.target.scope = RStructuralTargetScope::Node;
+    actuator.target.nodeId = 1;
+    actuator.variable = R_VARIABLE_HEAT;
+    actuator.unit = "W";
+    actuator.minimum = 0.0;
+    actuator.maximum = 2.0;
+    catalog.getActuators().push_back(actuator);
+    RStructuralSensor sensor;
+    sensor.id = "sensor-fe";
+    sensor.target.scope = RStructuralTargetScope::Node;
+    sensor.target.nodeId = 1;
+    sensor.quantity = RStructuralSensorQuantity::Temperature;
+    sensor.aggregation = RStructuralSensorAggregation::Point;
+    sensor.unit = "K";
+    catalog.getSensors().push_back(sensor);
+    return model;
+}
 }
 
 class TestStructuralThermalControl : public QObject
@@ -99,7 +186,116 @@ private slots:
     void failedSubstepPublishesNoCandidate();
     void checkpointRejectsTruncationCorruptionAndDifferentConfiguration();
     void observationsUseStableNodeAndSensorIds();
+    void pointHeaterControlsTransientHeatAndStressFE();
+    void legacyPointHeatBoundaryActuallyAppliesWatts();
 };
+
+void TestStructuralThermalControl::legacyPointHeatBoundaryActuallyAppliesWatts()
+{
+    RModel model = thermalFeRod();
+    RBoundaryCondition heater(R_BOUNDARY_CONDITION_HEAT);
+    setComponent(heater,R_VARIABLE_HEAT,2.0);
+    model.getPoint(1).addBoundaryCondition(heater);
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_HEAT));
+    RTimeSolver &time = model.getTimeSolver();
+    time.setEnabled(true);
+    time.setInputNTimeSteps(1);
+    time.setInputStartTime(0.0);
+    time.setInputTimeStepSize(1.0);
+    time.setTimeMarchApproximation(R_TIME_MARCH_BACKWARD);
+    RSolver solver(model,QString(),QString());
+    try { solver.run(); }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
+    QVERIFY(std::abs(model.getVariable(model.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1)-
+                     294.15) < 1.0e-8);
+}
+
+void TestStructuralThermalControl::pointHeaterControlsTransientHeatAndStressFE()
+{
+    RModel model = thermalFeRod();
+    RStructuralThermalControlConfig settings;
+    settings.thermalSubstepSeconds = 1.0;
+    settings.thermalSubstepsPerMechanicalMacrostep = 1;
+    settings.mechanicalMacrostepsPerControllerSample = 1;
+    const QString heatedNode = RStructuralThermalFEAdapter::nodeId(model,1);
+    settings.channels = {{"heater-fe",heatedNode,"sensor-fe",heatedNode,
+                          294.15,294.15,2.0,0.0,2.0}};
+    settings.sparseObservationNodeIds = {heatedNode};
+    const RStructuralThermalControlScheduler scheduler(settings);
+    auto accepted = scheduler.initialState(RStructuralThermalFEAdapter::capture(model));
+    RStructuralThermalControlScheduler::Result first;
+    try { first = RStructuralThermalFEAdapter::advance(model,scheduler,accepted); }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
+    QCOMPARE(first.channels.size(),std::size_t(1));
+    QCOMPARE(first.channels[0].appliedEnergyJoules,2.0);
+    QVERIFY(std::abs(model.getVariable(model.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1)-
+                     294.15) < 1.0e-8);
+    QVERIFY(std::abs(model.getVariable(model.findVariable(R_VARIABLE_DISPLACEMENT)).getValue(0,1)-
+                     0.005) < 1.0e-8);
+    accepted = first.candidate;
+    RStructuralThermalControlScheduler::Result second;
+    try { second = RStructuralThermalFEAdapter::advance(model,scheduler,accepted); }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
+    QCOMPARE(second.channels[0].appliedEnergyJoules,0.0);
+    // The legacy heat FE evaluates conduction and capacity on the prior
+    // accepted displaced length (1.005 m), then restores reference nodes.
+    const double deformedLength = 1.005;
+    const double expectedCooldown = 293.15 +
+        deformedLength/(deformedLength+1.0/deformedLength);
+    QVERIFY(std::abs(model.getVariable(model.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1)-
+                     expectedCooldown) < 1.0e-6);
+    QCOMPARE(second.candidate.channels[0].cumulativeAppliedEnergyJoules,2.0);
+
+    RModel resumedModel(model);
+    const QByteArray serializedState = scheduler.serialize(second.candidate);
+
+    const double acceptedTemperature =
+        model.getVariable(model.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1);
+    const double acceptedDisplacement =
+        model.getVariable(model.findVariable(R_VARIABLE_DISPLACEMENT)).getValue(0,1);
+    const double acceptedTime = model.getTimeSolver().getComputedTime();
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setSolverCvgValue(-1.0);
+    bool failed = false;
+    try { (void)RStructuralThermalFEAdapter::advance(model,scheduler,second.candidate); }
+    catch (const RError &) { failed = true; }
+    catch (const std::exception &) { failed = true; }
+    QVERIFY(failed);
+    QCOMPARE(model.getVariable(model.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1),
+             acceptedTemperature);
+    QCOMPARE(model.getVariable(model.findVariable(R_VARIABLE_DISPLACEMENT)).getValue(0,1),
+             acceptedDisplacement);
+    QCOMPARE(model.getTimeSolver().getComputedTime(),acceptedTime);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setSolverCvgValue(1.0e-12);
+    RStructuralThermalControlScheduler::Result retry;
+    try { retry = RStructuralThermalFEAdapter::advance(model,scheduler,second.candidate); }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
+    QCOMPARE(retry.candidate.completedMechanicalMacrosteps,quint64(3));
+    QCOMPARE(retry.channels[0].appliedEnergyJoules,2.0);
+
+    const auto restored = scheduler.deserialize(serializedState);
+    RStructuralThermalControlScheduler::Result resumed;
+    try { resumed = RStructuralThermalFEAdapter::advance(resumedModel,scheduler,restored); }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
+    QCOMPARE(resumed.candidate.channels[0].cumulativeAppliedEnergyJoules,
+             retry.candidate.channels[0].cumulativeAppliedEnergyJoules);
+    QCOMPARE(resumedModel.getVariable(resumedModel.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1),
+             model.getVariable(model.findVariable(R_VARIABLE_TEMPERATURE)).getValue(0,1));
+    QCOMPARE(resumedModel.getVariable(resumedModel.findVariable(R_VARIABLE_DISPLACEMENT)).getValue(0,1),
+             model.getVariable(model.findVariable(R_VARIABLE_DISPLACEMENT)).getValue(0,1));
+
+    RModel changedMesh(model);
+    changedMesh.getNode(1).set(1.000001,0.0,0.0);
+    bool rejectedMesh = false;
+    try { (void)RStructuralThermalFEAdapter::advance(changedMesh,scheduler,retry.candidate); }
+    catch (const RError &) { rejectedMesh = true; }
+    catch (const std::exception &) { rejectedMesh = true; }
+    QVERIFY(rejectedMesh);
+}
 
 void TestStructuralThermalControl::bangBangAcceptsThreeJouleBalancedSteps()
 {

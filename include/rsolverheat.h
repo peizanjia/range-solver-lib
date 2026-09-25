@@ -3,6 +3,8 @@
 
 #include <rbl_r3vector.h>
 
+#include <utility>
+
 #include "rsolvergeneric.h"
 
 class RSolverHeat : public RSolverGeneric
@@ -55,7 +57,15 @@ class RSolverHeat : public RSolverGeneric
         //! Check if solver has converged.
         bool hasConverged() const override;
 
+        //! Additive W inputs on uniquely identified POINT elements for one
+        //! trial heat solve. The caller owns the enclosing macrostep rollback.
+        void setControlledPointHeat(const std::vector<std::pair<uint,double>> &powers);
+
     protected:
+
+        std::vector<std::pair<uint,double>> controlledPointHeat;
+
+        void findComputableElements(RProblemType problemType) override;
 
         //! Recover previously computed results from the shared data container.
         void recoverSharedData() override;

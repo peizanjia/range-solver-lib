@@ -19,6 +19,8 @@ struct RStructuralPiezoCoupled1DMember
     double youngModulus = 0.0;
     double coupling = 0.0;
     double permittivity = 0.0;
+    //! Dimensionless integrated free thermal strain for this member.
+    double thermalStrain = 0.0;
 };
 
 //! Complete input for a linear coupled 1-D piezoelectric FE solve.

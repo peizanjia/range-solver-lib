@@ -13,6 +13,7 @@
 #include <rml_structural_dynamics_restart_data.h>
 #include <rml_structural_dynamics_setup.h>
 #include <rml_structural_interaction.h>
+#include <rml_structural_piezo_setup.h>
 #include <rml_time_solver.h>
 #include <rml_variable.h>
 
@@ -49,7 +50,8 @@ double staticComponentValue(const RConditionComponent &component,
     return value;
 }
 
-void validateEnvironmentConditions(const RElementGroup &group, uint groupId)
+void validateEnvironmentConditions(const RElementGroup &group, uint groupId,
+                                   bool allowThermalPiezo)
 {
     for (uint conditionPosition=0;
          conditionPosition<group.getNEnvironmentConditions();
@@ -104,7 +106,8 @@ void validateEnvironmentConditions(const RElementGroup &group, uint groupId)
                     const double value = staticComponentValue(
                         component,QString("temperature on group %1").arg(groupId));
                     const double tolerance = 1.0e-12*referenceTemperature;
-                    if (std::fabs(value-referenceTemperature) > tolerance)
+                    if (value < 0.0 ||
+                        (!allowThermalPiezo && std::fabs(value-referenceTemperature) > tolerance))
                     {
                         fail(QString("Static TRUSS1 mode is isothermal at 293.15 K; group %1 has a different temperature.")
                                  .arg(groupId));
@@ -335,13 +338,16 @@ void storeVector(RModel &model,
 
 }
 
-RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(const RModel &model)
+RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(
+    const RModel &model,bool allowStructuralDynamics,bool allowThermalPiezo)
 {
-    if (model.getProblemTaskTree().getProblemTypeMask() != R_PROBLEM_STRESS)
+    const RProblemTypeMask taskMask = model.getProblemTaskTree().getProblemTypeMask();
+    if (taskMask != R_PROBLEM_STRESS &&
+        !(allowThermalPiezo && taskMask == (R_PROBLEM_HEAT | R_PROBLEM_STRESS)))
     {
         fail("Static TRUSS1 mode requires an R_PROBLEM_STRESS-only task.");
     }
-    if (model.getTimeSolver().getEnabled())
+    if (model.getTimeSolver().getEnabled() && !allowStructuralDynamics)
     {
         fail("Static TRUSS1 mode does not support the legacy time solver.");
     }
@@ -350,7 +356,7 @@ RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(const RModel 
     {
         fail("Static TRUSS1 mode does not support restart.");
     }
-    if (problemSetup.getStructuralDynamicsSetup().getEnabled())
+    if (problemSetup.getStructuralDynamicsSetup().getEnabled() && !allowStructuralDynamics)
     {
         fail("Static TRUSS1 mode does not support second-order dynamics.");
     }
@@ -370,7 +376,7 @@ RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(const RModel 
     {
         fail("Static TRUSS1 mode does not support MPCs, couplings, sensors, actuators or prescribed motion.");
     }
-    if (model.findVariable(R_VARIABLE_TEMPERATURE) != RConstants::eod)
+    if (model.findVariable(R_VARIABLE_TEMPERATURE) != RConstants::eod && !allowThermalPiezo)
     {
         fail("Static TRUSS1 mode is isothermal at 293.15 K and does not accept a temperature field.");
     }
@@ -522,7 +528,7 @@ RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(const RModel 
         {
             continue;
         }
-        validateEnvironmentConditions(*group,groupId);
+        validateEnvironmentConditions(*group,groupId,allowThermalPiezo);
         if (group->getNInitialConditions() != 0)
         {
             fail(QString("Static TRUSS1 mode does not support initial conditions on group %1.").arg(groupId));
@@ -535,7 +541,14 @@ RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(const RModel 
         const std::vector<uint> nodes = uniqueGroupNodes(model,*group);
         for (uint bcPosition=0;bcPosition<group->getNBoundaryConditions();bcPosition++)
         {
-            applyBoundaryCondition(groupType,group->getBoundaryCondition(bcPosition),
+            const RBoundaryCondition &condition = group->getBoundaryCondition(bcPosition);
+            if (allowThermalPiezo &&
+                (condition.getType() == R_BOUNDARY_CONDITION_TEMPERATURE ||
+                 condition.getType() == R_BOUNDARY_CONDITION_HEAT ||
+                 condition.getType() == R_BOUNDARY_CONDITION_HEAT_RATE_AREA ||
+                 condition.getType() == R_BOUNDARY_CONDITION_HEAT_RATE_VOLUME))
+                continue;
+            applyBoundaryCondition(groupType,condition,
                                    nodes,data,groupId);
         }
     }
@@ -576,9 +589,14 @@ void RStructuralStaticTrussModel::publishMechanical(
     RModel &model,
     const std::vector<double> &displacements,
     const std::vector<double> &internalForces,
-    const std::vector<double> &memberAxialForces)
+    const std::vector<double> &memberAxialForces,
+    bool allowStructuralDynamics)
 {
-    const RStructuralStaticTrussModelData data = RStructuralStaticTrussModel::build(model);
+    const bool thermalPiezo = model.getProblemSetup().getStructuralPiezoSetup().enabled &&
+        model.getProblemTaskTree().getProblemTypeMask() ==
+            (R_PROBLEM_HEAT | R_PROBLEM_STRESS);
+    const RStructuralStaticTrussModelData data = RStructuralStaticTrussModel::build(
+        model,allowStructuralDynamics,thermalPiezo);
     const std::size_t expectedDofs = std::size_t(3)*model.getNNodes();
     if (displacements.size() != expectedDofs || internalForces.size() != expectedDofs ||
         memberAxialForces.size() != data.members.size())

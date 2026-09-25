@@ -19,6 +19,7 @@
 #include <rml_variable.h>
 
 #include "rstructural_piezo_model_adapter.h"
+#include "rsolver.h"
 
 namespace
 {
@@ -243,7 +244,78 @@ private slots:
     void rejectsMissingGaugeNonCollinearGeometryAndTransverseLoads();
     void failedSolveAndInvalidPublishDoNotLeaveNodalOutputs();
     void publishesNodalPotentialAndPhysicalChargeWithCorrectScope();
+    void heatThenConstrainedPiezoRodMatchesForceAndCharge();
 };
+
+void TestStructuralPiezoNetworkFE::heatThenConstrainedPiezoRodMatchesForceAndCharge()
+{
+    RModel model = makeNodalPotentialRod(2,true,0.0);
+    RMaterial material = model.getLine(0).getMaterial();
+    auto addProperty = [&material](RMaterialProperty::Type type,double value) {
+        RMaterialProperty property(type);
+        property.add(293.15,value);
+        material.add(property);
+    };
+    addProperty(RMaterialProperty::ThermalExpansionCoefficient,1.0e-3);
+    addProperty(RMaterialProperty::ThermalConductivity,2.0);
+    addProperty(RMaterialProperty::HeatCapacity,500.0);
+    addProperty(RMaterialProperty::Density,8000.0);
+    addProperty(RMaterialProperty::PoissonRatio,0.0);
+    addProperty(RMaterialProperty::Emissivity,0.0);
+    model.getLine(0).setMaterial(material);
+    model.getPoint(2).addBoundaryCondition(
+        displacementCondition({{true,false,false}},{{0.0,0.0,0.0}}));
+    for (uint node : {0u,2u})
+    {
+        RBoundaryCondition temperature(R_BOUNDARY_CONDITION_TEMPERATURE);
+        setComponent(temperature,R_VARIABLE_TEMPERATURE,true,393.15);
+        model.getPoint(node).addBoundaryCondition(temperature);
+    }
+    RProblemTaskItem sequence;
+    sequence.addChild(RProblemTaskItem(R_PROBLEM_HEAT));
+    sequence.addChild(RProblemTaskItem(R_PROBLEM_STRESS));
+    model.setProblemTaskTree(sequence);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setSolverCvgValue(1.0e-12);
+
+    RSolver solver(model,QString(),QString());
+    try { solver.run(); }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
+    for (uint node=0;node<3;node++)
+    {
+        QVERIFY(std::abs(nodalValue(model,R_VARIABLE_TEMPERATURE,0,node)-393.15) < 1.0e-8);
+        QVERIFY(std::abs(nodalValue(model,R_VARIABLE_DISPLACEMENT,0,node)) < 1.0e-10);
+        QVERIFY(std::abs(nodalValue(model,R_VARIABLE_ELECTRIC_POTENTIAL,0,node)) < 1.0e-10);
+    }
+    // c=10, e=2, A=0.5, alpha*DeltaT=0.1: F=-0.5 N,
+    // D=-0.2 C/m^2 and each directed right electrode carries +0.1 C.
+    QVERIFY(std::abs(nodalValue(model,R_VARIABLE_ELECTRIC_CHARGE,0,0)+0.1) < 1.0e-9);
+    QVERIFY(std::abs(nodalValue(model,R_VARIABLE_ELECTRIC_CHARGE,0,2)-0.1) < 1.0e-9);
+    QVERIFY(std::abs(nodalValue(model,R_VARIABLE_STRESS_X,0,0)+1.0) < 1.0e-9);
+    QVERIFY(std::abs(nodalValue(model,R_VARIABLE_STRESS_X,0,1)+1.0) < 1.0e-9);
+
+    RModel openCircuit = makeNodalPotentialRod(2,false,0.0);
+    openCircuit.getLine(0).setMaterial(material);
+    for (uint node : {0u,2u})
+    {
+        RBoundaryCondition temperature(R_BOUNDARY_CONDITION_TEMPERATURE);
+        setComponent(temperature,R_VARIABLE_TEMPERATURE,true,393.15);
+        openCircuit.getPoint(node).addBoundaryCondition(temperature);
+    }
+    openCircuit.setProblemTaskTree(sequence);
+    openCircuit.getMatrixSolverConf(RMatrixSolverConf::CG).setSolverCvgValue(1.0e-12);
+    RSolver openSolver(openCircuit,QString(),QString());
+    try { openSolver.run(); }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    catch (const std::exception &error) { QFAIL(error.what()); }
+    // Open circuit and traction-free: both the elastic strain and E vanish.
+    const double expectedStrain = 0.1;
+    QVERIFY(std::abs(nodalValue(openCircuit,R_VARIABLE_DISPLACEMENT,0,2)-
+                     4.0*expectedStrain) < 1.0e-8);
+    QVERIFY(std::abs(nodalValue(openCircuit,R_VARIABLE_ELECTRIC_POTENTIAL,0,2)) < 1.0e-8);
+    QVERIFY(std::abs(nodalValue(openCircuit,R_VARIABLE_ELECTRIC_CHARGE,0,2)) < 1.0e-9);
+    QVERIFY(std::abs(nodalValue(openCircuit,R_VARIABLE_STRESS_X,0,0)) < 1.0e-9);
+}
 
 void TestStructuralPiezoNetworkFE::openCircuitRodMatchesAnalyticCoupledSolution()
 {

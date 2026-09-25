@@ -37,7 +37,11 @@ class RStructuralStaticTrussModel
 {
     public:
         //! Validate common static restrictions and extract model data.
-        static RStructuralStaticTrussModelData build(const RModel &model);
+        //! Optional modes preserve all shared mesh/BC checks while allowing
+        //! a caller-owned dynamic or steady Heat->Piezo solve.
+        static RStructuralStaticTrussModelData build(
+            const RModel &model,bool allowStructuralDynamics = false,
+            bool allowThermalPiezo = false);
 
         //! Clear stale structural and electric-charge output fields.
         static void clearResults(RModel &model);
@@ -49,7 +53,8 @@ class RStructuralStaticTrussModel
             RModel &model,
             const std::vector<double> &displacements,
             const std::vector<double> &internalForces,
-            const std::vector<double> &memberAxialForces);
+            const std::vector<double> &memberAxialForces,
+            bool allowStructuralDynamics = false);
 };
 
 #endif // RSTRUCTURAL_STATIC_TRUSS_MODEL_H

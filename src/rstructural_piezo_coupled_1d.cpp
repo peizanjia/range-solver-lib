@@ -166,7 +166,7 @@ ValidatedInput validateInput(const RStructuralPiezoCoupled1DInput &input)
         if (!std::isfinite(member.area) || member.area <= 0.0 ||
             !std::isfinite(member.youngModulus) || member.youngModulus <= 0.0 ||
             !std::isfinite(member.coupling) || !std::isfinite(member.permittivity) ||
-            member.permittivity <= 0.0)
+            member.permittivity <= 0.0 || !std::isfinite(member.thermalStrain))
         {
             invalidInput("member area, Young modulus and permittivity must be positive and finite; coupling must be finite.");
         }
@@ -317,6 +317,13 @@ FreeSystem assembleFreeSystem(const RStructuralPiezoCoupled1DInput &input,
             const std::size_t freeRow = system.globalToFree[globalRow];
             if (freeRow == noFreeDof)
                 continue;
+            // Both stress and electric displacement use strain relative to
+            // the thermal eigenstrain. No separate pyroelectric coefficient is
+            // configured by this bounded constitutive model.
+            const double thermalEigenload = row < 2
+                ? axialShape[row]*member.area*member.youngModulus*member.thermalStrain
+                : potentialShape[row-2]*member.area*member.coupling*member.thermalStrain;
+            system.rhs[freeRow] += thermalEigenload;
             for (std::size_t column=0;column<4;column++)
             {
                 const std::size_t globalColumn = globalDofs[column];
@@ -393,7 +400,7 @@ RStructuralPiezoCoupled1DResult recoverResult(
             failedSolve("recovered elongation or voltage is non-finite.");
 
         const RStructuralPiezoKernelResult response = RStructuralPiezoKernel::evaluate(
-            elongation,voltage,member.youngModulus,member.coupling,
+            elongation-member.thermalStrain*length,voltage,member.youngModulus,member.coupling,
             member.permittivity,member.area,length);
         result.memberAxialForces[memberIndex] = response.mechanicalForce;
         result.memberRightCharges[memberIndex] = -response.dielectricDisplacementFlux;

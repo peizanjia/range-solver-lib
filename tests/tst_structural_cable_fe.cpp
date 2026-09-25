@@ -81,13 +81,20 @@ void addPointElement(RModel &model, uint node, uint pointGroup)
     model.addElement(point,true,pointGroup);
 }
 
-void assignCableMaterial(RLine &line, double area, double youngModulus)
+void assignCableMaterial(RLine &line, double area, double youngModulus,
+                         double density = 0.0)
 {
     line.setCrossArea(area);
     RMaterial material(RMaterial::Solid);
     RMaterialProperty modulus(RMaterialProperty::ModulusOfElasiticity);
     modulus.add(293.15,youngModulus);
     material.add(modulus);
+    if (density > 0.0)
+    {
+        RMaterialProperty massDensity(RMaterialProperty::Density);
+        massDensity.add(293.15,density);
+        material.add(massDensity);
+    }
     line.setMaterial(material);
 }
 
@@ -143,7 +150,8 @@ void addCableMember(RStructuralCableSetup &setup,
 }
 
 RModel makeAxialCable(bool includeUnconfiguredSegment = false,
-                      bool addContradictoryDisplacement = false)
+                      bool addContradictoryDisplacement = false,
+                      double density = 0.0)
 {
     RModel model;
     model.setNNodes(includeUnconfiguredSegment ? 3 : 2);
@@ -165,7 +173,7 @@ RModel makeAxialCable(bool includeUnconfiguredSegment = false,
         second.setNodeId(1,2);
         model.addElement(second,true,0);
     }
-    assignCableMaterial(model.getLine(0),0.5,1000.0);
+    assignCableMaterial(model.getLine(0),0.5,1000.0,density);
 
     addPointElement(model,0,0);
     addPointElement(model,1,1);
@@ -327,7 +335,7 @@ private slots:
     void axialExtensionAndStressMatchAnalyticSolution();
     void symmetricPretensionedSagMatchesAnalyticEquilibrium();
     void staleMeshFingerprintRejectedBeforeCleanup();
-    void unsupportedDynamicsRejectedBeforeCleanup();
+    void unsupportedDynamicsOptionRejectedBeforeCleanup();
     void unconfiguredNonpointMemberRejected();
     void contradictoryPrescriptionsRejected();
     void loadedSlackCableFailsWithoutPublishingResults();
@@ -337,6 +345,8 @@ private slots:
     void nonReferenceEnvironmentTemperatureRejected();
     void nonzeroEnvironmentGravityRejected();
     void cableMembersFollowElementIdsWhenSetupOrderIsReversed();
+    void transientSingleCableMatchesNewmarkAverageAcceleration();
+    void failedSecondCableStepRollsBackToLastAcceptedState();
     void cableAndPiezoModesCannotBeEnabledTogether();
 };
 
@@ -414,12 +424,15 @@ void TestStructuralCableFE::staleMeshFingerprintRejectedBeforeCleanup()
     QVERIFY(model.findVariable(R_VARIABLE_DISPLACEMENT) != RConstants::eod);
 }
 
-void TestStructuralCableFE::unsupportedDynamicsRejectedBeforeCleanup()
+void TestStructuralCableFE::unsupportedDynamicsOptionRejectedBeforeCleanup()
 {
     RModel model = makeAxialCable();
     const uint displacementPosition = model.addVariable(R_VARIABLE_DISPLACEMENT);
     model.getVariable(displacementPosition).resize(3,model.getNNodes());
-    model.getProblemSetup().getStructuralDynamicsSetup().setEnabled(true);
+    RStructuralDynamicsSetup &dynamics =
+        model.getProblemSetup().getStructuralDynamicsSetup();
+    dynamics.setEnabled(true);
+    dynamics.setRayleighAlpha(0.1);
 
     bool rejected = false;
     try
@@ -428,7 +441,7 @@ void TestStructuralCableFE::unsupportedDynamicsRejectedBeforeCleanup()
     }
     catch (const RError &error)
     {
-        rejected = error.getMessage().contains("dynamics",Qt::CaseInsensitive);
+        rejected = error.getMessage().contains("damping",Qt::CaseInsensitive);
     }
     QVERIFY(rejected);
     QVERIFY(model.findVariable(R_VARIABLE_DISPLACEMENT) != RConstants::eod);
@@ -513,7 +526,7 @@ void TestStructuralCableFE::cableModeCannotChangeAfterConstruction()
     }
     catch (const RError &error)
     {
-        rejected = error.getMessage().contains("cannot be enabled or disabled",Qt::CaseInsensitive);
+        rejected = error.getMessage().contains("cannot be enabled, disabled or switched",Qt::CaseInsensitive);
     }
     QVERIFY(rejected);
     QVERIFY(model.findVariable(R_VARIABLE_DISPLACEMENT) == RConstants::eod);
@@ -595,6 +608,87 @@ void TestStructuralCableFE::cableMembersFollowElementIdsWhenSetupOrderIsReversed
     QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_NORMAL,1)-26.0) < 1.0e-9);
     QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_X,0)-10.0) < 1.0e-9);
     QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_X,1)-26.0) < 1.0e-9);
+}
+
+void TestStructuralCableFE::transientSingleCableMatchesNewmarkAverageAcceleration()
+{
+    RModel model = makeAxialCable(false,false,2.0);
+    model.getProblemSetup().getStructuralCableSetup().members[0].initialTension = 0.0;
+    RStructuralDynamicsSetup &dynamics =
+        model.getProblemSetup().getStructuralDynamicsSetup();
+    dynamics.setEnabled(true);
+    dynamics.setMethod(RStructuralTimeIntegrationMethod::Newmark);
+    dynamics.setNewmarkGamma(0.5);
+    dynamics.setNewmarkBeta(0.25);
+    dynamics.setTimeStep(0.1);
+    dynamics.setNSteps(1);
+    dynamics.setOutputFrequency(1);
+
+    try
+    {
+        RSolver solver(model,QString(),QString());
+        solver.run();
+    }
+    catch (const RError &error)
+    {
+        const QByteArray message = error.getMessage().toUtf8();
+        QFAIL(message.constData());
+    }
+
+    // rho*A*L = 2 kg, so the free endpoint receives one kilogram. For this
+    // axial member k=EA/L0=250 N/m and the Newmark mass tangent is 400 N/m.
+    const double expectedDisplacement = 10.0/(250.0+400.0);
+    const double expectedAcceleration = 400.0*expectedDisplacement;
+    const double expectedVelocity = 0.5*0.1*expectedAcceleration;
+    const double expectedTension = 250.0*expectedDisplacement;
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,1)-expectedDisplacement) < 1.0e-11);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_VELOCITY,0,1)-expectedVelocity) < 1.0e-10);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_ACCELERATION,0,1)-expectedAcceleration) < 1.0e-9);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_FORCE,0,1)-expectedTension) < 1.0e-8);
+    QVERIFY(std::fabs(elementValue(model,R_VARIABLE_STRESS_NORMAL,0)-expectedTension/0.5) < 1.0e-7);
+    QCOMPARE(model.getTimeSolver().getCurrentTimeStep(),uint(0));
+    QVERIFY(std::fabs(model.getTimeSolver().getComputedTime()-0.1) < 1.0e-14);
+}
+
+void TestStructuralCableFE::failedSecondCableStepRollsBackToLastAcceptedState()
+{
+    RModel model = makeAxialCable(false,false,2.0);
+    model.getProblemSetup().getStructuralCableSetup().members[0].initialTension = 0.0;
+    RBoundaryCondition &force =
+        model.getPoint(1).getBoundaryCondition(R_BOUNDARY_CONDITION_FORCE);
+    setComponent(force,R_VARIABLE_FORCE_X,true,-1.6);
+    RStructuralDynamicsSetup &dynamics =
+        model.getProblemSetup().getStructuralDynamicsSetup();
+    dynamics.setEnabled(true);
+    dynamics.setTimeStep(1.0);
+    dynamics.setNSteps(2);
+    dynamics.setOutputFrequency(1);
+
+    RSolver solver(model,QString(),QString());
+    bool failed = false;
+    QString failureMessage;
+    try
+    {
+        solver.run();
+    }
+    catch (const RError &error)
+    {
+        failed = true;
+        failureMessage = error.getMessage();
+    }
+    QVERIFY(failed);
+    QVERIFY2(failureMessage.contains("current length must be positive",Qt::CaseInsensitive),
+             qPrintable(failureMessage));
+
+    // Step 1 reaches a valid slack state. The constant compression would
+    // collapse the element at step 2, so the rejected candidate must restore
+    // the already-published step-1 mechanics, kinematics, and accepted time.
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,1)+0.4) < 1.0e-10);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_VELOCITY,0,1)+0.8) < 1.0e-10);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_ACCELERATION,0,1)+1.6) < 1.0e-10);
+    QCOMPARE(model.getTimeSolver().getCurrentTimeStep(),uint(0));
+    QVERIFY(std::fabs(model.getTimeSolver().getCurrentTime()-1.0) < 1.0e-14);
+    QVERIFY(std::fabs(model.getTimeSolver().getComputedTime()-1.0) < 1.0e-14);
 }
 
 void TestStructuralCableFE::cableAndPiezoModesCannotBeEnabledTogether()

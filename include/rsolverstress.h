@@ -12,6 +12,7 @@
 #include "rstructural_control_protocol.h"
 #include "rstructural_control_conditioner.h"
 #include "rstructural_cable_model_adapter.h"
+#include "rstructural_cable_dynamics.h"
 #include "rstructural_piezo_model_adapter.h"
 #include "rsolvergeneric.h"
 
@@ -141,7 +142,11 @@ class RSolverStress : public RSolverGeneric
         //! Last converged result from the dedicated static cable equilibrium path.
         RStructuralCableEquilibriumResult structuralCableResult;
         bool structuralCableResultReady = false;
+        //! Last candidate/accepted result from the cable Newmark FE path.
+        RStructuralCableDynamicsResult structuralCableDynamicsResult;
+        bool structuralCableDynamicsResultReady = false;
         bool structuralCableModeAtConstruction = false;
+        bool structuralCableDynamicsModeAtConstruction = false;
         RStructuralPiezoModelResult structuralPiezoResult;
         bool structuralPiezoResultReady = false;
         bool structuralPiezoModeAtConstruction = false;
@@ -249,6 +254,7 @@ class RSolverStress : public RSolverGeneric
         void statistics() override;
 
         bool isStructuralCableMode() const;
+        bool isStructuralCableDynamicsMode() const;
         bool isStructuralPiezoMode() const;
         bool isSpecializedStaticTrussMode() const;
 
