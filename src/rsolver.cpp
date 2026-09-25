@@ -198,6 +198,69 @@ bool isTransientModelOutputPath(const QString &canonicalTarget,
     return isOutputStepScheduled(timeSolver,outputStep);
 }
 
+class TransientMonitoringOutputRunLock
+{
+private:
+    std::vector<std::unique_ptr<QLockFile>> locks;
+
+public:
+    TransientMonitoringOutputRunLock(const RMonitoringPointManager &monitoringPoints,
+                                     const QString &modelFileName,
+                                     const RTimeSolver &timeSolver)
+    {
+        std::vector<QString> targetFileNames;
+        for (const RMonitoringPoint &point : monitoringPoints)
+        {
+            if (point.getOutputFileName().isEmpty())
+            {
+                continue;
+            }
+            const QString canonicalFileName = getCanonicalFilePath(point.getOutputFileName());
+            if (isTransientModelOutputPath(canonicalFileName,modelFileName,timeSolver))
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Transient monitoring output cannot target a model result link or scheduled time-step record '%s'.",
+                             canonicalFileName.toUtf8().constData());
+            }
+            if (std::none_of(targetFileNames.cbegin(),targetFileNames.cend(),
+                             [&canonicalFileName](const QString &existingFileName)
+                             {
+                                 return areOutputPathsEqual(existingFileName,canonicalFileName);
+                             }))
+            {
+                targetFileNames.push_back(canonicalFileName);
+            }
+        }
+
+        std::sort(targetFileNames.begin(),targetFileNames.end(),
+                  [](const QString &first,const QString &second)
+                  {
+                      return first.compare(second,outputPathCaseSensitivity()) < 0;
+                  });
+
+        this->locks.reserve(targetFileNames.size());
+        for (const QString &targetFileName : targetFileNames)
+        {
+            const QString lockPath = targetFileName+QStringLiteral(".transient-monitor.lock");
+            if (QFileInfo(lockPath).isSymLink())
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Transient monitoring output lock path is a symbolic link: '%s'.",
+                             lockPath.toUtf8().constData());
+            }
+            std::unique_ptr<QLockFile> lock(new QLockFile(lockPath));
+            lock->setStaleLockTime(0);
+            if (!lock->tryLock(0))
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Transient monitoring output is locked by another process or a stale lock: '%s'.",
+                             lockPath.toUtf8().constData());
+            }
+            this->locks.push_back(std::move(lock));
+        }
+    }
+};
+
 void rejectUnpublishedOutputRecords(const QString &modelFileName,
                                     const RTimeSolver &timeSolver,
                                     bool restart)
@@ -471,7 +534,6 @@ private:
         QString fileName;
         QString stagingFileName;
         OutputFileSnapshot snapshot;
-        std::unique_ptr<QLockFile> lock;
     };
 
     RMonitoringPointManager *manager = nullptr;
@@ -577,21 +639,6 @@ public:
         for (size_t i=0;i<this->targets.size();i++)
         {
             Target &target = this->targets[i];
-            const QString lockPath = target.fileName+QStringLiteral(".transient-monitor.lock");
-            if (QFileInfo(lockPath).isSymLink())
-            {
-                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                             "Transient monitoring output lock path is a symbolic link: '%s'.",
-                             lockPath.toUtf8().constData());
-            }
-            target.lock.reset(new QLockFile(lockPath));
-            target.lock->setStaleLockTime(0);
-            if (!target.lock->tryLock(0))
-            {
-                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                             "Transient monitoring output is locked by another process or a stale lock: '%s'.",
-                             lockPath.toUtf8().constData());
-            }
             const QString backupFileName = this->temporaryDirectory->filePath(
                 QStringLiteral("monitor-%1-backup").arg(i));
             target.snapshot.capture(target.fileName,backupFileName);
@@ -1003,9 +1050,13 @@ void RSolver::run()
                      "Transient Heat->Stress execution requires one root iteration with exactly Heat then Stress leaves.");
     }
     std::unique_ptr<TransientOutputLock> transientOutputLock;
+    std::unique_ptr<TransientMonitoringOutputRunLock> transientMonitoringOutputRunLock;
     if (transientHeatStress)
     {
         transientOutputLock.reset(new TransientOutputLock(this->modelFileName));
+        transientMonitoringOutputRunLock.reset(new TransientMonitoringOutputRunLock(
+            this->pModel->getMonitoringPointManager(),this->modelFileName,
+            this->pModel->getTimeSolver()));
     }
 
     if (this->pModel->getProblemSetup().getStructuralCableSetup().enabled ||
