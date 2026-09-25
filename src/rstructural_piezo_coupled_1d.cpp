@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -384,6 +385,7 @@ RStructuralPiezoCoupled1DResult recoverResult(
     result.displacements.assign(fullSolution.begin(),fullSolution.begin()+std::ptrdiff_t(nNodes));
     result.potentials.assign(fullSolution.begin()+std::ptrdiff_t(nNodes),fullSolution.end());
     result.internalForces.assign(nNodes,0.0);
+    std::vector<double> absoluteInternalForceContributions(nNodes,0.0);
     result.conductorCharges.assign(nNodes,0.0);
     result.memberAxialForces.resize(input.members.size(),0.0);
     result.memberRightCharges.resize(input.members.size(),0.0);
@@ -413,9 +415,13 @@ RStructuralPiezoCoupled1DResult recoverResult(
         const double rightCharge = -response.dielectricDisplacementFlux;
         result.internalForces[member.node0] += axialShape[0]*response.mechanicalForce;
         result.internalForces[member.node1] += axialShape[1]*response.mechanicalForce;
+        absoluteInternalForceContributions[member.node0] += std::abs(response.mechanicalForce);
+        absoluteInternalForceContributions[member.node1] += std::abs(response.mechanicalForce);
         result.conductorCharges[member.node0] += leftCharge;
         result.conductorCharges[member.node1] += rightCharge;
-        if (!std::isfinite(result.internalForces[member.node0]) ||
+        if (!std::isfinite(absoluteInternalForceContributions[member.node0]) ||
+            !std::isfinite(absoluteInternalForceContributions[member.node1]) ||
+            !std::isfinite(result.internalForces[member.node0]) ||
             !std::isfinite(result.internalForces[member.node1]) ||
             !std::isfinite(result.conductorCharges[member.node0]) ||
             !std::isfinite(result.conductorCharges[member.node1]))
@@ -428,6 +434,7 @@ RStructuralPiezoCoupled1DResult recoverResult(
     std::vector<double> electricResidual;
     std::vector<double> freeMechanicalLoads;
     std::vector<double> freeMechanicalInternal;
+    std::vector<double> freeMechanicalAssemblyMagnitude;
     std::vector<double> freePrescribedCharges;
     std::vector<double> freeComputedCharges;
     for (std::size_t node=0;node<nNodes;node++)
@@ -437,6 +444,7 @@ RStructuralPiezoCoupled1DResult recoverResult(
             mechanicalResidual.push_back(result.internalForces[node]-input.mechanicalLoads[node]);
             freeMechanicalLoads.push_back(input.mechanicalLoads[node]);
             freeMechanicalInternal.push_back(result.internalForces[node]);
+            freeMechanicalAssemblyMagnitude.push_back(absoluteInternalForceContributions[node]);
         }
         if (!input.potentialPrescribed[node])
         {
@@ -453,14 +461,27 @@ RStructuralPiezoCoupled1DResult recoverResult(
     const double electricScale = std::max(
         stableNorm(freePrescribedCharges,"free prescribed conductor charges"),
         stableNorm(freeComputedCharges,"free computed conductor charges"));
+    // A free row can sum large opposing member forces to nearly zero. The
+    // relative certificate above then loses its physical assembly scale;
+    // allow only the rounding of those freshly recovered force terms.
+    const double mechanicalRoundoff = 8.0*std::numeric_limits<double>::epsilon()*
+        stableNorm(freeMechanicalAssemblyMagnitude,"free mechanical assembly magnitude");
     const double mechanicalTolerance = input.mechanicalAbsoluteTolerance+
-        input.mechanicalRelativeTolerance*mechanicalScale;
+        input.mechanicalRelativeTolerance*mechanicalScale+mechanicalRoundoff;
     const double electricTolerance = input.electricAbsoluteTolerance+
         input.electricRelativeTolerance*electricScale;
     if (!std::isfinite(mechanicalTolerance) || !std::isfinite(electricTolerance))
         failedSolve("physical residual tolerance overflowed.");
     if (result.mechanicalResidualNorm > mechanicalTolerance)
-        failedSolve("fresh mechanical force residual failed its N-based certificate.");
+    {
+        std::ostringstream detail;
+        detail.precision(17);
+        detail << "fresh mechanical force residual failed its N-based certificate: residual="
+               << result.mechanicalResidualNorm << " N, tolerance=" << mechanicalTolerance
+               << " N, net scale=" << mechanicalScale << " N, roundoff="
+               << mechanicalRoundoff << " N.";
+        failedSolve(detail.str());
+    }
     if (result.electricResidualNorm > electricTolerance)
         failedSolve("fresh electrical charge residual failed its C-based certificate.");
 
@@ -514,6 +535,7 @@ void certifySparseResiduals(const FreeSystem &system,
     const std::size_t nNodes = input.coordinates.size();
     std::vector<double> forceResidual;
     std::vector<double> chargeResidual;
+    std::vector<double> forceRoundoffBounds;
     std::vector<double> freeMechanicalLoads;
     std::vector<double> freeMechanicalInternal;
     std::vector<double> freePrescribedCharges;
@@ -527,6 +549,15 @@ void certifySparseResiduals(const FreeSystem &system,
         if (globalDof < nNodes)
         {
             forceResidual.push_back(residual);
+            const RSparseVector<double> &entries = system.matrix.getVector(uint(row));
+            double rowMagnitude = std::abs(system.rhs[row]);
+            for (uint position=0;position<entries.size();position++)
+                rowMagnitude += std::abs(entries.getValue(position)*
+                                         freeSolution[entries.getIndex(position)]);
+            if (!std::isfinite(rowMagnitude))
+                failedSolve("fresh sparse mechanical row magnitude is non-finite.");
+            forceRoundoffBounds.push_back(
+                4.0*double(entries.size()+2)*std::numeric_limits<double>::epsilon()*rowMagnitude);
             freeMechanicalLoads.push_back(input.mechanicalLoads[globalDof]);
             freeMechanicalInternal.push_back(result.internalForces[globalDof]);
         }
@@ -547,7 +578,8 @@ void certifySparseResiduals(const FreeSystem &system,
         stableNorm(freePrescribedCharges,"free prescribed conductor charges"),
         stableNorm(freeComputedCharges,"free computed conductor charges"));
     const double forceTolerance = input.mechanicalAbsoluteTolerance+
-        input.mechanicalRelativeTolerance*forceScale;
+        input.mechanicalRelativeTolerance*forceScale+
+        stableNorm(forceRoundoffBounds,"fresh sparse mechanical roundoff bound");
     const double chargeTolerance = input.electricAbsoluteTolerance+
         input.electricRelativeTolerance*chargeScale;
     if (!std::isfinite(forceTolerance) || !std::isfinite(chargeTolerance) ||

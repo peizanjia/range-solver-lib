@@ -67,7 +67,45 @@ private slots:
     void reversingConnectivityPreservesPhysicalResponseAndMapsTerminalCharge();
     void rejectMissingMechanicalOrElectricalPins();
     void failClosedOnUnderconvergenceAndInvalidInputs();
+    void highStiffnessSelfEquilibratedThermalRod();
 };
+
+void TestStructuralPiezoCoupled1D::highStiffnessSelfEquilibratedThermalRod()
+{
+    RStructuralPiezoCoupled1DInput input;
+    input.coordinates = {0.0,1.0,2.0};
+    constexpr double young = 2.0e11;
+    constexpr double area = 0.01;
+    constexpr double alpha = 1.2e-5;
+    constexpr double referenceKelvin = 293.15;
+    const double firstStrain = alpha*(325.0-referenceKelvin);
+    const double secondStrain = alpha*(375.0-referenceKelvin);
+    input.members = {{0,1,area,young,2.0,4.0,firstStrain},
+                     {1,2,area,young,2.0,4.0,secondStrain}};
+    input.mechanicalLoads = {0.0,0.0,0.0};
+    input.prescribedConductorCharges = {0.0,0.0,0.0};
+    input.displacementPrescribed = {true,false,true};
+    input.prescribedDisplacements = {0.0,0.0,0.0};
+    input.potentialPrescribed = {true,true,true};
+    input.prescribedPotentials = {0.0,0.0,0.0};
+
+    RStructuralPiezoCoupled1DResult result;
+    try
+    {
+        result = RStructuralPiezoCoupled1D::solve(input);
+    }
+    catch (const std::exception &error)
+    {
+        QFAIL(error.what());
+    }
+    const double expectedStress = -young*0.5*(firstStrain+secondStrain);
+    const double expectedMiddle = 0.5*(firstStrain-secondStrain);
+    QVERIFY(std::abs(result.displacements[1]-expectedMiddle) < 1.0e-12);
+    for (double force : result.memberAxialForces)
+        QVERIFY(std::abs(force-area*expectedStress) < 1.0e-5);
+    QVERIFY(std::abs(result.internalForces[1]) < 1.0e-5);
+    QVERIFY(std::isfinite(result.mechanicalResidualNorm));
+}
 
 void TestStructuralPiezoCoupled1D::freeActuatorHasAnalyticExtensionChargeAndEnthalpy()
 {
