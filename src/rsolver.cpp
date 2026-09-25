@@ -86,6 +86,11 @@ QString getCanonicalFilePath(const QString &fileName)
     return QDir(directory).filePath(info.fileName());
 }
 
+QString getTransientExactTargetLockPath(const QString &canonicalTarget)
+{
+    return canonicalTarget+QStringLiteral(".transient.lock");
+}
+
 class TransientOutputLock
 {
 private:
@@ -99,7 +104,7 @@ public:
             return;
         }
         const QString canonicalLinkPath = getCanonicalOutputLinkPath(modelFileName);
-        const QString lockPath = canonicalLinkPath+QStringLiteral(".transient.lock");
+        const QString lockPath = getTransientExactTargetLockPath(canonicalLinkPath);
         if (QFileInfo(lockPath).isSymLink())
         {
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
@@ -238,25 +243,33 @@ public:
                       return first.compare(second,outputPathCaseSensitivity()) < 0;
                   });
 
-        this->locks.reserve(targetFileNames.size());
+        this->locks.reserve(targetFileNames.size()*2);
         for (const QString &targetFileName : targetFileNames)
         {
-            const QString lockPath = targetFileName+QStringLiteral(".transient-monitor.lock");
-            if (QFileInfo(lockPath).isSymLink())
+            const QStringList lockPaths = {
+                getTransientExactTargetLockPath(targetFileName),
+                // Honor lock files left by a process running the preceding
+                // monitor-transaction implementation.
+                targetFileName+QStringLiteral(".transient-monitor.lock")
+            };
+            for (const QString &lockPath : lockPaths)
             {
-                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                             "Transient monitoring output lock path is a symbolic link: '%s'.",
-                             lockPath.toUtf8().constData());
+                if (QFileInfo(lockPath).isSymLink())
+                {
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Transient monitoring output lock path is a symbolic link: '%s'.",
+                                 lockPath.toUtf8().constData());
+                }
+                std::unique_ptr<QLockFile> lock(new QLockFile(lockPath));
+                lock->setStaleLockTime(0);
+                if (!lock->tryLock(0))
+                {
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Transient monitoring output is locked by another process or a stale lock: '%s'.",
+                                 lockPath.toUtf8().constData());
+                }
+                this->locks.push_back(std::move(lock));
             }
-            std::unique_ptr<QLockFile> lock(new QLockFile(lockPath));
-            lock->setStaleLockTime(0);
-            if (!lock->tryLock(0))
-            {
-                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                             "Transient monitoring output is locked by another process or a stale lock: '%s'.",
-                             lockPath.toUtf8().constData());
-            }
-            this->locks.push_back(std::move(lock));
         }
     }
 };
@@ -456,6 +469,7 @@ class DeferredOutputTransaction
 {
 private:
     std::unique_ptr<QTemporaryDir> backupDirectory;
+    std::unique_ptr<QLockFile> recordLock;
     OutputFileSnapshot record;
     OutputFileSnapshot link;
     bool prepared = false;
@@ -486,6 +500,22 @@ public:
         }
         const QString recordFileName = RFileUtils::getFileNameWithTimeStep(modelFileName,outputStep);
         const QString linkFileName = RFileUtils::getFileNameWithOutTimeStep(modelFileName);
+        const QString canonicalRecordFileName = getCanonicalFilePath(recordFileName);
+        const QString recordLockPath = getTransientExactTargetLockPath(canonicalRecordFileName);
+        if (QFileInfo(recordLockPath).isSymLink())
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Transient model result record lock path is a symbolic link: '%s'.",
+                         recordLockPath.toUtf8().constData());
+        }
+        this->recordLock.reset(new QLockFile(recordLockPath));
+        this->recordLock->setStaleLockTime(0);
+        if (!this->recordLock->tryLock(0))
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Transient model result record is locked by another run or a stale lock: '%s'.",
+                         canonicalRecordFileName.toUtf8().constData());
+        }
         this->record.capture(recordFileName,this->backupDirectory->filePath(QStringLiteral("record")));
         this->link.capture(linkFileName,this->backupDirectory->filePath(QStringLiteral("link")));
         this->prepared = true;

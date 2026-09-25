@@ -11,6 +11,7 @@
 #include <thread>
 
 #include <rbl_error.h>
+#include <rml_file_utils.h>
 #include <rml_monitoring_point.h>
 #include <rml_model.h>
 
@@ -111,25 +112,16 @@ QByteArray readBytes(const QString &fileName)
     QFile file(fileName);
     return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
 }
-}
 
-class TestStructuralMonitorOutputConcurrency : public QObject
+QString runConcurrentConflictScenario(const QString &firstModelFileName,
+                                      const QString &firstMonitorFileName,
+                                      const QString &secondModelFileName,
+                                      const QString &secondMonitorFileName,
+                                      const QString &expectedConflictMessage,
+                                      int expectedMonitorLinesAfterRetry)
 {
-    Q_OBJECT
-private slots:
-    void transientRunsHoldSharedMonitorLockForWholeRun();
-};
-
-void TestStructuralMonitorOutputConcurrency::transientRunsHoldSharedMonitorLockForWholeRun()
-{
-    QTemporaryDir directory;
-    QVERIFY(directory.isValid());
-    const QString monitorFileName = directory.filePath(QStringLiteral("shared-monitor.txt"));
-    const QString firstModelFileName = directory.filePath(QStringLiteral("first-model.ram"));
-    const QString secondModelFileName = directory.filePath(QStringLiteral("second-model.ram"));
-
-    RModel firstModel = transientRod(monitorFileName);
-    RModel secondModel = transientRod(monitorFileName);
+    RModel firstModel = transientRod(firstMonitorFileName);
+    RModel secondModel = transientRod(secondMonitorFileName);
     RSolver firstSolver(firstModel,firstModelFileName,QString());
     RSolver secondSolver(secondModel,secondModelFileName,QString());
 
@@ -173,10 +165,9 @@ void TestStructuralMonitorOutputConcurrency::transientRunsHoldSharedMonitorLockF
         }
         condition.notify_one();
         firstRun.join();
-        QFAIL("First transient run did not reach its synchronized observer.");
+        return QStringLiteral("First run did not reach its synchronized observer.");
     }
 
-    bool secondRunWasRejectedForTheSharedMonitor = false;
     QString secondRunFailure;
     try
     {
@@ -185,8 +176,6 @@ void TestStructuralMonitorOutputConcurrency::transientRunsHoldSharedMonitorLockF
     catch (const RError &error)
     {
         secondRunFailure = error.getMessage();
-        secondRunWasRejectedForTheSharedMonitor =
-            secondRunFailure.contains(QStringLiteral("Transient monitoring output is locked"));
     }
     catch (...)
     {
@@ -201,33 +190,119 @@ void TestStructuralMonitorOutputConcurrency::transientRunsHoldSharedMonitorLockF
     condition.notify_one();
     firstRun.join();
 
-    QVERIFY2(secondRunWasRejectedForTheSharedMonitor,
-             qPrintable(QStringLiteral("Second run did not fail on the shared monitor lock: %1")
-                            .arg(secondRunFailure)));
-    QVERIFY(!secondModelWasPublished);
-
+    if (!secondRunFailure.contains(expectedConflictMessage))
+    {
+        return QStringLiteral("Second run did not report the expected exact-target conflict: %1")
+            .arg(secondRunFailure);
+    }
+    if (secondModelWasPublished)
+    {
+        return QStringLiteral("Second model output was published while the first run held the target.");
+    }
     if (firstFailure)
     {
         try
         {
             std::rethrow_exception(firstFailure);
         }
+        catch (const RError &error)
+        {
+            return QStringLiteral("First run failed: %1").arg(error.getMessage());
+        }
         catch (const std::exception &error)
         {
-            QFAIL(qPrintable(QStringLiteral("First transient run failed: %1").arg(error.what())));
+            return QStringLiteral("First run failed: %1").arg(QString::fromUtf8(error.what()));
         }
         catch (...)
         {
-            QFAIL("First transient run failed with a non-standard exception.");
+            return QStringLiteral("First run failed with a non-standard exception.");
         }
     }
-    QVERIFY(QFileInfo::exists(firstModelFileName));
-    QCOMPARE(readBytes(monitorFileName).count('\n'),2);
+    if (!QFileInfo::exists(firstModelFileName))
+    {
+        return QStringLiteral("First model output was not published after releasing the observer.");
+    }
+    if (readBytes(firstMonitorFileName).count('\n') != 2)
+    {
+        return QStringLiteral("First run did not publish exactly one monitoring sample.");
+    }
 
-    // The run-level lock is released when the first transient run exits.
-    secondSolver.run();
-    QVERIFY(QFileInfo::exists(secondModelFileName));
-    QCOMPARE(readBytes(monitorFileName).count('\n'),4);
+    // A contender must be able to retry after the full first run releases its locks.
+    try
+    {
+        secondSolver.run();
+    }
+    catch (const RError &error)
+    {
+        return QStringLiteral("Second run could not retry after lock release: %1")
+            .arg(error.getMessage());
+    }
+    catch (...)
+    {
+        return QStringLiteral("Second run retry failed with a non-RError exception.");
+    }
+    if (!QFileInfo::exists(secondModelFileName))
+    {
+        return QStringLiteral("Second model output was not published after lock release.");
+    }
+    if (expectedMonitorLinesAfterRetry >= 0 &&
+        readBytes(firstMonitorFileName).count('\n') != expectedMonitorLinesAfterRetry)
+    {
+        return QStringLiteral("Monitor output did not append after the second sequential run.");
+    }
+    return QString();
+}
+}
+
+class TestStructuralMonitorOutputConcurrency : public QObject
+{
+    Q_OBJECT
+private slots:
+    void transientRunsHoldSharedMonitorLockForWholeRun();
+    void monitorLockConflictsWithAnotherModelLatestLink();
+    void monitorLockConflictsWithAnotherScheduledModelRecord();
+};
+
+void TestStructuralMonitorOutputConcurrency::transientRunsHoldSharedMonitorLockForWholeRun()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString monitorFileName = directory.filePath(QStringLiteral("shared-monitor.txt"));
+    const QString firstModelFileName = directory.filePath(QStringLiteral("first-model.ram"));
+    const QString secondModelFileName = directory.filePath(QStringLiteral("second-model.ram"));
+    const QString failure = runConcurrentConflictScenario(
+        firstModelFileName,monitorFileName,secondModelFileName,monitorFileName,
+        QStringLiteral("Transient monitoring output is locked"),4);
+    QVERIFY2(failure.isEmpty(),qPrintable(failure));
+}
+
+void TestStructuralMonitorOutputConcurrency::monitorLockConflictsWithAnotherModelLatestLink()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString secondModelFileName = directory.filePath(QStringLiteral("model-b.ram"));
+    const QString monitorFileName = directory.filePath(QStringLiteral("model-b-monitor.txt"));
+    const QString firstModelFileName = directory.filePath(QStringLiteral("model-a.ram"));
+
+    const QString failure = runConcurrentConflictScenario(
+        firstModelFileName,secondModelFileName,secondModelFileName,monitorFileName,
+        QStringLiteral("Transient Heat->Stress output is locked"),-1);
+    QVERIFY2(failure.isEmpty(),qPrintable(failure));
+}
+
+void TestStructuralMonitorOutputConcurrency::monitorLockConflictsWithAnotherScheduledModelRecord()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString secondModelFileName = directory.filePath(QStringLiteral("model-b.ram"));
+    const QString secondRecordFileName = RFileUtils::getFileNameWithTimeStep(secondModelFileName,1);
+    const QString secondMonitorFileName = directory.filePath(QStringLiteral("model-b-monitor.txt"));
+    const QString firstModelFileName = directory.filePath(QStringLiteral("model-a.ram"));
+
+    const QString failure = runConcurrentConflictScenario(
+        firstModelFileName,secondRecordFileName,secondModelFileName,secondMonitorFileName,
+        QStringLiteral("Transient model result record is locked"),-1);
+    QVERIFY2(failure.isEmpty(),qPrintable(failure));
 }
 
 QTEST_GUILESS_MAIN(TestStructuralMonitorOutputConcurrency)
