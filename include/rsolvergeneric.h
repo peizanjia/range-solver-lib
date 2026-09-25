@@ -64,6 +64,8 @@ class RSolverGeneric
         RSolverSharedData *pSharedData;
         //! First run indicator.
         bool firstRun;
+        //! Parent task transaction currently owns model-result publication.
+        bool resultWritesDeferred;
         //! Task iteration counter.
         uint taskIteration;
         //! Computable elements array.
@@ -89,6 +91,13 @@ class RSolverGeneric
 
         //! Run solver.
         void run(bool firstExecution, uint taskIteration);
+
+        //! Defer model-file result publication while a parent task transaction
+        //! is collecting results from multiple sub-solvers.
+        void setResultWritesDeferred(bool deferred);
+
+        //! Publish the result accumulated while deferred writes were enabled.
+        void publishDeferredResults();
 
         //! Get mesh changed.
         bool getMeshChanged() const;

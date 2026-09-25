@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <utility>
 
 #include <rbl_application_state.h>
@@ -23,6 +24,24 @@
 #include "rstructural_piezo_model_adapter.h"
 #include "rparallel_execution_context.h"
 #include "rsolverwave.h"
+
+namespace
+{
+
+bool isHeatStressSequence(const RProblemTaskItem &task)
+{
+    if (task.getProblemType() != R_PROBLEM_NONE || task.getNChildren() != 2)
+    {
+        return false;
+    }
+
+    const RProblemTaskItem &heat = task.getChild(0);
+    const RProblemTaskItem &stress = task.getChild(1);
+    return heat.getProblemType() == R_PROBLEM_HEAT && heat.getNChildren() == 0 &&
+           stress.getProblemType() == R_PROBLEM_STRESS && stress.getNChildren() == 0;
+}
+
+}
 
 void RSolver::_init()
 {
@@ -289,6 +308,14 @@ std::vector<RStructuralControlChannelSample> RSolver::getStructuralControlSample
 
 void RSolver::run()
 {
+    const RProblemTaskItem &taskTree = this->pModel->getProblemTaskTree();
+    if (isHeatStressSequence(taskTree) &&
+        (taskTree.getNIterations() != 1 || this->pModel->getTimeSolver().getEnabled()))
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Transactional Heat->Stress task publication supports one steady root iteration only.");
+    }
+
     if (this->pModel->getProblemSetup().getStructuralCableSetup().enabled ||
         this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled)
     {
@@ -440,7 +467,62 @@ void RSolver::run()
 
 void RSolver::runSingle()
 {
-    this->runProblemTask(this->pModel->getProblemTaskTree(),0);
+    const RProblemTaskItem &taskTree = this->pModel->getProblemTaskTree();
+    if (!isHeatStressSequence(taskTree))
+    {
+        this->runProblemTask(taskTree,0);
+        return;
+    }
+
+    RSolverGeneric *heatSolver = this->solvers.value(R_PROBLEM_HEAT,nullptr);
+    RSolverGeneric *stressSolver = this->solvers.value(R_PROBLEM_STRESS,nullptr);
+    if (!heatSolver || !stressSolver)
+    {
+        throw RError(RError::Type::Application,R_ERROR_REF,
+                     "Transactional Heat->Stress task is missing a registered sub-solver.");
+    }
+    if (taskTree.getNIterations() != 1 || this->pModel->getTimeSolver().getEnabled())
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Transactional Heat->Stress task publication supports one steady root iteration only.");
+    }
+
+    const RModel acceptedModel(*this->pModel);
+    const RSolverSharedData acceptedSharedData(this->sharedData);
+    const QMap<RProblemType,uint> acceptedExecutionCount(this->solversExecutionCount);
+    heatSolver->setResultWritesDeferred(true);
+    stressSolver->setResultWritesDeferred(true);
+    try
+    {
+        if (!this->runProblemTask(taskTree,0))
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Sequential Heat->Stress task did not converge; transaction rolled back.");
+        }
+
+        // Both sub-solvers have populated the same in-memory model. Publish it
+        // exactly once, after the enclosing task reports convergence.
+        stressSolver->publishDeferredResults();
+        heatSolver->setResultWritesDeferred(false);
+        stressSolver->setResultWritesDeferred(false);
+    }
+    catch (...)
+    {
+        const std::exception_ptr originalFailure = std::current_exception();
+        heatSolver->setResultWritesDeferred(false);
+        stressSolver->setResultWritesDeferred(false);
+        try
+        {
+            *this->pModel = acceptedModel;
+            this->sharedData = acceptedSharedData;
+            this->solversExecutionCount = acceptedExecutionCount;
+        }
+        catch (...)
+        {
+            RLogger::warning("Heat->Stress task rollback failed while restoring its snapshot.\n");
+        }
+        std::rethrow_exception(originalFailure);
+    }
 }
 
 bool RSolver::runProblemTask(const RProblemTaskItem &problemTaskItem, uint taskIteration)

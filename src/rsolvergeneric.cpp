@@ -22,6 +22,7 @@ RSolverGeneric::RSolverGeneric(RModel *pModel, const QString &modelFileName, con
     , convergenceFileName(convergenceFileName)
     , pSharedData(&sharedData)
     , firstRun(false)
+    , resultWritesDeferred(false)
     , taskIteration(0)
     , computableElements(this->pModel->getNElements(),false)
 {
@@ -633,7 +634,7 @@ void RSolverGeneric::recoverSharedData()
 
 void RSolverGeneric::writeResults()
 {
-    if (this->modelFileName.isEmpty())
+    if (this->resultWritesDeferred || this->modelFileName.isEmpty())
     {
         return;
     }
@@ -659,6 +660,27 @@ void RSolverGeneric::writeResults()
     {
         this->modelFileName = this->pModel->write(this->modelFileName);
     }
+}
+
+void RSolverGeneric::setResultWritesDeferred(bool deferred)
+{
+    this->resultWritesDeferred = deferred;
+}
+
+void RSolverGeneric::publishDeferredResults()
+{
+    const bool wasDeferred = this->resultWritesDeferred;
+    this->resultWritesDeferred = false;
+    try
+    {
+        this->writeResults();
+    }
+    catch (...)
+    {
+        this->resultWritesDeferred = wasDeferred;
+        throw;
+    }
+    this->resultWritesDeferred = wasDeferred;
 }
 
 void RSolverGeneric::applyDisplacement()

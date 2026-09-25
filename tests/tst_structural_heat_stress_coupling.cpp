@@ -1,9 +1,15 @@
 #include <QtTest>
 
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QTemporaryDir>
+
 #include <cmath>
 #include <limits>
 
 #include <rbl_error.h>
+#include <rml_file_utils.h>
 #include <rml_model.h>
 
 #include "rsolver.h"
@@ -24,14 +30,16 @@ void setComponent(RBoundaryCondition &condition,RVariableType type,double value)
     component.add(0.0,value);
 }
 
-void property(RMaterial &material,RMaterialProperty::Type type,double value)
+void setMaterialProperty(RMaterial &material,RMaterialProperty::Type type,double value)
 {
     RMaterialProperty entry(type);
     entry.add(referenceKelvin,value);
     material.add(entry);
 }
 
-RModel heatedRod(bool fixRight,bool temperatureDependentExpansion = false)
+RModel heatedRod(bool fixRight,
+                 bool temperatureDependentExpansion = false,
+                 bool elasticModulusDefined = true)
 {
     RModel model;
     model.setNNodes(3);
@@ -46,9 +54,10 @@ RModel heatedRod(bool fixRight,bool temperatureDependentExpansion = false)
     }
 
     RMaterial material(RMaterial::Solid);
-    property(material,RMaterialProperty::ModulusOfElasiticity,modulus);
-    property(material,RMaterialProperty::PoissonRatio,0.0);
-    property(material,RMaterialProperty::Density,8000.0);
+    if (elasticModulusDefined)
+        setMaterialProperty(material,RMaterialProperty::ModulusOfElasiticity,modulus);
+    setMaterialProperty(material,RMaterialProperty::PoissonRatio,0.0);
+    setMaterialProperty(material,RMaterialProperty::Density,8000.0);
     if (temperatureDependentExpansion)
     {
         RMaterialProperty variableAlpha(RMaterialProperty::ThermalExpansionCoefficient);
@@ -58,11 +67,11 @@ RModel heatedRod(bool fixRight,bool temperatureDependentExpansion = false)
     }
     else
     {
-        property(material,RMaterialProperty::ThermalExpansionCoefficient,expansion);
+        setMaterialProperty(material,RMaterialProperty::ThermalExpansionCoefficient,expansion);
     }
-    property(material,RMaterialProperty::ThermalConductivity,2.0);
-    property(material,RMaterialProperty::HeatCapacity,500.0);
-    property(material,RMaterialProperty::Emissivity,0.0);
+    setMaterialProperty(material,RMaterialProperty::ThermalConductivity,2.0);
+    setMaterialProperty(material,RMaterialProperty::HeatCapacity,500.0);
+    setMaterialProperty(material,RMaterialProperty::Emissivity,0.0);
     RLine &line = model.getLine(0);
     line.setCrossArea(0.01);
     line.setMaterial(material);
@@ -116,6 +125,21 @@ double elemental(const RModel &model,RVariableType type,uint component,uint elem
     if (variable == RConstants::eod) return std::numeric_limits<double>::quiet_NaN();
     return model.getVariable(variable).getValue(component,element);
 }
+
+QByteArray readBytes(const QString &path)
+{
+    QFile file(path);
+    return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+}
+
+void seedAcceptedArtifact(const QString &latestPath)
+{
+    RModel accepted;
+    accepted.setName(QStringLiteral("accepted-before-heat-stress"));
+    accepted.getTimeSolver().setEnabled(true);
+    accepted.getTimeSolver().setTimes({0.01});
+    accepted.write(latestPath);
+}
 }
 
 class TestStructuralHeatStressCoupling : public QObject
@@ -126,6 +150,9 @@ private slots:
     void heatThenConstrainedCompression();
     void temperatureDependentExpansionUsesIntegratedAlpha();
     void persistedTemperatureChangesModalFrequency();
+    void stressFailureDoesNotPublishAndCanRetry();
+    void resultWriteFailureRollsBackAndCanRetry();
+    void transientSequenceIsRejectedBeforeOutputCleanup();
 };
 
 void TestStructuralHeatStressCoupling::heatThenFreeExpansion()
@@ -205,6 +232,108 @@ void TestStructuralHeatStressCoupling::persistedTemperatureChangesModalFrequency
     QVERIFY2(std::fabs(hot/cold-expectedRatio) < 0.01,
              qPrintable(QString("Thermal modal ratio = %1, expected %2")
                         .arg(hot/cold).arg(expectedRatio)));
+}
+
+void TestStructuralHeatStressCoupling::stressFailureDoesNotPublishAndCanRetry()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString latestPath = directory.filePath("coupled.ram");
+    seedAcceptedArtifact(latestPath);
+    const QByteArray acceptedLink = readBytes(latestPath);
+    QVERIFY(!acceptedLink.isEmpty());
+    const QString trialRecord = RFileUtils::getFileNameWithTimeStep(latestPath,0);
+    QVERIFY(!QFileInfo::exists(trialRecord));
+
+    RModel model = heatedRod(false,false,false);
+    RBoundaryCondition load(R_BOUNDARY_CONDITION_FORCE);
+    setComponent(load,R_VARIABLE_FORCE_X,1000.0);
+    model.getPoint(2).addBoundaryCondition(load);
+    RSolver solver(model,latestPath,QString());
+
+    // Heat succeeds, then the loaded zero-stiffness stress problem fails.
+    // Neither the in-memory temperature nor a new file record may escape.
+    QVERIFY_EXCEPTION_THROWN(solver.run(),RError);
+    QCOMPARE(readBytes(latestPath),acceptedLink);
+    QVERIFY(!QFileInfo::exists(trialRecord));
+    QVERIFY(model.findVariable(R_VARIABLE_TEMPERATURE) == RConstants::eod);
+    QVERIFY(model.findVariable(R_VARIABLE_DISPLACEMENT) == RConstants::eod);
+    RModel persistedBeforeRetry;
+    persistedBeforeRetry.read(latestPath);
+    QCOMPARE(persistedBeforeRetry.getName(),QStringLiteral("accepted-before-heat-stress"));
+    QVERIFY(persistedBeforeRetry.findVariable(R_VARIABLE_TEMPERATURE) == RConstants::eod);
+
+    // Repair the model in place and retry on the same RSolver. Restored task
+    // counters must make both sub-solvers run as a fresh coupled execution.
+    RMaterial material = model.getLine(0).getMaterial();
+    setMaterialProperty(material,RMaterialProperty::ModulusOfElasiticity,modulus);
+    model.getLine(0).setMaterial(material);
+    solver.run();
+
+    QVERIFY(QFileInfo::exists(trialRecord));
+    RModel persistedAfterRetry;
+    persistedAfterRetry.read(latestPath);
+    QVERIFY(persistedAfterRetry.findVariable(R_VARIABLE_TEMPERATURE) != RConstants::eod);
+    QVERIFY(persistedAfterRetry.findVariable(R_VARIABLE_DISPLACEMENT) != RConstants::eod);
+    QVERIFY(persistedAfterRetry.findVariable(R_VARIABLE_STRESS_X) != RConstants::eod);
+}
+
+void TestStructuralHeatStressCoupling::resultWriteFailureRollsBackAndCanRetry()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString latestPath = directory.filePath("coupled.ram");
+    seedAcceptedArtifact(latestPath);
+    const QByteArray acceptedLink = readBytes(latestPath);
+    QVERIFY(!acceptedLink.isEmpty());
+
+    const QString trialRecord = RFileUtils::getFileNameWithTimeStep(latestPath,0);
+    QVERIFY(QDir().mkpath(trialRecord));
+    RModel model = heatedRod(false);
+    RSolver solver(model,latestPath,QString());
+
+    // Both solves succeed, but an existing directory blocks the final atomic
+    // model-record write. The accepted link and pre-run model state survive.
+    QVERIFY_EXCEPTION_THROWN(solver.run(),RError);
+    QCOMPARE(readBytes(latestPath),acceptedLink);
+    QVERIFY(QFileInfo(trialRecord).isDir());
+    QVERIFY(model.findVariable(R_VARIABLE_TEMPERATURE) == RConstants::eod);
+    QVERIFY(model.findVariable(R_VARIABLE_DISPLACEMENT) == RConstants::eod);
+    RModel persistedBeforeRetry;
+    persistedBeforeRetry.read(latestPath);
+    QCOMPARE(persistedBeforeRetry.getName(),QStringLiteral("accepted-before-heat-stress"));
+
+    QVERIFY(QDir(trialRecord).removeRecursively());
+    solver.run();
+    QVERIFY(QFileInfo::exists(trialRecord));
+    RModel persistedAfterRetry;
+    persistedAfterRetry.read(latestPath);
+    QVERIFY(persistedAfterRetry.findVariable(R_VARIABLE_TEMPERATURE) != RConstants::eod);
+    QVERIFY(persistedAfterRetry.findVariable(R_VARIABLE_STRESS_X) != RConstants::eod);
+}
+
+void TestStructuralHeatStressCoupling::transientSequenceIsRejectedBeforeOutputCleanup()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString latestPath = directory.filePath("coupled.ram");
+    seedAcceptedArtifact(latestPath);
+    const QByteArray acceptedLink = readBytes(latestPath);
+    const QString acceptedRecord = RFileUtils::getFileNameWithTimeStep(latestPath,1);
+    const QByteArray acceptedRecordBytes = readBytes(acceptedRecord);
+    QVERIFY(!acceptedLink.isEmpty());
+    QVERIFY(!acceptedRecordBytes.isEmpty());
+
+    RModel model = heatedRod(false);
+    model.getTimeSolver().setEnabled(true);
+    model.getTimeSolver().setTimes({0.01,0.02});
+    RSolver solver(model,latestPath,QString());
+    QVERIFY_EXCEPTION_THROWN(solver.run(),RError);
+
+    // The unsupported transient shape is rejected before the legacy old-record
+    // cleanup can rewrite or remove an accepted artifact.
+    QCOMPARE(readBytes(latestPath),acceptedLink);
+    QCOMPARE(readBytes(acceptedRecord),acceptedRecordBytes);
 }
 
 QTEST_APPLESS_MAIN(TestStructuralHeatStressCoupling)
