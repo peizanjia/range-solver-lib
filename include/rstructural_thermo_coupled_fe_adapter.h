@@ -9,8 +9,9 @@ class RModel;
 
 //! Explicit physical Kelvin-Voigt input for one TRUSS1 model element.
 //!
-//! RModel has no persistent element UUID, so the key is the element's current
-//! zero-based model index. The adapter never infers this coefficient from a
+//! This legacy entry point keys the coefficient by the element's current
+//! zero-based model index. Use advanceByPhysicalId for persisted model IDs.
+//! The adapter never infers this coefficient from a
 //! fluid material's dynamic viscosity or from structural Rayleigh damping.
 using RStructuralThermoFEViscosityByElement = QHash<unsigned int,double>;
 
@@ -42,6 +43,15 @@ class RStructuralThermoCoupledFEAdapter
             RModel &model,
             const RStructuralThermoFEViscosityByElement &viscosityPaSecondsByElement,
             const RStructuralThermoCoupled1DConditions &conditions,
+            const RStructuralThermoCoupled1DOptions &options,
+            double referenceTemperatureKelvin = 293.15);
+
+        //! Accept persisted physical node/element IDs and return node records
+        //! under those IDs. Missing, padded or duplicate IDs fail before solve.
+        static RStructuralThermoCoupled1DResult advanceByPhysicalId(
+            RModel &model,
+            const RStructuralThermoFEViscosityByElement &viscosityPaSecondsByPhysicalElement,
+            const RStructuralThermoCoupled1DConditions &conditionsByPhysicalNode,
             const RStructuralThermoCoupled1DOptions &options,
             double referenceTemperatureKelvin = 293.15);
 };

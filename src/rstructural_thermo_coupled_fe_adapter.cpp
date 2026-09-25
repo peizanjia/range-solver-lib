@@ -410,3 +410,51 @@ RStructuralThermoCoupled1DResult RStructuralThermoCoupledFEAdapter::advance(
     model = candidate;
     return result;
 }
+
+RStructuralThermoCoupled1DResult RStructuralThermoCoupledFEAdapter::advanceByPhysicalId(
+    RModel &model,
+    const RStructuralThermoFEViscosityByElement &viscosityPaSecondsByPhysicalElement,
+    const RStructuralThermoCoupled1DConditions &conditionsByPhysicalNode,
+    const RStructuralThermoCoupled1DOptions &options,
+    double referenceTemperatureKelvin)
+{
+    auto positionForNode = [&model](const QString &text) {
+        bool ok = false;
+        const uint id = text.toUInt(&ok);
+        require(ok && id != 0 && QString::number(id) == text,
+                "Physical node ID must be a canonical nonzero decimal integer.");
+        const uint position = model.findNodePositionByPhysicalId(id);
+        require(position != RConstants::eod,"Physical node ID is not present in the model.");
+        return QString::number(position);
+    };
+    require(viscosityPaSecondsByPhysicalElement.size() == model.getNElements(),
+            "Supply one explicit viscosity for every physical TRUSS1 element ID.");
+    RStructuralThermoFEViscosityByElement byPosition;
+    for (auto it=viscosityPaSecondsByPhysicalElement.cbegin();
+         it!=viscosityPaSecondsByPhysicalElement.cend();++it)
+    {
+        const uint position = model.findElementPositionByPhysicalId(it.key());
+        require(position != RConstants::eod,
+                "Physical element viscosity ID is not present in the model.");
+        byPosition.insert(position,it.value());
+    }
+    RStructuralThermoCoupled1DConditions indexed(conditionsByPhysicalNode);
+    for (auto &force : indexed.mechanicalForces)
+        force.nodeId = positionForNode(force.nodeId);
+    for (auto &boundary : indexed.prescribedDisplacements)
+        boundary.nodeId = positionForNode(boundary.nodeId);
+    for (auto &heater : indexed.heaters)
+        heater.nodeId = positionForNode(heater.nodeId);
+
+    RModel candidate(model);
+    RStructuralThermoCoupled1DResult result = advance(
+        candidate,byPosition,indexed,options,referenceTemperatureKelvin);
+    for (uint position=0;position<model.getNNodes();position++)
+    {
+        const QString physicalId = QString::number(model.getNodePhysicalId(position));
+        result.nextState[position].nodeId = physicalId;
+        result.nodes[position].nodeId = physicalId;
+    }
+    model = candidate;
+    return result;
+}

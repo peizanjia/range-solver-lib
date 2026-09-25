@@ -121,7 +121,41 @@ private slots:
     void failedCertifiedStepLeavesOriginalRModelUntouched();
     void materialDynamicViscosityCannotReplaceExplicitStructuralInput();
     void activeModelConditionsAreRejected();
+    void persistedPhysicalIdsDriveDissipationAndSurviveReordering();
 };
+
+void TestStructuralThermoCoupledFEAdapter::persistedPhysicalIdsDriveDissipationAndSurviveReordering()
+{
+    RModel model = makeRodModel();
+    model.setNodePhysicalId(0,41);
+    model.setNodePhysicalId(1,97);
+    model.setElementPhysicalId(0,501);
+    RStructuralThermoCoupled1DConditions conditions;
+    conditions.prescribedDisplacements = {{"41",0.0},{"97",0.1}};
+    const RStructuralThermoFEViscosityByElement physicalViscosity{{501U,2.0}};
+    RStructuralThermoCoupled1DResult result;
+    try
+    {
+        result = RStructuralThermoCoupledFEAdapter::advanceByPhysicalId(
+            model,physicalViscosity,conditions,twoWayOptions(),300.0);
+    }
+    catch (const std::exception &error) { QFAIL(error.what()); }
+    catch (const RError &error) { QFAIL(qPrintable(error.getMessage())); }
+    QCOMPARE(result.nextState[0].nodeId,QStringLiteral("41"));
+    QCOMPARE(result.nextState[1].nodeId,QStringLiteral("97"));
+    QCOMPARE(result.nodes[1].nodeId,QStringLiteral("97"));
+    QVERIFY(std::abs(result.dissipationHeatEnergyJoules-0.02) < 1.0e-12);
+    QCOMPARE(model.getNodePhysicalId(0),41U);
+    QCOMPARE(model.getElementPhysicalId(0),501U);
+    QCOMPARE(model.getTimeSolver().getComputedTime(),1.0);
+
+    const double acceptedTemperature = value(model,R_VARIABLE_TEMPERATURE,0,1);
+    conditions.prescribedDisplacements[1].nodeId = "98";
+    QVERIFY_EXCEPTION_THROWN(RStructuralThermoCoupledFEAdapter::advanceByPhysicalId(
+        model,physicalViscosity,conditions,twoWayOptions(),300.0),std::invalid_argument);
+    QCOMPARE(value(model,R_VARIABLE_TEMPERATURE,0,1),acceptedTemperature);
+    QCOMPARE(model.getTimeSolver().getComputedTime(),1.0);
+}
 
 void TestStructuralThermoCoupledFEAdapter::explicitKelvinVoigtWorkFeedsHeatAndPublishesAxialFields()
 {
