@@ -41,6 +41,8 @@ class RSolverHeat : public RSolverGeneric
         RRVector fluidNodeVelocity;
         //! Element heat transfer coefficient.
         RRVector elementHeatTransferCoefficient;
+        //! True only after the most recent run has passed a fresh linear residual check.
+        mutable bool solveCertified;
 
     public:
 
@@ -79,6 +81,9 @@ class RSolverHeat : public RSolverGeneric
 
         //! Initialize solver.
         void initialize() override;
+
+        //! Clear the previous solve status and validate the linear tolerance at run entry.
+        void validateRunConfiguration() const override;
 
         //! Update scales.
         void updateScales() override;

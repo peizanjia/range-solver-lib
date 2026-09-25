@@ -39,6 +39,9 @@ qt_add_library(range-solver-lib
         src/rstructural_control_force_map.cpp
         src/rstructural_control_conditioner.cpp
         src/rstructural_dynamics_support.cpp
+        src/rstructural_temperature_field.cpp
+        src/rstructural_cable_dynamics.cpp
+        src/rstructural_piezo_coupled_1d.cpp
         src/rsolverwave.cpp
 
         include/rconvection.h
@@ -80,6 +83,9 @@ qt_add_library(range-solver-lib
         include/rstructural_control_conditioner.h
         include/rstructural_control_protocol.h
         include/rstructural_dynamics_support.h
+        include/rstructural_temperature_field.h
+        include/rstructural_cable_dynamics.h
+        include/rstructural_piezo_coupled_1d.h
         include/rsolverwave.h
 )
 

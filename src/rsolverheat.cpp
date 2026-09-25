@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <limits>
 
 #include <omp.h>
 
@@ -8,8 +10,40 @@
 #include "rconvection.h"
 #include "rmatrixsolver.h"
 
+namespace
+{
+
+double stableNorm(const RRVector &values)
+{
+    double norm = 0.0;
+    for (uint i=0;i<values.getNRows();i++)
+    {
+        if (!std::isfinite(values[i]))
+        {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        norm = std::hypot(norm,values[i]);
+    }
+    return norm;
+}
+
+void requireFiniteVector(const RRVector &values, const char *name)
+{
+    for (uint i=0;i<values.getNRows();i++)
+    {
+        if (!std::isfinite(values[i]))
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Heat solve contains a non-finite %s value at index %u.",name,i);
+        }
+    }
+}
+
+}
+
 RSolverHeat::RSolverHeat(RModel *pModel, const QString &modelFileName, const QString &convergenceFileName, RSolverSharedData &sharedData)
     : RSolverGeneric(pModel,modelFileName,convergenceFileName,sharedData)
+    , solveCertified(false)
 {
     this->problemType = R_PROBLEM_HEAT;
 }
@@ -20,7 +54,22 @@ RSolverHeat::~RSolverHeat()
 
 bool RSolverHeat::hasConverged() const
 {
-    return true;
+    return this->solveCertified;
+}
+
+void RSolverHeat::validateRunConfiguration() const
+{
+    // RSolverGeneric calls this before every run, before recovery or assembly
+    // can fail. A previous successful solve must not make a later failed run
+    // appear converged to an enclosing problem-task iteration.
+    this->solveCertified = false;
+
+    const double tolerance = this->pModel->getMatrixSolverConf(RMatrixSolverConf::CG).getSolverCvgValue();
+    if (!std::isfinite(tolerance) || tolerance < 0.0)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Heat CG convergence tolerance must be finite and nonnegative.");
+    }
 }
 
 void RSolverHeat::recoverSharedData()
@@ -649,6 +698,7 @@ void RSolverHeat::prepare()
 
 void RSolverHeat::solve()
 {
+    this->solveCertified = false;
     try
     {
         RLogger::indent();
@@ -662,16 +712,91 @@ void RSolverHeat::solve()
         throw;
     }
 
+    const uint nUnknowns = this->b.getNRows();
+    if (this->A.getNRows() != nUnknowns || this->x.getNRows() != nUnknowns)
+    {
+        throw RError(RError::Type::Application,R_ERROR_REF,
+                     "Heat solve returned inconsistent matrix or vector dimensions.");
+    }
+    requireFiniteVector(this->b,"right-hand side");
+    requireFiniteVector(this->x,"solution");
+    for (uint row=0;row<this->A.getNRows();row++)
+    {
+        const RSparseVector<double> &entries = this->A.getVector(row);
+        for (uint entry=0;entry<entries.size();entry++)
+        {
+            if (entries.getIndex(entry) >= nUnknowns || !std::isfinite(entries.getValue(entry)))
+            {
+                throw RError(RError::Type::Application,R_ERROR_REF,
+                             "Heat solve matrix contains an invalid entry at row %u.",row);
+            }
+        }
+    }
+
+    RRVector product;
+    RSparseMatrix::mlt(this->A,this->x,product);
+    if (product.getNRows() != nUnknowns)
+    {
+        throw RError(RError::Type::Application,R_ERROR_REF,
+                     "Heat solve residual has an invalid dimension.");
+    }
+
+    RRVector residual(nUnknowns,0.0);
+    for (uint i=0;i<nUnknowns;i++)
+    {
+        if (!std::isfinite(product[i]))
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Heat solve produced a non-finite matrix product at index %u.",i);
+        }
+        residual[i] = product[i]-this->b[i];
+    }
+
+    const double residualNorm = stableNorm(residual);
+    const double rhsNorm = stableNorm(this->b);
+    const double configuredTolerance = this->pModel->getMatrixSolverConf(RMatrixSolverConf::CG).getSolverCvgValue();
+    const double allowedResidual = std::max(1.0e-8,configuredTolerance)*rhsNorm+1.0e-12;
+    if (!std::isfinite(residualNorm) || !std::isfinite(rhsNorm) || !std::isfinite(allowedResidual))
+    {
+        throw RError(RError::Type::Application,R_ERROR_REF,
+                     "Heat solve produced a non-finite residual or convergence threshold.");
+    }
+    if (residualNorm > allowedResidual)
+    {
+        throw RError(RError::Type::Application,R_ERROR_REF,
+                     "Heat solve did not converge (residual %g, allowed %g).",
+                     residualNorm,allowedResidual);
+    }
+
+    if (this->nodeTemperature.getNRows() != this->pModel->getNNodes())
+    {
+        throw RError(RError::Type::Application,R_ERROR_REF,
+                     "Heat solve has an invalid nodal temperature vector.");
+    }
+    RRVector candidateNodeTemperature(this->nodeTemperature);
+
     for (uint i=0;i<this->pModel->getNNodes();i++)
     {
         uint position;
         if (this->nodeBook.getValue(i,position))
         {
-            this->nodeTemperature[i] = this->x[position];
+            if (position >= nUnknowns)
+            {
+                throw RError(RError::Type::Application,R_ERROR_REF,
+                             "Heat solve node book contains an invalid unknown index at node %u.",i);
+            }
+            candidateNodeTemperature[i] = this->x[position];
         }
     }
 
-    this->pModel->convertNodeToElementVector(this->nodeTemperature,this->elementTemperature);
+    requireFiniteVector(candidateNodeTemperature,"nodal temperature");
+    RRVector candidateElementTemperature;
+    this->pModel->convertNodeToElementVector(candidateNodeTemperature,candidateElementTemperature);
+    requireFiniteVector(candidateElementTemperature,"element temperature");
+
+    this->nodeTemperature = candidateNodeTemperature;
+    this->elementTemperature = candidateElementTemperature;
+    this->solveCertified = true;
 }
 
 void RSolverHeat::process()
