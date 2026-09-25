@@ -46,6 +46,7 @@ qt_add_library(range-solver-lib
         src/rstructural_thermal_control.cpp
         src/rstructural_thermal_fe_adapter.cpp
         src/rstructural_thermo_coupled_1d.cpp
+        src/rstructural_thermo_coupled_fe_adapter.cpp
         src/rsolverwave.cpp
 
         include/rconvection.h
@@ -94,6 +95,7 @@ qt_add_library(range-solver-lib
         include/rstructural_thermal_control.h
         include/rstructural_thermal_fe_adapter.h
         include/rstructural_thermo_coupled_1d.h
+        include/rstructural_thermo_coupled_fe_adapter.h
         include/rsolverwave.h
 )
 

@@ -64,6 +64,7 @@ private slots:
     void boundedHeaterConservesTenJoules();
     void temperatureDependentModulusChangesMechanicalResponse();
     void twoWayModeFeedsOnlyPositiveViscousWorkAsHeat();
+    void partitionedTwoWayMatchesIndependentSimultaneousRoot();
     void heaterBoundFailurePublishesNoCandidate();
 };
 
@@ -166,6 +167,52 @@ void TestStructuralThermoCoupled1D::twoWayModeFeedsOnlyPositiveViscousWorkAsHeat
     QVERIFY(near(result.mechanicalExternalWorkJoules,0.0));
     QVERIFY(near(result.mechanicalSupportWorkJoules,0.52));
     QVERIFY(std::abs(result.mechanicalWorkBalanceResidualJoules) < 1.0e-10);
+}
+
+void TestStructuralThermoCoupled1D::partitionedTwoWayMatchesIndependentSimultaneousRoot()
+{
+    auto member = rod(5.0,100.0,[](double) { return 0.0; },20.0);
+    member.youngModulusAtKelvin = [](double kelvin) {
+        return 100.0+2.0*(kelvin-300.0);
+    };
+    const auto model = modelWith(member);
+    const auto accepted = uniformState(300.0);
+    RStructuralThermoCoupled1DConditions conditions;
+    conditions.prescribedDisplacements = {{"left",0.0}};
+    conditions.mechanicalForces = {{"right",20.0}};
+    auto stepOptions = options();
+    stepOptions.twoWayDissipationHeat = true;
+
+    // Independently solve the two simultaneously coupled scalar equations:
+    // (E(T)+eta/dt)u=F, C(T-Tn)/dt=eta*(u/dt)^2.
+    const auto simultaneousResidual = [](double kelvin) {
+        const double modulus = 100.0+2.0*(kelvin-300.0);
+        const double displacement = 20.0/(modulus+20.0);
+        return 5.0*(kelvin-300.0)-20.0*displacement*displacement;
+    };
+    double lower = 300.0;
+    double upper = 301.0;
+    QVERIFY(simultaneousResidual(lower) < 0.0);
+    QVERIFY(simultaneousResidual(upper) > 0.0);
+    for (unsigned int iteration=0;iteration<80;iteration++)
+    {
+        const double middle = 0.5*(lower+upper);
+        if (simultaneousResidual(middle) > 0.0) upper = middle;
+        else lower = middle;
+    }
+    const double simultaneousTemperature = 0.5*(lower+upper);
+    const double simultaneousDisplacement =
+        20.0/(100.0+2.0*(simultaneousTemperature-300.0)+20.0);
+
+    const auto partitioned = RStructuralThermoCoupled1D::step(
+        model,accepted,conditions,stepOptions);
+    QVERIFY(partitioned.couplingIterations > 1);
+    QVERIFY(near(partitioned.nextState[0].temperatureKelvin,simultaneousTemperature,1.0e-9));
+    QVERIFY(near(partitioned.nextState[1].temperatureKelvin,simultaneousTemperature,1.0e-9));
+    QVERIFY(near(partitioned.nextState[1].axialDisplacement,simultaneousDisplacement,1.0e-9));
+    QVERIFY(near(partitioned.dissipationHeatEnergyJoules,
+                 20.0*simultaneousDisplacement*simultaneousDisplacement,1.0e-9));
+    QVERIFY(std::abs(partitioned.thermalEnergyBalanceResidualJoules) < 1.0e-9);
 }
 
 void TestStructuralThermoCoupled1D::heaterBoundFailurePublishesNoCandidate()
