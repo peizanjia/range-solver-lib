@@ -3,6 +3,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QLockFile>
 #include <QTemporaryDir>
 
 #include <cmath>
@@ -10,6 +11,7 @@
 
 #include <rbl_error.h>
 #include <rml_file_utils.h>
+#include <rml_monitoring_point.h>
 #include <rml_model.h>
 
 #include "rsolver.h"
@@ -39,7 +41,9 @@ void setMaterialProperty(RMaterial &material,RMaterialProperty::Type type,double
 
 RModel heatedRod(bool fixRight,
                  bool temperatureDependentExpansion = false,
-                 bool elasticModulusDefined = true)
+                 bool elasticModulusDefined = true,
+                 double thermalExpansion = expansion,
+                 bool densityDefined = true)
 {
     RModel model;
     model.setNNodes(3);
@@ -57,7 +61,8 @@ RModel heatedRod(bool fixRight,
     if (elasticModulusDefined)
         setMaterialProperty(material,RMaterialProperty::ModulusOfElasiticity,modulus);
     setMaterialProperty(material,RMaterialProperty::PoissonRatio,0.0);
-    setMaterialProperty(material,RMaterialProperty::Density,8000.0);
+    if (densityDefined)
+        setMaterialProperty(material,RMaterialProperty::Density,8000.0);
     if (temperatureDependentExpansion)
     {
         RMaterialProperty variableAlpha(RMaterialProperty::ThermalExpansionCoefficient);
@@ -67,7 +72,7 @@ RModel heatedRod(bool fixRight,
     }
     else
     {
-        setMaterialProperty(material,RMaterialProperty::ThermalExpansionCoefficient,expansion);
+        setMaterialProperty(material,RMaterialProperty::ThermalExpansionCoefficient,thermalExpansion);
     }
     setMaterialProperty(material,RMaterialProperty::ThermalConductivity,2.0);
     setMaterialProperty(material,RMaterialProperty::HeatCapacity,500.0);
@@ -152,7 +157,14 @@ private slots:
     void persistedTemperatureChangesModalFrequency();
     void stressFailureDoesNotPublishAndCanRetry();
     void resultWriteFailureRollsBackAndCanRetry();
-    void transientSequenceIsRejectedBeforeOutputCleanup();
+    void transientSequenceAdvancesHeatThenStressAtEachTime();
+    void transientStressFailureRollsBackAndPreservesRecordsForRetry();
+    void transientPublicationFailureRetriesSameTimeIndex();
+    void transientRestartRejectsUnpublishedFutureRecords();
+    void transientRestartFindsSixDigitOutputRecord();
+    void transientOutputLockRejectsConcurrentWriter();
+    void transientRejectsMonitoringOutputBeforeStep();
+    void unsupportedTransientSequenceIsRejectedBeforeOutputCleanup();
 };
 
 void TestStructuralHeatStressCoupling::heatThenFreeExpansion()
@@ -312,7 +324,340 @@ void TestStructuralHeatStressCoupling::resultWriteFailureRollsBackAndCanRetry()
     QVERIFY(persistedAfterRetry.findVariable(R_VARIABLE_STRESS_X) != RConstants::eod);
 }
 
-void TestStructuralHeatStressCoupling::transientSequenceIsRejectedBeforeOutputCleanup()
+void TestStructuralHeatStressCoupling::transientSequenceAdvancesHeatThenStressAtEachTime()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString latestPath = directory.filePath("transient-coupled.ram");
+    // Keep the geometry fixed here so this time-marching check isolates the
+    // coupled transaction and the exact transient Heat FE recurrence.
+    RModel model = heatedRod(false,false,true,0.0);
+    RTimeSolver &time = model.getTimeSolver();
+    constexpr double dt = 500000.0;
+    time.setEnabled(true);
+    time.setInputNTimeSteps(2);
+    time.setInputStartTime(0.0);
+    time.setInputTimeStepSize(dt);
+    time.setOutputFrequency(1);
+    time.setTimeMarchApproximation(R_TIME_MARCH_BACKWARD);
+    RSolver solver(model,latestPath,QString());
+    solver.run();
+
+    const double massDiagonal = 40000.0/3.0*2.0;
+    const double centerConductance = 2.0*2.0*0.01;
+    const double boundaryConductance = 2.0*0.01;
+    auto nextCenterTemperature = [&](double previous) {
+        return (massDiagonal*previous + dt*boundaryConductance*(300.0+400.0)) /
+               (massDiagonal + dt*centerConductance);
+    };
+    const double firstCenter = nextCenterTemperature(referenceKelvin);
+    const double secondCenter = nextCenterTemperature(firstCenter);
+    QVERIFY(std::fabs(nodal(model,R_VARIABLE_TEMPERATURE,0,1)-secondCenter) < 1.0e-7);
+    QVERIFY(std::fabs(nodal(model,R_VARIABLE_DISPLACEMENT,0,2)) < 1.0e-12);
+    QVERIFY(std::fabs(elemental(model,R_VARIABLE_STRESS_X,0,0)) < 1.0e-8);
+    QVERIFY(std::fabs(elemental(model,R_VARIABLE_STRESS_X,0,1)) < 1.0e-8);
+    QCOMPARE(time.getCurrentTimeStep(),uint(1));
+    QCOMPARE(time.getComputedTime(),2.0*dt);
+
+    const QString firstRecord = RFileUtils::getFileNameWithTimeStep(latestPath,1);
+    const QString secondRecord = RFileUtils::getFileNameWithTimeStep(latestPath,2);
+    QVERIFY(QFileInfo::exists(firstRecord));
+    QVERIFY(QFileInfo::exists(secondRecord));
+    RModel persistedFirst;
+    persistedFirst.read(firstRecord);
+    const double persistedFirstCenter = nodal(persistedFirst,R_VARIABLE_TEMPERATURE,0,1);
+    QVERIFY2(std::fabs(persistedFirstCenter-firstCenter) < 1.0e-3,
+             qPrintable(QString("First stored coupled temperature = %1 K, expected %2 K")
+                        .arg(persistedFirstCenter,0,'g',16).arg(firstCenter,0,'g',16)));
+    QVERIFY(std::fabs(nodal(persistedFirst,R_VARIABLE_DISPLACEMENT,0,2)) < 1.0e-12);
+    QVERIFY(std::fabs(elemental(persistedFirst,R_VARIABLE_STRESS_X,0,0)) < 1.0e-8);
+    RModel persistedLast;
+    persistedLast.read(latestPath);
+    QVERIFY(std::fabs(nodal(persistedLast,R_VARIABLE_TEMPERATURE,0,1)-secondCenter) < 1.0e-3);
+    QVERIFY(std::fabs(nodal(persistedLast,R_VARIABLE_DISPLACEMENT,0,2)) < 1.0e-12);
+    QVERIFY(std::fabs(elemental(persistedLast,R_VARIABLE_STRESS_X,0,0)) < 1.0e-8);
+}
+
+void TestStructuralHeatStressCoupling::transientStressFailureRollsBackAndPreservesRecordsForRetry()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString latestPath = directory.filePath("transient-coupled.ram");
+    seedAcceptedArtifact(latestPath);
+    const QByteArray acceptedLink = readBytes(latestPath);
+    const QString acceptedRecord = RFileUtils::getFileNameWithTimeStep(latestPath,1);
+    const QByteArray acceptedRecordBytes = readBytes(acceptedRecord);
+    const QString futureRecord = RFileUtils::getFileNameWithTimeStep(latestPath,2);
+    QVERIFY(!acceptedLink.isEmpty());
+    QVERIFY(!acceptedRecordBytes.isEmpty());
+
+    RModel model = heatedRod(false,false,false,0.0,false);
+    RBoundaryCondition load(R_BOUNDARY_CONDITION_FORCE);
+    setComponent(load,R_VARIABLE_FORCE_X,1000.0);
+    model.getPoint(2).addBoundaryCondition(load);
+    RTimeSolver &time = model.getTimeSolver();
+    constexpr double dt = 500000.0;
+    time.setEnabled(true);
+    time.setInputNTimeSteps(2);
+    time.setInputStartTime(0.0);
+    time.setInputTimeStepSize(dt);
+    time.setOutputFrequency(1);
+    RSolver solver(model,latestPath,QString());
+
+    QVERIFY_EXCEPTION_THROWN(solver.run(),RError);
+    QCOMPARE(readBytes(latestPath),acceptedLink);
+    QCOMPARE(readBytes(acceptedRecord),acceptedRecordBytes);
+    QCOMPARE(time.getCurrentTimeStep(),uint(0));
+    QCOMPARE(time.getComputedTime(),0.0);
+    QVERIFY(model.findVariable(R_VARIABLE_TEMPERATURE) == RConstants::eod);
+    QVERIFY(model.findVariable(R_VARIABLE_DISPLACEMENT) == RConstants::eod);
+
+    RMaterial material = model.getLine(0).getMaterial();
+    setMaterialProperty(material,RMaterialProperty::ModulusOfElasiticity,modulus);
+    model.getLine(0).setMaterial(material);
+    solver.run();
+    QVERIFY(QFileInfo::exists(acceptedRecord));
+    QVERIFY(QFileInfo::exists(futureRecord));
+    RModel persisted;
+    persisted.read(latestPath);
+    QVERIFY(persisted.findVariable(R_VARIABLE_TEMPERATURE) != RConstants::eod);
+    QVERIFY(persisted.findVariable(R_VARIABLE_STRESS_X) != RConstants::eod);
+    QCOMPARE(persisted.getTimeSolver().getComputedTime(),2.0*dt);
+}
+
+void TestStructuralHeatStressCoupling::transientPublicationFailureRetriesSameTimeIndex()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString latestPath = directory.filePath("transient-coupled.ram");
+    RModel model = heatedRod(false,false,true,0.0);
+    RTimeSolver &time = model.getTimeSolver();
+    constexpr double dt = 500000.0;
+    time.setEnabled(true);
+    time.setInputNTimeSteps(1);
+    time.setInputStartTime(0.0);
+    time.setInputTimeStepSize(dt);
+    time.setOutputFrequency(1);
+    time.setTimeMarchApproximation(R_TIME_MARCH_BACKWARD);
+    const QString futureRecord = RFileUtils::getFileNameWithTimeStep(latestPath,2);
+    QFile futureFile(futureRecord);
+    QVERIFY(futureFile.open(QIODevice::WriteOnly));
+    const QByteArray futureSentinel("future-step-sentinel");
+    QCOMPARE(futureFile.write(futureSentinel),qint64(futureSentinel.size()));
+    futureFile.close();
+    RSolver solver(model,latestPath,QString());
+    solver.run();
+
+    const double firstCenter =
+        (40000.0/3.0*2.0*referenceKelvin + dt*2.0*0.01*(300.0+400.0)) /
+        (40000.0/3.0*2.0 + dt*2.0*2.0*0.01);
+    const QString firstRecord = RFileUtils::getFileNameWithTimeStep(latestPath,1);
+    const QByteArray acceptedRecord = readBytes(firstRecord);
+    const QByteArray acceptedLink = readBytes(latestPath);
+    QVERIFY(!acceptedRecord.isEmpty());
+    QVERIFY(!acceptedLink.isEmpty());
+    QVERIFY(std::fabs(nodal(model,R_VARIABLE_TEMPERATURE,0,1)-firstCenter) < 1.0e-7);
+
+    // Force RModel::write to commit the second-step record and then fail when
+    // publishing the latest link. The transaction must restore the prior
+    // future record and keep the accepted first-step model/time in memory.
+    QVERIFY(QFile::remove(latestPath));
+    QVERIFY(QDir().mkpath(latestPath));
+    model.getProblemSetup().setRestart(true);
+    QVERIFY_EXCEPTION_THROWN(solver.run(),RError);
+    QCOMPARE(readBytes(futureRecord),futureSentinel);
+    QVERIFY(QDir(latestPath).exists());
+    QCOMPARE(readBytes(firstRecord),acceptedRecord);
+    QVERIFY(std::fabs(nodal(model,R_VARIABLE_TEMPERATURE,0,1)-firstCenter) < 1.0e-7);
+    QCOMPARE(time.getCurrentTimeStep(),uint(1));
+    QCOMPARE(time.getComputedTime(),dt);
+
+    QVERIFY(QDir(latestPath).removeRecursively());
+    QFile restoredLink(latestPath);
+    QVERIFY(restoredLink.open(QIODevice::WriteOnly));
+    QCOMPARE(restoredLink.write(acceptedLink),qint64(acceptedLink.size()));
+    restoredLink.close();
+    solver.run();
+    QCOMPARE(time.getCurrentTimeStep(),uint(1));
+    QCOMPARE(time.getComputedTime(),2.0*dt);
+    QCOMPARE(readBytes(firstRecord),acceptedRecord);
+    QVERIFY(QFileInfo(futureRecord).isFile());
+    QVERIFY(readBytes(futureRecord) != futureSentinel);
+    RModel persisted;
+    persisted.read(latestPath);
+    QVERIFY(std::fabs(nodal(persisted,R_VARIABLE_TEMPERATURE,0,1)-
+                      (40000.0/3.0*2.0*firstCenter + dt*2.0*0.01*(300.0+400.0)) /
+                      (40000.0/3.0*2.0 + dt*2.0*2.0*0.01)) < 1.0e-3);
+}
+
+void TestStructuralHeatStressCoupling::transientRestartRejectsUnpublishedFutureRecords()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString latestPath = directory.filePath("transient-restart.ram");
+    constexpr double dt = 500000.0;
+
+    RModel accepted;
+    accepted.setName(QStringLiteral("accepted-restart-state"));
+    RTimeSolver &acceptedTime = accepted.getTimeSolver();
+    acceptedTime.setEnabled(true);
+    acceptedTime.setTimes({dt,2.0*dt});
+    acceptedTime.setCurrentTimeStep(1);
+    acceptedTime.setComputedTime(2.0*dt);
+    accepted.write(latestPath);
+    const QByteArray acceptedLink = readBytes(latestPath);
+    const QString acceptedRecord = RFileUtils::getFileNameWithTimeStep(latestPath,2);
+    const QByteArray acceptedRecordBytes = readBytes(acceptedRecord);
+    QVERIFY(!acceptedLink.isEmpty());
+    QVERIFY(!acceptedRecordBytes.isEmpty());
+
+    // Step three is the immediate next publication and is transactionally
+    // replaceable. The later in-schedule records cannot be safely cleaned
+    // until the run finishes, so restart must fail before starting a trial.
+    const QString immediateRecord = RFileUtils::getFileNameWithTimeStep(latestPath,3);
+    const QString laterRecord = RFileUtils::getFileNameWithTimeStep(latestPath,4);
+    const QString finalRecord = RFileUtils::getFileNameWithTimeStep(latestPath,5);
+    const QByteArray immediateSentinel("immediate-trial-sentinel");
+    const QByteArray laterSentinel("stale-future-four");
+    const QByteArray finalSentinel("stale-future-five");
+    for (const auto &entry : {qMakePair(immediateRecord,immediateSentinel),
+                              qMakePair(laterRecord,laterSentinel),
+                              qMakePair(finalRecord,finalSentinel)})
+    {
+        QFile file(entry.first);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write(entry.second),qint64(entry.second.size()));
+    }
+
+    RModel model = heatedRod(false,false,true,0.0);
+    RTimeSolver &time = model.getTimeSolver();
+    time.setEnabled(true);
+    time.setTimes({dt,2.0*dt});
+    time.setCurrentTimeStep(1);
+    time.setComputedTime(2.0*dt);
+    time.setInputNTimeSteps(3);
+    time.setInputStartTime(2.0*dt);
+    time.setInputTimeStepSize(dt);
+    time.setOutputFrequency(1);
+    model.getProblemSetup().setRestart(true);
+    RSolver solver(model,latestPath,QString());
+
+    QVERIFY_EXCEPTION_THROWN(solver.run(),RError);
+    QCOMPARE(readBytes(latestPath),acceptedLink);
+    QCOMPARE(readBytes(acceptedRecord),acceptedRecordBytes);
+    QCOMPARE(readBytes(immediateRecord),immediateSentinel);
+    QCOMPARE(readBytes(laterRecord),laterSentinel);
+    QCOMPARE(readBytes(finalRecord),finalSentinel);
+    QCOMPARE(time.getCurrentTimeStep(),uint(1));
+    QCOMPARE(time.getComputedTime(),2.0*dt);
+}
+
+void TestStructuralHeatStressCoupling::transientRestartFindsSixDigitOutputRecord()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString latestPath = directory.filePath("transient-six-digit.ram");
+    constexpr double dt = 500000.0;
+
+    RModel accepted;
+    accepted.getTimeSolver().setEnabled(true);
+    accepted.getTimeSolver().setTimes({dt});
+    accepted.write(latestPath);
+    const QByteArray acceptedLink = readBytes(latestPath);
+    const QString acceptedRecord = RFileUtils::getFileNameWithTimeStep(latestPath,1);
+    const QByteArray acceptedRecordBytes = readBytes(acceptedRecord);
+    QVERIFY(!acceptedLink.isEmpty());
+    QVERIFY(!acceptedRecordBytes.isEmpty());
+
+    const QString sixDigitRecord = RFileUtils::getFileNameWithTimeStep(latestPath,100000);
+    QFile staleFile(sixDigitRecord);
+    QVERIFY(staleFile.open(QIODevice::WriteOnly));
+    const QByteArray staleSentinel("stale-step-100000");
+    QCOMPARE(staleFile.write(staleSentinel),qint64(staleSentinel.size()));
+    staleFile.close();
+
+    RModel model = heatedRod(false,false,true,0.0);
+    RTimeSolver &time = model.getTimeSolver();
+    time.setEnabled(true);
+    time.setTimes({dt});
+    time.setCurrentTimeStep(0);
+    time.setComputedTime(dt);
+    time.setInputNTimeSteps(99999);
+    time.setInputStartTime(dt);
+    time.setInputTimeStepSize(dt);
+    time.setOutputFrequency(1);
+    model.getProblemSetup().setRestart(true);
+    RSolver solver(model,latestPath,QString());
+
+    QVERIFY_EXCEPTION_THROWN(solver.run(),RError);
+    QCOMPARE(readBytes(latestPath),acceptedLink);
+    QCOMPARE(readBytes(acceptedRecord),acceptedRecordBytes);
+    QCOMPARE(readBytes(sixDigitRecord),staleSentinel);
+    QCOMPARE(time.getCurrentTimeStep(),uint(0));
+    QCOMPARE(time.getComputedTime(),dt);
+}
+
+void TestStructuralHeatStressCoupling::transientOutputLockRejectsConcurrentWriter()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString latestPath = directory.filePath("transient-locked.ram");
+    RModel model = heatedRod(false,false,true,0.0);
+    RTimeSolver &time = model.getTimeSolver();
+    time.setEnabled(true);
+    time.setInputNTimeSteps(2);
+    time.setInputStartTime(0.0);
+    time.setInputTimeStepSize(500000.0);
+    time.setOutputFrequency(1);
+    const QString lockPath = latestPath+QStringLiteral(".transient.lock");
+    QLockFile competingWriter(lockPath);
+    competingWriter.setStaleLockTime(0);
+    QVERIFY(competingWriter.tryLock(0));
+    RSolver solver(model,latestPath,QString());
+
+    QVERIFY_EXCEPTION_THROWN(solver.run(),RError);
+    QCOMPARE(time.getCurrentTimeStep(),uint(0));
+    QCOMPARE(time.getComputedTime(),0.0);
+    QVERIFY(!QFileInfo::exists(RFileUtils::getFileNameWithTimeStep(latestPath,1)));
+    QVERIFY(!QFileInfo::exists(latestPath));
+    competingWriter.unlock();
+    QVERIFY(!QFileInfo::exists(lockPath));
+}
+
+void TestStructuralHeatStressCoupling::transientRejectsMonitoringOutputBeforeStep()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString latestPath = directory.filePath("transient-monitor.ram");
+    const QString monitorPath = directory.filePath("monitor.txt");
+    const QByteArray monitorSentinel("accepted-monitor-data");
+    QFile monitorFile(monitorPath);
+    QVERIFY(monitorFile.open(QIODevice::WriteOnly));
+    QCOMPARE(monitorFile.write(monitorSentinel),qint64(monitorSentinel.size()));
+    monitorFile.close();
+
+    RModel model = heatedRod(false,false,true,0.0);
+    RMonitoringPoint point(R_VARIABLE_TEMPERATURE,RR3Vector(1.0,0.0,0.0));
+    model.getMonitoringPointManager().push_back(point);
+    model.getMonitoringPointManager().setOutputFileName(monitorPath);
+    RTimeSolver &time = model.getTimeSolver();
+    time.setEnabled(true);
+    time.setInputNTimeSteps(2);
+    time.setInputStartTime(0.0);
+    time.setInputTimeStepSize(500000.0);
+    time.setOutputFrequency(1);
+    RSolver solver(model,latestPath,QString());
+
+    QVERIFY_EXCEPTION_THROWN(solver.run(),RError);
+    QCOMPARE(readBytes(monitorPath),monitorSentinel);
+    QVERIFY(!QFileInfo::exists(latestPath));
+    QVERIFY(!QFileInfo::exists(RFileUtils::getFileNameWithTimeStep(latestPath,1)));
+    QCOMPARE(time.getCurrentTimeStep(),uint(0));
+    QCOMPARE(time.getComputedTime(),0.0);
+    QVERIFY(model.findVariable(R_VARIABLE_TEMPERATURE) == RConstants::eod);
+}
+
+void TestStructuralHeatStressCoupling::unsupportedTransientSequenceIsRejectedBeforeOutputCleanup()
 {
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
@@ -326,7 +671,9 @@ void TestStructuralHeatStressCoupling::transientSequenceIsRejectedBeforeOutputCl
 
     RModel model = heatedRod(false);
     model.getTimeSolver().setEnabled(true);
-    model.getTimeSolver().setTimes({0.01,0.02});
+    RProblemTaskItem unsupported = model.getProblemTaskTree();
+    unsupported.setNIterations(2);
+    model.setProblemTaskTree(unsupported);
     RSolver solver(model,latestPath,QString());
     QVERIFY_EXCEPTION_THROWN(solver.run(),RError);
 

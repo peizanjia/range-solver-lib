@@ -61,6 +61,8 @@ class RSolver
 
         //! Internal initialization function.
         void _init();
+        //! Preserve a failed transient Heat->Stress trial index for same-solver retry.
+        bool transientHeatStressRetryPending;
 
     public:
 

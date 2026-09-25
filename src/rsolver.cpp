@@ -1,7 +1,16 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
+#include <memory>
 #include <utility>
+
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QLockFile>
+#include <QSaveFile>
+#include <QStringList>
+#include <QTemporaryDir>
 
 #include <rbl_application_state.h>
 #include <rbl_error.h>
@@ -40,6 +49,330 @@ bool isHeatStressSequence(const RProblemTaskItem &task)
     return heat.getProblemType() == R_PROBLEM_HEAT && heat.getNChildren() == 0 &&
            stress.getProblemType() == R_PROBLEM_STRESS && stress.getNChildren() == 0;
 }
+
+QString getCanonicalOutputLinkPath(const QString &modelFileName)
+{
+    const QString linkFileName = RFileUtils::getFileNameWithOutTimeStep(modelFileName);
+    const QFileInfo linkInfo(linkFileName);
+    if (linkInfo.isSymLink())
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Transient Heat->Stress output cannot use a symbolic-link target '%s'.",
+                     linkFileName.toUtf8().constData());
+    }
+    QString directory = QDir(linkInfo.absolutePath()).canonicalPath();
+    if (directory.isEmpty())
+    {
+        directory = QDir::cleanPath(linkInfo.absolutePath());
+    }
+    return QDir(directory).filePath(linkInfo.fileName());
+}
+
+class TransientOutputLock
+{
+private:
+    std::unique_ptr<QLockFile> lockFile;
+
+public:
+    explicit TransientOutputLock(const QString &modelFileName)
+    {
+        if (modelFileName.isEmpty())
+        {
+            return;
+        }
+        const QString canonicalLinkPath = getCanonicalOutputLinkPath(modelFileName);
+        const QString lockPath = canonicalLinkPath+QStringLiteral(".transient.lock");
+        if (QFileInfo(lockPath).isSymLink())
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Transient Heat->Stress output lock path is a symbolic link: '%s'.",
+                         lockPath.toUtf8().constData());
+        }
+        this->lockFile.reset(new QLockFile(lockPath));
+        // A slow solve must not lose its lock just because it exceeds a
+        // timeout. A leftover lock after process termination is handled by
+        // failing closed for manual inspection.
+        this->lockFile->setStaleLockTime(0);
+        if (!this->lockFile->tryLock(0))
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Transient Heat->Stress output is locked by another process or a stale lock: '%s'.",
+                         lockPath.toUtf8().constData());
+        }
+    }
+};
+
+bool isOutputStepScheduled(const RTimeSolver &timeSolver, uint outputStep)
+{
+    return outputStep == timeSolver.getNTimeSteps() ||
+           (timeSolver.getOutputFrequency() > 0 &&
+            outputStep % timeSolver.getOutputFrequency() == 0);
+}
+
+void rejectUnpublishedOutputRecords(const QString &modelFileName,
+                                    const RTimeSolver &timeSolver,
+                                    bool restart)
+{
+    if (modelFileName.isEmpty() || timeSolver.getNTimeSteps() == 0)
+    {
+        return;
+    }
+
+    const QString linkFileName = RFileUtils::getFileNameWithOutTimeStep(modelFileName);
+    const QFileInfo linkInfo(linkFileName);
+    const QString prefix = linkInfo.completeBaseName()+QStringLiteral("-");
+    const QString suffix = QStringLiteral(".")+linkInfo.suffix();
+    const QDir outputDirectory(linkInfo.absolutePath());
+
+    const uint acceptedOutputStep = restart ? timeSolver.getCurrentTimeStep()+1 : 0;
+    const uint nextTrialOutputStep = acceptedOutputStep+1;
+    const bool nextTrialWillPublish = nextTrialOutputStep <= timeSolver.getNTimeSteps() &&
+                                      isOutputStepScheduled(timeSolver,nextTrialOutputStep);
+    const QStringList entries = outputDirectory.entryList(
+        QDir::Files | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot,
+        QDir::NoSort);
+    for (const QString &entry : entries)
+    {
+        if (!entry.startsWith(prefix) || !entry.endsWith(suffix) ||
+            entry.size() < prefix.size()+5+suffix.size())
+        {
+            continue;
+        }
+        const QString stepText = entry.mid(prefix.size(),
+                                           entry.size()-prefix.size()-suffix.size());
+        if (stepText.size() < 5)
+        {
+            continue;
+        }
+        bool allDigits = true;
+        for (const QChar digit : stepText)
+        {
+            if (!digit.isDigit())
+            {
+                allDigits = false;
+                break;
+            }
+        }
+        if (!allDigits)
+        {
+            continue;
+        }
+        bool parsed = false;
+        const uint outputStep = stepText.toUInt(&parsed);
+        if (!parsed || outputStep <= acceptedOutputStep ||
+            outputStep > timeSolver.getNTimeSteps())
+        {
+            continue;
+        }
+        if (nextTrialWillPublish && outputStep == nextTrialOutputStep)
+        {
+            continue;
+        }
+        const QString stalePath = outputDirectory.filePath(entry);
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Transient Heat->Stress run found a pre-existing output record '%s' beyond accepted history; remove or archive it before continuing.",
+                     stalePath.toUtf8().constData());
+    }
+}
+
+class OutputFileSnapshot
+{
+private:
+    enum class OriginalState { Absent, RegularFile, Other };
+
+    QString path;
+    QString backupPath;
+    OriginalState originalState = OriginalState::Absent;
+
+    bool matchesBackup() const noexcept
+    {
+        const QFileInfo originalInfo(this->path);
+        const QFileInfo backupInfo(this->backupPath);
+        if (originalInfo.isSymLink() || !originalInfo.isFile() || !backupInfo.isFile() ||
+            originalInfo.size() != backupInfo.size())
+        {
+            return false;
+        }
+        QFile original(this->path);
+        QFile backup(this->backupPath);
+        if (!original.open(QIODevice::ReadOnly) || !backup.open(QIODevice::ReadOnly))
+        {
+            return false;
+        }
+        while (!original.atEnd() && !backup.atEnd())
+        {
+            const QByteArray originalBlock = original.read(1024*1024);
+            const QByteArray backupBlock = backup.read(1024*1024);
+            if (original.error() != QFileDevice::NoError || backup.error() != QFileDevice::NoError ||
+                originalBlock != backupBlock)
+            {
+                return false;
+            }
+        }
+        return original.atEnd() && backup.atEnd();
+    }
+
+    bool restoreFile() const noexcept
+    {
+        if (this->originalState == OriginalState::Other)
+        {
+            return true;
+        }
+
+        if (this->originalState == OriginalState::Absent)
+        {
+            const QFileInfo current(this->path);
+            return !current.exists() || !current.isFile() || QFile::remove(this->path);
+        }
+        if (this->matchesBackup())
+        {
+            return true;
+        }
+
+        QFile source(this->backupPath);
+        if (!source.open(QIODevice::ReadOnly))
+        {
+            return false;
+        }
+        QSaveFile destination(this->path);
+        if (!destination.open(QIODevice::WriteOnly))
+        {
+            return false;
+        }
+        while (!source.atEnd())
+        {
+            const QByteArray block = source.read(1024*1024);
+            if (source.error() != QFileDevice::NoError ||
+                (!block.isEmpty() && destination.write(block) != block.size()))
+            {
+                destination.cancelWriting();
+                return false;
+            }
+        }
+        return destination.commit();
+    }
+
+public:
+    void capture(const QString &fileName, const QString &backupFileName)
+    {
+        this->path = fileName;
+        this->backupPath = backupFileName;
+        const QFileInfo info(fileName);
+        if (info.isSymLink())
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Transactional transient output cannot replace a symbolic-link file '%s'.",
+                         fileName.toUtf8().constData());
+        }
+        if (!info.exists())
+        {
+            this->originalState = OriginalState::Absent;
+            return;
+        }
+        if (!info.isFile())
+        {
+            // Directories and other non-file paths cannot be replaced by the
+            // model writer. Preserve them as-is and let publication report it.
+            this->originalState = OriginalState::Other;
+            return;
+        }
+        this->originalState = OriginalState::RegularFile;
+        if (!QFile::copy(fileName,backupFileName))
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Could not preserve existing transient output file '%s'.",
+                         fileName.toUtf8().constData());
+        }
+    }
+
+    bool restore() const noexcept
+    {
+        if (!this->restoreFile())
+        {
+            return false;
+        }
+        return true;
+    }
+
+    const QString &getPath() const noexcept
+    {
+        return this->path;
+    }
+};
+
+class DeferredOutputTransaction
+{
+private:
+    std::unique_ptr<QTemporaryDir> backupDirectory;
+    OutputFileSnapshot record;
+    OutputFileSnapshot link;
+    bool prepared = false;
+    bool committed = false;
+
+public:
+    void prepare(const QString &modelFileName, const RTimeSolver &timeSolver)
+    {
+        if (modelFileName.isEmpty() || !timeSolver.getEnabled())
+        {
+            return;
+        }
+        const uint outputStep = timeSolver.getCurrentTimeStep()+1;
+        const bool shouldPublish = outputStep == timeSolver.getNTimeSteps() ||
+            (timeSolver.getOutputFrequency() > 0 &&
+             outputStep % timeSolver.getOutputFrequency() == 0);
+        if (!shouldPublish)
+        {
+            return;
+        }
+
+        this->backupDirectory.reset(new QTemporaryDir(
+            QDir::tempPath()+QStringLiteral("/range-fea-step-XXXXXX")));
+        if (!this->backupDirectory->isValid())
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Could not create a temporary directory for transient output rollback.");
+        }
+        const QString recordFileName = RFileUtils::getFileNameWithTimeStep(modelFileName,outputStep);
+        const QString linkFileName = RFileUtils::getFileNameWithOutTimeStep(modelFileName);
+        this->record.capture(recordFileName,this->backupDirectory->filePath(QStringLiteral("record")));
+        this->link.capture(linkFileName,this->backupDirectory->filePath(QStringLiteral("link")));
+        this->prepared = true;
+    }
+
+    void commit() noexcept
+    {
+        this->committed = true;
+    }
+
+    QString rollback() noexcept
+    {
+        if (!this->prepared || this->committed)
+        {
+            return QString();
+        }
+        const bool recordRestored = this->record.restore();
+        const bool linkRestored = this->link.restore();
+        if (!recordRestored || !linkRestored)
+        {
+            QStringList failedPaths;
+            if (!recordRestored)
+            {
+                failedPaths.append(this->record.getPath());
+            }
+            if (!linkRestored)
+            {
+                failedPaths.append(this->link.getPath());
+            }
+            this->backupDirectory->setAutoRemove(false);
+            this->committed = true;
+            return QStringLiteral("Could not restore %1. Rollback backups were retained at '%2'.")
+                .arg(failedPaths.join(QStringLiteral(", ")),
+                     this->backupDirectory->path());
+        }
+        this->committed = true;
+        return QString();
+    }
+};
 
 }
 
@@ -217,6 +550,7 @@ RSolver::RSolver(RModel &model,
     , modelFileName(modelFileName)
     , convergenceFileName(convergenceFileName)
     , executionPolicy(executionPolicy)
+    , transientHeatStressRetryPending(false)
 {
     this->_init();
 }
@@ -309,11 +643,46 @@ std::vector<RStructuralControlChannelSample> RSolver::getStructuralControlSample
 void RSolver::run()
 {
     const RProblemTaskItem &taskTree = this->pModel->getProblemTaskTree();
-    if (isHeatStressSequence(taskTree) &&
-        (taskTree.getNIterations() != 1 || this->pModel->getTimeSolver().getEnabled()))
+    const bool transactionalHeatStress = isHeatStressSequence(taskTree);
+    const bool transientHeatStress = transactionalHeatStress &&
+        this->pModel->getTimeSolver().getEnabled();
+    const bool resumingFailedTransientStep = transientHeatStress &&
+        this->transientHeatStressRetryPending;
+    if (this->transientHeatStressRetryPending && !transientHeatStress)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Transactional Heat->Stress task publication supports one steady root iteration only.");
+                     "A failed transient Heat->Stress step must be retried with the same task shape and time solver enabled.");
+    }
+    if (transactionalHeatStress && taskTree.getNIterations() != 1)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Transactional Heat->Stress task publication supports one root iteration.");
+    }
+    const RProblemTypeMask taskMask = taskTree.getProblemTypeMask();
+    if (this->pModel->getTimeSolver().getEnabled() &&
+        (taskMask & R_PROBLEM_HEAT) && (taskMask & R_PROBLEM_STRESS) &&
+        !transactionalHeatStress)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Transient Heat->Stress execution requires one root iteration with exactly Heat then Stress leaves.");
+    }
+    if (transientHeatStress)
+    {
+        const RMonitoringPointManager &monitoringPoints =
+            this->pModel->getMonitoringPointManager();
+        for (uint i=0;i<monitoringPoints.size();i++)
+        {
+            if (!monitoringPoints[i].getOutputFileName().isEmpty())
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Transient Heat->Stress execution does not support monitoring-point output files yet.");
+            }
+        }
+    }
+    std::unique_ptr<TransientOutputLock> transientOutputLock;
+    if (transientHeatStress)
+    {
+        transientOutputLock.reset(new TransientOutputLock(this->modelFileName));
     }
 
     if (this->pModel->getProblemSetup().getStructuralCableSetup().enabled ||
@@ -396,7 +765,18 @@ void RSolver::run()
         timeSolver.setInputTimeStepSize(dynamics.getTimeStep());
         timeSolver.setOutputFrequency(dynamics.getOutputFrequency());
     }
-    timeSolver.harmonizeTimesWithInput(this->pModel->getProblemSetup().getRestart());
+    if (!resumingFailedTransientStep)
+    {
+        timeSolver.harmonizeTimesWithInput(this->pModel->getProblemSetup().getRestart());
+    }
+    if (transientHeatStress && !resumingFailedTransientStep)
+    {
+        // There is no safe point at which to delete old future records if the
+        // run may stop before reaching them. Reject stale in-schedule records
+        // before the first trial instead of letting them masquerade as output.
+        rejectUnpublishedOutputRecords(this->modelFileName,timeSolver,
+                                       this->pModel->getProblemSetup().getRestart());
+    }
 
     // A harmonic acoustic analysis is a frequency domain analysis - the solver
     // sweeps frequencies internally and must not be driven by the time loop.
@@ -415,7 +795,7 @@ void RSolver::run()
     }
     else if (timeSolver.getEnabled() && RProblem::getTimeSolverEnabled(this->pModel->getProblemTaskTree().getProblemTypeMask()))
     {
-        if (this->pModel->getProblemSetup().getRestart())
+        if (this->pModel->getProblemSetup().getRestart() && !resumingFailedTransientStep)
         {
             timeSolver.setNextTimeStep();
         }
@@ -424,7 +804,7 @@ void RSolver::run()
         // checkpoint/results transactionally; preserve existing files on a
         // failed step and let RModel::write publish the new latest link only
         // after its target record succeeds.
-        if (!dynamics.getEnabled())
+        if (!dynamics.getEnabled() && !transientHeatStress)
         {
             RSolverGeneric::updateOldRecords(timeSolver,this->modelFileName);
         }
@@ -435,11 +815,32 @@ void RSolver::run()
                           timeSolver.getNTimeSteps(),
                           timeSolver.getCurrentTime(),
                           timeSolver.getCurrentTimeStepSize());
+            const double acceptedComputedTime = timeSolver.getComputedTime();
             timeSolver.setComputedTime(timeSolver.getCurrentTime());
 
             RLogger::indent();
-            this->runSingle();
+            try
+            {
+                this->runSingle();
+            }
+            catch (...)
+            {
+                if (transientHeatStress)
+                {
+                    // Keep the failed index selected so the same trial step can
+                    // be retried, while computedTime continues to identify the
+                    // last accepted coupled step.
+                    timeSolver.setComputedTime(acceptedComputedTime);
+                    this->transientHeatStressRetryPending = true;
+                }
+                RLogger::unindent();
+                throw;
+            }
             RLogger::unindent();
+            if (transientHeatStress)
+            {
+                this->transientHeatStressRetryPending = false;
+            }
             if (control.enabled)
             {
                 const auto *stress = static_cast<const RSolverStress*>(this->solvers.value(R_PROBLEM_STRESS));
@@ -481,19 +882,21 @@ void RSolver::runSingle()
         throw RError(RError::Type::Application,R_ERROR_REF,
                      "Transactional Heat->Stress task is missing a registered sub-solver.");
     }
-    if (taskTree.getNIterations() != 1 || this->pModel->getTimeSolver().getEnabled())
+    if (taskTree.getNIterations() != 1)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Transactional Heat->Stress task publication supports one steady root iteration only.");
+                     "Transactional Heat->Stress task publication supports one root iteration.");
     }
 
     const RModel acceptedModel(*this->pModel);
     const RSolverSharedData acceptedSharedData(this->sharedData);
     const QMap<RProblemType,uint> acceptedExecutionCount(this->solversExecutionCount);
+    DeferredOutputTransaction outputTransaction;
     heatSolver->setResultWritesDeferred(true);
     stressSolver->setResultWritesDeferred(true);
     try
     {
+        outputTransaction.prepare(this->modelFileName,this->pModel->getTimeSolver());
         if (!this->runProblemTask(taskTree,0))
         {
             throw RError(RError::Type::Application,R_ERROR_REF,
@@ -503,14 +906,17 @@ void RSolver::runSingle()
         // Both sub-solvers have populated the same in-memory model. Publish it
         // exactly once, after the enclosing task reports convergence.
         stressSolver->publishDeferredResults();
+        outputTransaction.commit();
         heatSolver->setResultWritesDeferred(false);
         stressSolver->setResultWritesDeferred(false);
     }
     catch (...)
     {
         const std::exception_ptr originalFailure = std::current_exception();
+        const QString outputRollbackFailure = outputTransaction.rollback();
         heatSolver->setResultWritesDeferred(false);
         stressSolver->setResultWritesDeferred(false);
+        bool modelRollbackFailed = false;
         try
         {
             *this->pModel = acceptedModel;
@@ -519,7 +925,16 @@ void RSolver::runSingle()
         }
         catch (...)
         {
-            RLogger::warning("Heat->Stress task rollback failed while restoring its snapshot.\n");
+            modelRollbackFailed = true;
+        }
+        if (!outputRollbackFailure.isEmpty() || modelRollbackFailed)
+        {
+            const QString modelDiagnostic = modelRollbackFailed
+                ? QStringLiteral(" Model/shared-state restoration also failed.") : QString();
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Heat->Stress transaction failed and rollback was incomplete. %s%s",
+                         outputRollbackFailure.toUtf8().constData(),
+                         modelDiagnostic.toUtf8().constData());
         }
         std::rethrow_exception(originalFailure);
     }
