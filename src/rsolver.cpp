@@ -3,6 +3,7 @@
 #include <exception>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include <QDir>
 #include <QFile>
@@ -68,6 +69,23 @@ QString getCanonicalOutputLinkPath(const QString &modelFileName)
     return QDir(directory).filePath(linkInfo.fileName());
 }
 
+QString getCanonicalFilePath(const QString &fileName)
+{
+    const QFileInfo info(fileName);
+    if (info.isSymLink())
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Transactional transient output cannot replace a symbolic-link file '%s'.",
+                     fileName.toUtf8().constData());
+    }
+    QString directory = QDir(info.absolutePath()).canonicalPath();
+    if (directory.isEmpty())
+    {
+        directory = QDir::cleanPath(info.absolutePath());
+    }
+    return QDir(directory).filePath(info.fileName());
+}
+
 class TransientOutputLock
 {
 private:
@@ -107,6 +125,77 @@ bool isOutputStepScheduled(const RTimeSolver &timeSolver, uint outputStep)
     return outputStep == timeSolver.getNTimeSteps() ||
            (timeSolver.getOutputFrequency() > 0 &&
             outputStep % timeSolver.getOutputFrequency() == 0);
+}
+
+bool areOutputPathsEqual(const QString &first, const QString &second)
+{
+#ifdef Q_OS_WIN
+    return first.compare(second,Qt::CaseInsensitive) == 0;
+#else
+    return first == second;
+#endif
+}
+
+Qt::CaseSensitivity outputPathCaseSensitivity()
+{
+#ifdef Q_OS_WIN
+    return Qt::CaseInsensitive;
+#else
+    return Qt::CaseSensitive;
+#endif
+}
+
+bool isTransientModelOutputPath(const QString &canonicalTarget,
+                                const QString &modelFileName,
+                                const RTimeSolver &timeSolver)
+{
+    if (modelFileName.isEmpty())
+    {
+        return false;
+    }
+    const QString modelLink = getCanonicalOutputLinkPath(modelFileName);
+    if (areOutputPathsEqual(canonicalTarget,modelLink))
+    {
+        return true;
+    }
+
+    const QFileInfo linkInfo(modelLink);
+    const QFileInfo targetInfo(canonicalTarget);
+    if (!areOutputPathsEqual(targetInfo.absolutePath(),linkInfo.absolutePath()))
+    {
+        return false;
+    }
+    const QString prefix = linkInfo.completeBaseName()+QStringLiteral("-");
+    const QString suffix = linkInfo.suffix().isEmpty()
+        ? QString() : QStringLiteral(".")+linkInfo.suffix();
+    const QString targetName = targetInfo.fileName();
+    if (!targetName.startsWith(prefix,outputPathCaseSensitivity()) ||
+        !targetName.endsWith(suffix,outputPathCaseSensitivity()) ||
+        targetName.size() < prefix.size()+5+suffix.size())
+    {
+        return false;
+    }
+    const QString stepText = targetName.mid(prefix.size(),
+        targetName.size()-prefix.size()-suffix.size());
+    if (stepText.size() < 5)
+    {
+        return false;
+    }
+    for (const QChar digit : stepText)
+    {
+        if (!digit.isDigit())
+        {
+            return false;
+        }
+    }
+    bool parsed = false;
+    const uint outputStep = stepText.toUInt(&parsed);
+    if (!parsed || outputStep == 0 || outputStep > timeSolver.getNTimeSteps() ||
+        QStringLiteral("%1").arg(outputStep,5,10,QChar('0')) != stepText)
+    {
+        return false;
+    }
+    return isOutputStepScheduled(timeSolver,outputStep);
 }
 
 void rejectUnpublishedOutputRecords(const QString &modelFileName,
@@ -368,6 +457,253 @@ public:
             return QStringLiteral("Could not restore %1. Rollback backups were retained at '%2'.")
                 .arg(failedPaths.join(QStringLiteral(", ")),
                      this->backupDirectory->path());
+        }
+        this->committed = true;
+        return QString();
+    }
+};
+
+class TransientMonitoringOutputTransaction
+{
+private:
+    struct Target
+    {
+        QString fileName;
+        QString stagingFileName;
+        OutputFileSnapshot snapshot;
+        std::unique_ptr<QLockFile> lock;
+    };
+
+    RMonitoringPointManager *manager = nullptr;
+    std::vector<QString> originalFileNames;
+    std::vector<int> pointTargetIndices;
+    std::vector<Target> targets;
+    std::unique_ptr<QTemporaryDir> temporaryDirectory;
+    bool pathsRestored = false;
+    bool prepared = false;
+    bool committed = false;
+
+    static void copyContents(QFile &source, QSaveFile &destination,
+                             const QString &sourceName, const QString &destinationName)
+    {
+        while (!source.atEnd())
+        {
+            const QByteArray block = source.read(1024*1024);
+            if (source.error() != QFileDevice::NoError ||
+                (!block.isEmpty() && destination.write(block) != block.size()))
+            {
+                throw RError(RError::Type::WriteFile,R_ERROR_REF,
+                             "Could not copy transactional monitoring output '%s' to '%s'.",
+                             sourceName.toUtf8().constData(),destinationName.toUtf8().constData());
+            }
+        }
+    }
+
+    void restoreFileNames() noexcept
+    {
+        if (!this->manager || this->pathsRestored)
+        {
+            return;
+        }
+        const size_t n = std::min(this->manager->size(),this->originalFileNames.size());
+        for (size_t i=0;i<n;i++)
+        {
+            (*this->manager)[static_cast<uint>(i)].setOutputFileName(this->originalFileNames[i]);
+        }
+        this->pathsRestored = true;
+    }
+
+public:
+    void prepare(RMonitoringPointManager &monitoringPoints,
+                 const QString &modelFileName,
+                 const RTimeSolver &timeSolver)
+    {
+        this->manager = &monitoringPoints;
+        this->originalFileNames.reserve(monitoringPoints.size());
+        this->pointTargetIndices.resize(monitoringPoints.size(),-1);
+        for (const RMonitoringPoint &point : monitoringPoints)
+        {
+            this->originalFileNames.push_back(point.getOutputFileName());
+        }
+
+        for (uint i=0;i<monitoringPoints.size();i++)
+        {
+            const QString &requestedFileName = monitoringPoints[i].getOutputFileName();
+            if (requestedFileName.isEmpty())
+            {
+                continue;
+            }
+            const QString canonicalFileName = getCanonicalFilePath(requestedFileName);
+            size_t targetIndex = this->targets.size();
+            for (size_t j=0;j<this->targets.size();j++)
+            {
+                if (areOutputPathsEqual(this->targets[j].fileName,canonicalFileName))
+                {
+                    targetIndex = j;
+                    break;
+                }
+            }
+            if (targetIndex == this->targets.size())
+            {
+                Target target;
+                target.fileName = canonicalFileName;
+                this->targets.push_back(std::move(target));
+            }
+            this->pointTargetIndices[i] = static_cast<int>(targetIndex);
+        }
+
+        if (this->targets.empty())
+        {
+            this->pathsRestored = true;
+            return;
+        }
+        for (const Target &target : this->targets)
+        {
+            if (isTransientModelOutputPath(target.fileName,modelFileName,timeSolver))
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Transient monitoring output cannot target a model result link or scheduled time-step record '%s'.",
+                             target.fileName.toUtf8().constData());
+            }
+        }
+
+        this->temporaryDirectory.reset(new QTemporaryDir(
+            QDir::tempPath()+QStringLiteral("/range-fea-monitor-XXXXXX")));
+        if (!this->temporaryDirectory->isValid())
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Could not create a temporary directory for transient monitoring output.");
+        }
+        for (size_t i=0;i<this->targets.size();i++)
+        {
+            Target &target = this->targets[i];
+            const QString lockPath = target.fileName+QStringLiteral(".transient-monitor.lock");
+            if (QFileInfo(lockPath).isSymLink())
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Transient monitoring output lock path is a symbolic link: '%s'.",
+                             lockPath.toUtf8().constData());
+            }
+            target.lock.reset(new QLockFile(lockPath));
+            target.lock->setStaleLockTime(0);
+            if (!target.lock->tryLock(0))
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Transient monitoring output is locked by another process or a stale lock: '%s'.",
+                             lockPath.toUtf8().constData());
+            }
+            const QString backupFileName = this->temporaryDirectory->filePath(
+                QStringLiteral("monitor-%1-backup").arg(i));
+            target.snapshot.capture(target.fileName,backupFileName);
+            target.stagingFileName = this->temporaryDirectory->filePath(
+                QStringLiteral("monitor-%1-stage").arg(i));
+        }
+
+        this->prepared = true;
+        for (uint i=0;i<monitoringPoints.size();i++)
+        {
+            if (this->pointTargetIndices[i] < 0)
+            {
+                continue;
+            }
+            const size_t targetIndex = static_cast<size_t>(this->pointTargetIndices[i]);
+            if (targetIndex >= this->targets.size())
+            {
+                throw RError(RError::Type::Application,R_ERROR_REF,
+                             "Transient monitoring output target mapping is invalid.");
+            }
+            monitoringPoints[i].setOutputFileName(this->targets[targetIndex].stagingFileName);
+        }
+    }
+
+    void restoreOutputFileNames() noexcept
+    {
+        this->restoreFileNames();
+    }
+
+    void publish()
+    {
+        this->restoreFileNames();
+        for (Target &target : this->targets)
+        {
+            QFile staging(target.stagingFileName);
+            const QFileInfo stagingInfo(target.stagingFileName);
+            if (!stagingInfo.exists() || stagingInfo.size() == 0)
+            {
+                continue;
+            }
+            if (!staging.open(QIODevice::ReadOnly))
+            {
+                throw RError(RError::Type::OpenFile,R_ERROR_REF,
+                             "Could not read staged monitoring output '%s'.",
+                             target.stagingFileName.toUtf8().constData());
+            }
+
+            const QFileInfo targetInfo(target.fileName);
+            if (targetInfo.isSymLink() || (targetInfo.exists() && !targetInfo.isFile()))
+            {
+                throw RError(RError::Type::WriteFile,R_ERROR_REF,
+                             "Transient monitoring output target is not a regular file: '%s'.",
+                             target.fileName.toUtf8().constData());
+            }
+            QSaveFile output(target.fileName);
+            if (!output.open(QIODevice::WriteOnly))
+            {
+                throw RError(RError::Type::OpenFile,R_ERROR_REF,
+                             "Could not open transient monitoring output '%s': %s",
+                             target.fileName.toUtf8().constData(),
+                             output.errorString().toUtf8().constData());
+            }
+            if (targetInfo.exists())
+            {
+                QFile original(target.fileName);
+                if (!original.open(QIODevice::ReadOnly))
+                {
+                    output.cancelWriting();
+                    throw RError(RError::Type::OpenFile,R_ERROR_REF,
+                                 "Could not read existing transient monitoring output '%s'.",
+                                 target.fileName.toUtf8().constData());
+                }
+                copyContents(original,output,target.fileName,target.fileName);
+            }
+            copyContents(staging,output,target.stagingFileName,target.fileName);
+            if (!output.commit())
+            {
+                throw RError(RError::Type::WriteFile,R_ERROR_REF,
+                             "Could not atomically publish transient monitoring output '%s': %s",
+                             target.fileName.toUtf8().constData(),
+                             output.errorString().toUtf8().constData());
+            }
+        }
+    }
+
+    void commit() noexcept
+    {
+        this->committed = true;
+    }
+
+    QString rollback() noexcept
+    {
+        this->restoreFileNames();
+        if (!this->prepared || this->committed)
+        {
+            return QString();
+        }
+        QStringList failedPaths;
+        for (auto it=this->targets.rbegin();it!=this->targets.rend();++it)
+        {
+            if (!it->snapshot.restore())
+            {
+                failedPaths.append(it->snapshot.getPath());
+            }
+        }
+        if (!failedPaths.isEmpty())
+        {
+            this->temporaryDirectory->setAutoRemove(false);
+            this->committed = true;
+            return QStringLiteral("Could not restore monitoring output %1. Rollback backups were retained at '%2'.")
+                .arg(failedPaths.join(QStringLiteral(", ")),
+                     this->temporaryDirectory->path());
         }
         this->committed = true;
         return QString();
@@ -666,19 +1002,6 @@ void RSolver::run()
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                      "Transient Heat->Stress execution requires one root iteration with exactly Heat then Stress leaves.");
     }
-    if (transientHeatStress)
-    {
-        const RMonitoringPointManager &monitoringPoints =
-            this->pModel->getMonitoringPointManager();
-        for (uint i=0;i<monitoringPoints.size();i++)
-        {
-            if (!monitoringPoints[i].getOutputFileName().isEmpty())
-            {
-                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                             "Transient Heat->Stress execution does not support monitoring-point output files yet.");
-            }
-        }
-    }
     std::unique_ptr<TransientOutputLock> transientOutputLock;
     if (transientHeatStress)
     {
@@ -892,11 +1215,21 @@ void RSolver::runSingle()
     const RSolverSharedData acceptedSharedData(this->sharedData);
     const QMap<RProblemType,uint> acceptedExecutionCount(this->solversExecutionCount);
     DeferredOutputTransaction outputTransaction;
+    TransientMonitoringOutputTransaction monitoringOutputTransaction;
+    const bool transient = this->pModel->getTimeSolver().getEnabled();
     heatSolver->setResultWritesDeferred(true);
     stressSolver->setResultWritesDeferred(true);
+    heatSolver->setMonitoringOutputFailuresAreFatal(transient);
+    stressSolver->setMonitoringOutputFailuresAreFatal(transient);
     try
     {
         outputTransaction.prepare(this->modelFileName,this->pModel->getTimeSolver());
+        if (transient)
+        {
+            monitoringOutputTransaction.prepare(this->pModel->getMonitoringPointManager(),
+                                                this->modelFileName,
+                                                this->pModel->getTimeSolver());
+        }
         if (!this->runProblemTask(taskTree,0))
         {
             throw RError(RError::Type::Application,R_ERROR_REF,
@@ -905,17 +1238,25 @@ void RSolver::runSingle()
 
         // Both sub-solvers have populated the same in-memory model. Publish it
         // exactly once, after the enclosing task reports convergence.
+        monitoringOutputTransaction.restoreOutputFileNames();
         stressSolver->publishDeferredResults();
+        monitoringOutputTransaction.publish();
         outputTransaction.commit();
+        monitoringOutputTransaction.commit();
         heatSolver->setResultWritesDeferred(false);
         stressSolver->setResultWritesDeferred(false);
+        heatSolver->setMonitoringOutputFailuresAreFatal(false);
+        stressSolver->setMonitoringOutputFailuresAreFatal(false);
     }
     catch (...)
     {
         const std::exception_ptr originalFailure = std::current_exception();
         const QString outputRollbackFailure = outputTransaction.rollback();
+        const QString monitoringRollbackFailure = monitoringOutputTransaction.rollback();
         heatSolver->setResultWritesDeferred(false);
         stressSolver->setResultWritesDeferred(false);
+        heatSolver->setMonitoringOutputFailuresAreFatal(false);
+        stressSolver->setMonitoringOutputFailuresAreFatal(false);
         bool modelRollbackFailed = false;
         try
         {
@@ -927,13 +1268,13 @@ void RSolver::runSingle()
         {
             modelRollbackFailed = true;
         }
-        if (!outputRollbackFailure.isEmpty() || modelRollbackFailed)
+        if (!outputRollbackFailure.isEmpty() || !monitoringRollbackFailure.isEmpty() || modelRollbackFailed)
         {
             const QString modelDiagnostic = modelRollbackFailed
                 ? QStringLiteral(" Model/shared-state restoration also failed.") : QString();
             throw RError(RError::Type::Application,R_ERROR_REF,
                          "Heat->Stress transaction failed and rollback was incomplete. %s%s",
-                         outputRollbackFailure.toUtf8().constData(),
+                         (outputRollbackFailure+monitoringRollbackFailure).toUtf8().constData(),
                          modelDiagnostic.toUtf8().constData());
         }
         std::rethrow_exception(originalFailure);

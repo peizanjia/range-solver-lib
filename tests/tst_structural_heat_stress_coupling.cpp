@@ -163,7 +163,9 @@ private slots:
     void transientRestartRejectsUnpublishedFutureRecords();
     void transientRestartFindsSixDigitOutputRecord();
     void transientOutputLockRejectsConcurrentWriter();
-    void transientRejectsMonitoringOutputBeforeStep();
+    void transientPublishesMonitoringOutput();
+    void transientMonitoringPublicationFailureRollsBackAndRetries();
+    void transientMonitoringRejectsModelRecordCollision();
     void unsupportedTransientSequenceIsRejectedBeforeOutputCleanup();
 };
 
@@ -624,22 +626,97 @@ void TestStructuralHeatStressCoupling::transientOutputLockRejectsConcurrentWrite
     QVERIFY(!QFileInfo::exists(lockPath));
 }
 
-void TestStructuralHeatStressCoupling::transientRejectsMonitoringOutputBeforeStep()
+void TestStructuralHeatStressCoupling::transientPublishesMonitoringOutput()
 {
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
     const QString latestPath = directory.filePath("transient-monitor.ram");
     const QString monitorPath = directory.filePath("monitor.txt");
-    const QByteArray monitorSentinel("accepted-monitor-data");
-    QFile monitorFile(monitorPath);
-    QVERIFY(monitorFile.open(QIODevice::WriteOnly));
-    QCOMPARE(monitorFile.write(monitorSentinel),qint64(monitorSentinel.size()));
-    monitorFile.close();
 
     RModel model = heatedRod(false,false,true,0.0);
     RMonitoringPoint point(R_VARIABLE_TEMPERATURE,RR3Vector(1.0,0.0,0.0));
+    point.setOutputFileName(monitorPath);
     model.getMonitoringPointManager().push_back(point);
-    model.getMonitoringPointManager().setOutputFileName(monitorPath);
+    RTimeSolver &time = model.getTimeSolver();
+    time.setEnabled(true);
+    time.setInputNTimeSteps(1);
+    time.setInputStartTime(0.0);
+    time.setInputTimeStepSize(500000.0);
+    time.setOutputFrequency(1);
+    RSolver solver(model,latestPath,QString());
+
+    solver.run();
+    const QByteArray output = readBytes(monitorPath);
+    QCOMPARE(output.count('\n'),2);
+    QVERIFY(model.getMonitoringPointManager()[0].getOutputFileName() == monitorPath);
+    QCOMPARE(time.getComputedTime(),500000.0);
+    QVERIFY(model.findVariable(R_VARIABLE_TEMPERATURE) != RConstants::eod);
+}
+
+void TestStructuralHeatStressCoupling::transientMonitoringPublicationFailureRollsBackAndRetries()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString latestPath = directory.filePath("transient-monitor-retry.ram");
+    const QString firstMonitorPath = directory.filePath("monitor-first.txt");
+    const QString blockedMonitorPath = directory.filePath("monitor-blocked.txt");
+    const QByteArray acceptedMonitorData("accepted-monitor-data\n");
+    QFile acceptedMonitor(firstMonitorPath);
+    QVERIFY(acceptedMonitor.open(QIODevice::WriteOnly));
+    QCOMPARE(acceptedMonitor.write(acceptedMonitorData),qint64(acceptedMonitorData.size()));
+    acceptedMonitor.close();
+    QVERIFY(QDir().mkpath(blockedMonitorPath));
+
+    RModel model = heatedRod(false,false,true,0.0);
+    RMonitoringPoint firstPoint(R_VARIABLE_TEMPERATURE,RR3Vector(1.0,0.0,0.0));
+    firstPoint.setOutputFileName(firstMonitorPath);
+    RMonitoringPoint blockedPoint(R_VARIABLE_TEMPERATURE,RR3Vector(1.0,0.0,0.0));
+    blockedPoint.setOutputFileName(blockedMonitorPath);
+    model.getMonitoringPointManager().push_back(firstPoint);
+    model.getMonitoringPointManager().push_back(blockedPoint);
+    RTimeSolver &time = model.getTimeSolver();
+    time.setEnabled(true);
+    time.setInputNTimeSteps(1);
+    time.setInputStartTime(0.0);
+    time.setInputTimeStepSize(500000.0);
+    time.setOutputFrequency(1);
+    RSolver solver(model,latestPath,QString());
+
+    // The first monitor target publishes before the directory target fails.
+    // Rollback must restore its original bytes, preserve model output files
+    // and leave the selected trial step available for a same-solver retry.
+    QVERIFY_EXCEPTION_THROWN(solver.run(),RError);
+    QCOMPARE(readBytes(firstMonitorPath),acceptedMonitorData);
+    QVERIFY(QFileInfo(blockedMonitorPath).isDir());
+    QVERIFY(!QFileInfo::exists(latestPath));
+    QVERIFY(!QFileInfo::exists(RFileUtils::getFileNameWithTimeStep(latestPath,1)));
+    QCOMPARE(time.getCurrentTimeStep(),uint(0));
+    QCOMPARE(time.getComputedTime(),0.0);
+    QVERIFY(model.findVariable(R_VARIABLE_TEMPERATURE) == RConstants::eod);
+    QCOMPARE(model.getMonitoringPointManager()[0].getOutputFileName(),firstMonitorPath);
+    QCOMPARE(model.getMonitoringPointManager()[1].getOutputFileName(),blockedMonitorPath);
+
+    QVERIFY(QDir(blockedMonitorPath).removeRecursively());
+    solver.run();
+    const QByteArray firstOutput = readBytes(firstMonitorPath);
+    QCOMPARE(firstOutput.count('\n'),3);
+    const QByteArray blockedOutput = readBytes(blockedMonitorPath);
+    QCOMPARE(blockedOutput.count('\n'),2);
+    QCOMPARE(time.getComputedTime(),500000.0);
+    QVERIFY(model.findVariable(R_VARIABLE_TEMPERATURE) != RConstants::eod);
+}
+
+void TestStructuralHeatStressCoupling::transientMonitoringRejectsModelRecordCollision()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString latestPath = directory.filePath("transient-monitor-collision.ram");
+    const QString futureRecord = RFileUtils::getFileNameWithTimeStep(latestPath,2);
+
+    RModel model = heatedRod(false,false,true,0.0);
+    RMonitoringPoint point(R_VARIABLE_TEMPERATURE,RR3Vector(1.0,0.0,0.0));
+    point.setOutputFileName(futureRecord);
+    model.getMonitoringPointManager().push_back(point);
     RTimeSolver &time = model.getTimeSolver();
     time.setEnabled(true);
     time.setInputNTimeSteps(2);
@@ -648,10 +725,12 @@ void TestStructuralHeatStressCoupling::transientRejectsMonitoringOutputBeforeSte
     time.setOutputFrequency(1);
     RSolver solver(model,latestPath,QString());
 
+    // A monitor path must not consume a result-record path that a later
+    // accepted time step is scheduled to publish.
     QVERIFY_EXCEPTION_THROWN(solver.run(),RError);
-    QCOMPARE(readBytes(monitorPath),monitorSentinel);
     QVERIFY(!QFileInfo::exists(latestPath));
     QVERIFY(!QFileInfo::exists(RFileUtils::getFileNameWithTimeStep(latestPath,1)));
+    QVERIFY(!QFileInfo::exists(futureRecord));
     QCOMPARE(time.getCurrentTimeStep(),uint(0));
     QCOMPARE(time.getComputedTime(),0.0);
     QVERIFY(model.findVariable(R_VARIABLE_TEMPERATURE) == RConstants::eod);

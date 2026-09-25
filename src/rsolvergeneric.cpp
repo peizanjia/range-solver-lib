@@ -1,4 +1,5 @@
 #include <QFile>
+#include <QFileInfo>
 #include <cstdio>
 #include <exception>
 #include <memory>
@@ -23,6 +24,7 @@ RSolverGeneric::RSolverGeneric(RModel *pModel, const QString &modelFileName, con
     , pSharedData(&sharedData)
     , firstRun(false)
     , resultWritesDeferred(false)
+    , monitoringOutputFailuresAreFatal(false)
     , taskIteration(0)
     , computableElements(this->pModel->getNElements(),false)
 {
@@ -665,6 +667,11 @@ void RSolverGeneric::writeResults()
 void RSolverGeneric::setResultWritesDeferred(bool deferred)
 {
     this->resultWritesDeferred = deferred;
+}
+
+void RSolverGeneric::setMonitoringOutputFailuresAreFatal(bool fatal)
+{
+    this->monitoringOutputFailuresAreFatal = fatal;
 }
 
 void RSolverGeneric::publishDeferredResults()
@@ -1342,10 +1349,28 @@ void RSolverGeneric::processMonitoringPoints() const
 
         try
         {
+            const QString outputFileName = rMonitorinPoint.getOutputFileName();
+            const QFileInfo beforeInfo(outputFileName);
+            const qint64 previousSize = beforeInfo.exists() ? beforeInfo.size() : 0;
             rMonitorinPoint.writeValueVectorToFile(this->pModel->getTimeSolver().getCurrentTimeStep()+1,valueVector);
+            if (this->monitoringOutputFailuresAreFatal && !outputFileName.isEmpty())
+            {
+                const QFileInfo afterInfo(outputFileName);
+                if (!afterInfo.isFile() || afterInfo.size() <= previousSize)
+                {
+                    throw RError(RError::Type::WriteFile,R_ERROR_REF,
+                                 "Monitoring point output did not append a record to '%s'.",
+                                 outputFileName.toUtf8().constData());
+                }
+            }
         }
         catch (const RError &error)
         {
+            if (this->monitoringOutputFailuresAreFatal &&
+                !rMonitorinPoint.getOutputFileName().isEmpty())
+            {
+                throw;
+            }
             RLogger::error("Failed to write monitoring point. %s\n",error.getMessage().toUtf8().constData());
         }
     }

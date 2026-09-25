@@ -66,6 +66,9 @@ class RSolverGeneric
         bool firstRun;
         //! Parent task transaction currently owns model-result publication.
         bool resultWritesDeferred;
+        //! Propagate configured monitoring-file write failures to a parent
+        //! transient task transaction instead of logging and continuing.
+        bool monitoringOutputFailuresAreFatal;
         //! Task iteration counter.
         uint taskIteration;
         //! Computable elements array.
@@ -95,6 +98,9 @@ class RSolverGeneric
         //! Defer model-file result publication while a parent task transaction
         //! is collecting results from multiple sub-solvers.
         void setResultWritesDeferred(bool deferred);
+
+        //! Make configured monitoring-file write failures fatal for the run.
+        void setMonitoringOutputFailuresAreFatal(bool fatal);
 
         //! Publish the result accumulated while deferred writes were enabled.
         void publishDeferredResults();
