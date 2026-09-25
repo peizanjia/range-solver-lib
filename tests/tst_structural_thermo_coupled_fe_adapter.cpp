@@ -121,10 +121,10 @@ private slots:
     void failedCertifiedStepLeavesOriginalRModelUntouched();
     void materialDynamicViscosityCannotReplaceExplicitStructuralInput();
     void activeModelConditionsAreRejected();
-    void persistedPhysicalIdsDriveDissipationAndSurviveReordering();
+    void persistedPhysicalIdsDriveDissipationAndRejectMissingInputs();
 };
 
-void TestStructuralThermoCoupledFEAdapter::persistedPhysicalIdsDriveDissipationAndSurviveReordering()
+void TestStructuralThermoCoupledFEAdapter::persistedPhysicalIdsDriveDissipationAndRejectMissingInputs()
 {
     RModel model = makeRodModel();
     model.setNodePhysicalId(0,41);
