@@ -68,6 +68,7 @@ private slots:
     void rejectMissingMechanicalOrElectricalPins();
     void failClosedOnUnderconvergenceAndInvalidInputs();
     void highStiffnessSelfEquilibratedThermalRod();
+    void highConnectivityThermalCancellationUsesAccumulationCount();
 };
 
 void TestStructuralPiezoCoupled1D::highStiffnessSelfEquilibratedThermalRod()
@@ -105,6 +106,79 @@ void TestStructuralPiezoCoupled1D::highStiffnessSelfEquilibratedThermalRod()
         QVERIFY(std::abs(force-area*expectedStress) < 1.0e-5);
     QVERIFY(std::abs(result.internalForces[1]) < 1.0e-5);
     QVERIFY(std::isfinite(result.mechanicalResidualNorm));
+}
+
+void TestStructuralPiezoCoupled1D::highConnectivityThermalCancellationUsesAccumulationCount()
+{
+    constexpr std::size_t largeMemberCount = 100;
+    constexpr std::size_t smallMemberCount = 100;
+    constexpr double young = 2.0e11;
+    constexpr double area = 0.01;
+    constexpr double largeForce = 1.0e6;
+    const double largeStrain = largeForce/(young*area);
+    const double smallForceTarget = 0.3*std::numeric_limits<double>::epsilon()*
+        (double(largeMemberCount)*largeForce);
+    const double smallStrain = smallForceTarget/(young*area);
+    const double smallForce = area*(young*smallStrain);
+
+    const std::size_t nodeCount = largeMemberCount+smallMemberCount+largeMemberCount+1;
+    RStructuralPiezoCoupled1DInput input;
+    input.coordinates.assign(nodeCount,1.0);
+    input.coordinates[0] = 0.0;
+    for (std::size_t node=1;node<nodeCount;node++)
+        input.coordinates[node] = 1.0+1.0e-3*double(node);
+    input.members.reserve(nodeCount-1);
+    for (std::size_t member=0;member<largeMemberCount;member++)
+        input.members.push_back({0,uint(member+1),area,young,0.0,1.0,largeStrain});
+    for (std::size_t member=0;member<smallMemberCount;member++)
+    {
+        const uint node = uint(largeMemberCount+member+1);
+        input.members.push_back({0,node,area,young,0.0,1.0,smallStrain});
+    }
+    for (std::size_t member=0;member<largeMemberCount;member++)
+    {
+        const uint node = uint(largeMemberCount+smallMemberCount+member+1);
+        input.members.push_back({0,node,area,young,0.0,1.0,-largeStrain});
+    }
+    input.mechanicalLoads.assign(nodeCount,0.0);
+    input.mechanicalLoads[0] = double(smallMemberCount)*smallForce;
+    input.prescribedConductorCharges.assign(nodeCount,0.0);
+    input.displacementPrescribed.assign(nodeCount,true);
+    input.displacementPrescribed[0] = false;
+    input.prescribedDisplacements.assign(nodeCount,0.0);
+    input.potentialPrescribed.assign(nodeCount,true);
+    input.prescribedPotentials.assign(nodeCount,0.0);
+    input.mechanicalAbsoluteTolerance = 1.0e-12;
+    input.mechanicalRelativeTolerance = 0.0;
+
+    const RStructuralPiezoCoupled1DResult result = RStructuralPiezoCoupled1D::solve(input);
+    double absoluteMemberForceSum = 0.0;
+    double forceEvaluationScaleSum = 0.0;
+    for (double force : result.memberAxialForces)
+        absoluteMemberForceSum += std::abs(force);
+    for (const RStructuralPiezoCoupled1DMember &member : input.members)
+    {
+        const double length = std::abs(
+            input.coordinates[member.node1]-input.coordinates[member.node0]);
+        forceEvaluationScaleSum += area*(young/length)*(
+            std::abs(result.displacements[member.node0])+
+            std::abs(result.displacements[member.node1])+
+            std::abs(member.thermalStrain*length));
+    }
+    const double fixedEightEpsilonBound = 8.0*std::numeric_limits<double>::epsilon()*
+        absoluteMemberForceSum;
+    const double localForceEvaluationBound =
+        12.0*std::numeric_limits<double>::epsilon()*forceEvaluationScaleSum;
+    const double degreeScaledBound =
+        (double(input.members.size())*std::numeric_limits<double>::epsilon())*
+        absoluteMemberForceSum+localForceEvaluationBound;
+
+    QVERIFY(result.mechanicalResidualNorm > fixedEightEpsilonBound);
+    QVERIFY(result.mechanicalResidualNorm > localForceEvaluationBound);
+    QVERIFY(result.mechanicalResidualNorm < degreeScaledBound);
+    QVERIFY(std::abs(result.mechanicalResidualNorm-
+                     std::abs(result.internalForces[0]-input.mechanicalLoads[0])) < 1.0e-15);
+    QVERIFY(std::isfinite(result.displacements[0]));
 }
 
 void TestStructuralPiezoCoupled1D::freeActuatorHasAnalyticExtensionChargeAndEnthalpy()

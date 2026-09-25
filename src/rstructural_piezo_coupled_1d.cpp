@@ -46,6 +46,41 @@ double stableNorm(const std::vector<double> &values,const char *description)
     return norm;
 }
 
+// Forward error for n rounded operations: gamma_n = n*epsilon/(1-n*epsilon).
+// numeric_limits::epsilon is twice the unit roundoff, so this stays conservative.
+double gammaBound(std::size_t operationCount)
+{
+    const double scaledCount = double(operationCount)*std::numeric_limits<double>::epsilon();
+    if (!std::isfinite(scaledCount) || scaledCount >= 0.5)
+        failedSolve("the floating-point operation-count bound is not finite.");
+    return scaledCount/(1.0-scaledCount);
+}
+
+double upperBoundForNonnegativeSum(double computedSum,std::size_t operationCount)
+{
+    if (!std::isfinite(computedSum) || computedSum < 0.0)
+        failedSolve("an absolute-contribution sum is invalid.");
+    if (operationCount == 0)
+        return computedSum;
+    const double gamma = gammaBound(operationCount);
+    const double bound = computedSum/(1.0-gamma)+
+        double(operationCount)*std::numeric_limits<double>::denorm_min();
+    if (!std::isfinite(bound))
+        failedSolve("an absolute-contribution upper bound is non-finite.");
+    return bound;
+}
+
+double roundoffBound(std::size_t operationCount,double absoluteMagnitude)
+{
+    if (!std::isfinite(absoluteMagnitude) || absoluteMagnitude < 0.0)
+        failedSolve("a roundoff-bound magnitude is invalid.");
+    const double bound = gammaBound(operationCount)*absoluteMagnitude+
+        double(operationCount)*std::numeric_limits<double>::denorm_min();
+    if (!std::isfinite(bound))
+        failedSolve("a roundoff bound is non-finite.");
+    return bound;
+}
+
 class DisjointSets
 {
     private:
@@ -220,7 +255,13 @@ ValidatedInput validateInput(const RStructuralPiezoCoupled1DInput &input)
 struct FreeSystem
 {
     RSparseMatrix matrix;
+    // Sparse assembly coalesces repeated element terms; retain their absolute
+    // magnitudes and counts so cancellation does not erase the roundoff scale.
+    RSparseMatrix absoluteMatrixContributions;
     std::vector<double> rhs;
+    std::vector<double> absoluteRhsContributions;
+    std::vector<std::size_t> matrixAssemblyContributionCounts;
+    std::vector<std::size_t> rhsAssemblyOperationCounts;
     std::vector<double> diagonalScale;
     std::vector<std::size_t> globalToFree;
     std::vector<std::size_t> freeToGlobal;
@@ -250,7 +291,11 @@ FreeSystem assembleFreeSystem(const RStructuralPiezoCoupled1DInput &input,
 
     const uint nFree = uint(system.freeToGlobal.size());
     system.matrix.setNRows(nFree);
+    system.absoluteMatrixContributions.setNRows(nFree);
     system.rhs.assign(nFree,0.0);
+    system.absoluteRhsContributions.assign(nFree,0.0);
+    system.matrixAssemblyContributionCounts.assign(nFree,0);
+    system.rhsAssemblyOperationCounts.assign(nFree,0);
     for (std::size_t freeDof=0;freeDof<system.freeToGlobal.size();freeDof++)
     {
         const std::size_t globalDof = system.freeToGlobal[freeDof];
@@ -260,6 +305,7 @@ FreeSystem assembleFreeSystem(const RStructuralPiezoCoupled1DInput &input,
             : -input.prescribedConductorCharges[node];
         if (!std::isfinite(system.rhs[freeDof]))
             invalidInput("the free mechanical/electric right-hand side is non-finite.");
+        system.absoluteRhsContributions[freeDof] = std::abs(system.rhs[freeDof]);
     }
 
     for (std::size_t memberIndex=0;memberIndex<input.members.size();memberIndex++)
@@ -325,6 +371,8 @@ FreeSystem assembleFreeSystem(const RStructuralPiezoCoupled1DInput &input,
                 ? axialShape[row]*member.area*member.youngModulus*member.thermalStrain
                 : potentialShape[row-2]*member.area*member.coupling*member.thermalStrain;
             system.rhs[freeRow] += thermalEigenload;
+            system.absoluteRhsContributions[freeRow] += std::abs(thermalEigenload);
+            system.rhsAssemblyOperationCounts[freeRow] += 4;
             for (std::size_t column=0;column<4;column++)
             {
                 const std::size_t globalColumn = globalDofs[column];
@@ -336,11 +384,18 @@ FreeSystem assembleFreeSystem(const RStructuralPiezoCoupled1DInput &input,
                     const double prescribedValue = globalColumn < nNodes
                         ? input.prescribedDisplacements[prescribedNode]
                         : input.prescribedPotentials[prescribedNode];
-                    system.rhs[freeRow] -= value*prescribedValue;
+                    const double eliminatedValue = value*prescribedValue;
+                    system.rhs[freeRow] -= eliminatedValue;
+                    system.absoluteRhsContributions[freeRow] += std::abs(eliminatedValue);
+                    if (value != 0.0 && prescribedValue != 0.0)
+                        system.rhsAssemblyOperationCounts[freeRow] += 2;
                 }
                 else if (value != 0.0)
                 {
                     system.matrix.addValue(uint(freeRow),uint(freeColumn),value);
+                    system.absoluteMatrixContributions.addValue(
+                        uint(freeRow),uint(freeColumn),std::abs(value));
+                    ++system.matrixAssemblyContributionCounts[freeRow];
                 }
                 if (!std::isfinite(system.rhs[freeRow]))
                     invalidInput("prescribed-value elimination produced a non-finite right-hand side.");
@@ -386,6 +441,8 @@ RStructuralPiezoCoupled1DResult recoverResult(
     result.potentials.assign(fullSolution.begin()+std::ptrdiff_t(nNodes),fullSolution.end());
     result.internalForces.assign(nNodes,0.0);
     std::vector<double> absoluteInternalForceContributions(nNodes,0.0);
+    std::vector<double> absoluteForceEvaluationScales(nNodes,0.0);
+    std::vector<std::size_t> internalForceContributionCounts(nNodes,0);
     result.conductorCharges.assign(nNodes,0.0);
     result.memberAxialForces.resize(input.members.size(),0.0);
     result.memberRightCharges.resize(input.members.size(),0.0);
@@ -401,9 +458,21 @@ RStructuralPiezoCoupled1DResult recoverResult(
         if (!std::isfinite(elongation) || !std::isfinite(voltage))
             failedSolve("recovered elongation or voltage is non-finite.");
 
+        const double thermalElongation = member.thermalStrain*length;
+        const double adjustedElongation = elongation-thermalElongation;
         const RStructuralPiezoKernelResult response = RStructuralPiezoKernel::evaluate(
-            elongation-member.thermalStrain*length,voltage,member.youngModulus,member.coupling,
+            adjustedElongation,voltage,member.youngModulus,member.coupling,
             member.permittivity,member.area,length);
+        const double forceEvaluationScale = member.area*(
+            (member.youngModulus/length)*(
+                std::abs(result.displacements[member.node0])+
+                std::abs(result.displacements[member.node1]))+
+            member.youngModulus*std::abs(member.thermalStrain)+
+            (std::abs(member.coupling)/length)*(
+                std::abs(result.potentials[member.node0])+
+                std::abs(result.potentials[member.node1])));
+        if (!std::isfinite(forceEvaluationScale))
+            failedSolve("recovered force evaluation scale is non-finite.");
         result.memberAxialForces[memberIndex] = response.mechanicalForce;
         result.memberRightCharges[memberIndex] = -response.dielectricDisplacementFlux;
         result.enthalpy += response.enthalpy;
@@ -417,10 +486,16 @@ RStructuralPiezoCoupled1DResult recoverResult(
         result.internalForces[member.node1] += axialShape[1]*response.mechanicalForce;
         absoluteInternalForceContributions[member.node0] += std::abs(response.mechanicalForce);
         absoluteInternalForceContributions[member.node1] += std::abs(response.mechanicalForce);
+        absoluteForceEvaluationScales[member.node0] += forceEvaluationScale;
+        absoluteForceEvaluationScales[member.node1] += forceEvaluationScale;
+        ++internalForceContributionCounts[member.node0];
+        ++internalForceContributionCounts[member.node1];
         result.conductorCharges[member.node0] += leftCharge;
         result.conductorCharges[member.node1] += rightCharge;
         if (!std::isfinite(absoluteInternalForceContributions[member.node0]) ||
             !std::isfinite(absoluteInternalForceContributions[member.node1]) ||
+            !std::isfinite(absoluteForceEvaluationScales[member.node0]) ||
+            !std::isfinite(absoluteForceEvaluationScales[member.node1]) ||
             !std::isfinite(result.internalForces[member.node0]) ||
             !std::isfinite(result.internalForces[member.node1]) ||
             !std::isfinite(result.conductorCharges[member.node0]) ||
@@ -434,7 +509,7 @@ RStructuralPiezoCoupled1DResult recoverResult(
     std::vector<double> electricResidual;
     std::vector<double> freeMechanicalLoads;
     std::vector<double> freeMechanicalInternal;
-    std::vector<double> freeMechanicalAssemblyMagnitude;
+    std::vector<double> freeMechanicalRoundoff;
     std::vector<double> freePrescribedCharges;
     std::vector<double> freeComputedCharges;
     for (std::size_t node=0;node<nNodes;node++)
@@ -444,7 +519,18 @@ RStructuralPiezoCoupled1DResult recoverResult(
             mechanicalResidual.push_back(result.internalForces[node]-input.mechanicalLoads[node]);
             freeMechanicalLoads.push_back(input.mechanicalLoads[node]);
             freeMechanicalInternal.push_back(result.internalForces[node]);
-            freeMechanicalAssemblyMagnitude.push_back(absoluteInternalForceContributions[node]);
+            const std::size_t contributionCount = internalForceContributionCounts[node];
+            const double forceMagnitude = upperBoundForNonnegativeSum(
+                absoluteInternalForceContributions[node],contributionCount);
+            const double evaluationMagnitude = upperBoundForNonnegativeSum(
+                absoluteForceEvaluationScales[node],10*contributionCount);
+            const double residualSubtractionMagnitude =
+                std::abs(result.internalForces[node])+std::abs(input.mechanicalLoads[node]);
+            const double rowRoundoff =
+                roundoffBound(contributionCount,forceMagnitude)+
+                roundoffBound(12,evaluationMagnitude)+
+                roundoffBound(1,upperBoundForNonnegativeSum(residualSubtractionMagnitude,1));
+            freeMechanicalRoundoff.push_back(rowRoundoff);
         }
         if (!input.potentialPrescribed[node])
         {
@@ -463,9 +549,13 @@ RStructuralPiezoCoupled1DResult recoverResult(
         stableNorm(freeComputedCharges,"free computed conductor charges"));
     // A free row can sum large opposing member forces to nearly zero. The
     // relative certificate above then loses its physical assembly scale;
-    // allow only the rounding of those freshly recovered force terms.
-    const double mechanicalRoundoff = 8.0*std::numeric_limits<double>::epsilon()*
-        stableNorm(freeMechanicalAssemblyMagnitude,"free mechanical assembly magnitude");
+    // bound the force evaluation and member reduction from their absolute
+    // contributions and incident-member operation count.
+    const double mechanicalRoundoffNorm = upperBoundForNonnegativeSum(
+        stableNorm(freeMechanicalRoundoff,"free mechanical force roundoff bound"),
+        2*freeMechanicalRoundoff.size());
+    const double mechanicalRoundoff = mechanicalRoundoffNorm+
+        roundoffBound(2*mechanicalResidual.size(),result.mechanicalResidualNorm);
     const double mechanicalTolerance = input.mechanicalAbsoluteTolerance+
         input.mechanicalRelativeTolerance*mechanicalScale+mechanicalRoundoff;
     const double electricTolerance = input.electricAbsoluteTolerance+
@@ -536,6 +626,7 @@ void certifySparseResiduals(const FreeSystem &system,
     std::vector<double> forceResidual;
     std::vector<double> chargeResidual;
     std::vector<double> forceRoundoffBounds;
+    std::vector<double> chargeRoundoffBounds;
     std::vector<double> freeMechanicalLoads;
     std::vector<double> freeMechanicalInternal;
     std::vector<double> freePrescribedCharges;
@@ -546,18 +637,31 @@ void certifySparseResiduals(const FreeSystem &system,
         const double residual = system.rhs[row]-product[uint(row)];
         if (!std::isfinite(residual))
             failedSolve("fresh sparse matrix residual is non-finite.");
+        const RSparseVector<double> &absoluteEntries =
+            system.absoluteMatrixContributions.getVector(uint(row));
+        double matrixMagnitude = 0.0;
+        for (uint position=0;position<absoluteEntries.size();position++)
+            matrixMagnitude += absoluteEntries.getValue(position)*
+                std::abs(freeSolution[absoluteEntries.getIndex(position)]);
+        if (!std::isfinite(matrixMagnitude))
+            failedSolve("fresh sparse row contribution scale is non-finite.");
+        const std::size_t matrixScaleOperationCount =
+            system.matrixAssemblyContributionCounts[row]+2*absoluteEntries.size();
+        const double matrixMagnitudeUpper = upperBoundForNonnegativeSum(
+            matrixMagnitude,matrixScaleOperationCount);
+        const double rhsMagnitudeUpper = upperBoundForNonnegativeSum(
+            system.absoluteRhsContributions[row],system.rhsAssemblyOperationCounts[row]);
+        const double rowMagnitudeUpper = upperBoundForNonnegativeSum(
+            matrixMagnitudeUpper+rhsMagnitudeUpper,1);
+        const std::size_t residualOperationCount =
+            system.matrixAssemblyContributionCounts[row]+
+            system.rhsAssemblyOperationCounts[row]+2*absoluteEntries.size()+1;
+        const double rowRoundoffBound = roundoffBound(
+            residualOperationCount,rowMagnitudeUpper);
         if (globalDof < nNodes)
         {
             forceResidual.push_back(residual);
-            const RSparseVector<double> &entries = system.matrix.getVector(uint(row));
-            double rowMagnitude = std::abs(system.rhs[row]);
-            for (uint position=0;position<entries.size();position++)
-                rowMagnitude += std::abs(entries.getValue(position)*
-                                         freeSolution[entries.getIndex(position)]);
-            if (!std::isfinite(rowMagnitude))
-                failedSolve("fresh sparse mechanical row magnitude is non-finite.");
-            forceRoundoffBounds.push_back(
-                4.0*double(entries.size()+2)*std::numeric_limits<double>::epsilon()*rowMagnitude);
+            forceRoundoffBounds.push_back(rowRoundoffBound);
             freeMechanicalLoads.push_back(input.mechanicalLoads[globalDof]);
             freeMechanicalInternal.push_back(result.internalForces[globalDof]);
         }
@@ -565,6 +669,7 @@ void certifySparseResiduals(const FreeSystem &system,
         {
             const std::size_t node = globalDof-nNodes;
             chargeResidual.push_back(residual);
+            chargeRoundoffBounds.push_back(rowRoundoffBound);
             freePrescribedCharges.push_back(input.prescribedConductorCharges[node]);
             freeComputedCharges.push_back(result.conductorCharges[node]);
         }
@@ -579,9 +684,16 @@ void certifySparseResiduals(const FreeSystem &system,
         stableNorm(freeComputedCharges,"free computed conductor charges"));
     const double forceTolerance = input.mechanicalAbsoluteTolerance+
         input.mechanicalRelativeTolerance*forceScale+
-        stableNorm(forceRoundoffBounds,"fresh sparse mechanical roundoff bound");
+        upperBoundForNonnegativeSum(
+            stableNorm(forceRoundoffBounds,"fresh sparse mechanical roundoff bound"),
+            2*forceRoundoffBounds.size())+
+        roundoffBound(2*forceRoundoffBounds.size(),sparseForceNorm);
     const double chargeTolerance = input.electricAbsoluteTolerance+
-        input.electricRelativeTolerance*chargeScale;
+        input.electricRelativeTolerance*chargeScale+
+        upperBoundForNonnegativeSum(
+            stableNorm(chargeRoundoffBounds,"fresh sparse electrical roundoff bound"),
+            2*chargeRoundoffBounds.size())+
+        roundoffBound(2*chargeRoundoffBounds.size(),sparseChargeNorm);
     if (!std::isfinite(forceTolerance) || !std::isfinite(chargeTolerance) ||
         sparseForceNorm > forceTolerance || sparseChargeNorm > chargeTolerance)
         failedSolve("fresh sparse residual failed its separate N/C certificates.");
