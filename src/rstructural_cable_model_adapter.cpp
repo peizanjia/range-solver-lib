@@ -2,6 +2,7 @@
 #include <array>
 #include <algorithm>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include <rbl_error.h>
@@ -9,11 +10,14 @@
 #include <rml_line.h>
 #include <rml_material.h>
 #include <rml_model.h>
+#include <rml_structural_control_setup.h>
+#include <rml_structural_dynamics_restart_data.h>
 #include <rml_structural_dynamics_setup.h>
 #include <rml_structural_cable_setup.h>
 #include <rml_variable.h>
 
 #include "rstructural_cable_model_adapter.h"
+#include "rstructural_cable_dynamics_restart_adapter.h"
 #include "rstructural_static_truss_model.h"
 
 namespace
@@ -65,6 +69,10 @@ CableModelData buildCableModelData(const RModel &model, bool dynamics)
     {
         fail("Structural cable and piezo modes cannot be enabled together.");
     }
+    if (problemSetup.getStructuralControlSetup().enabled)
+    {
+        fail("Structural cable mode does not yet support Stage-6 structural control.");
+    }
     setup.validate(model);
 
     const RStructuralDynamicsSetup &dynamicsSetup =
@@ -79,7 +87,22 @@ CableModelData buildCableModelData(const RModel &model, bool dynamics)
     }
 
     CableModelData data;
-    data.common = RStructuralStaticTrussModel::build(model,dynamics,false);
+    if (dynamics &&
+        (problemSetup.getRestart() ||
+         problemSetup.getStructuralDynamicsRestartData().available))
+    {
+        // The shared static truss extractor intentionally rejects restart
+        // records. Build physical FE data from a local clean copy so the
+        // accepted checkpoint stays intact on the live model.
+        RModel physicalModel(model);
+        physicalModel.getProblemSetup().setRestart(false);
+        physicalModel.getProblemSetup().getStructuralDynamicsRestartData().clear();
+        data.common = RStructuralStaticTrussModel::build(physicalModel,true,false);
+    }
+    else
+    {
+        data.common = RStructuralStaticTrussModel::build(model,dynamics,false);
+    }
 
     std::vector<const RStructuralCableMember*> setupByElement(model.getNElements(),nullptr);
     for (const RStructuralCableMember &member : setup.members)
@@ -231,6 +254,22 @@ void storeNodalKinematics(RModel &model,RVariableType type,
     }
 }
 
+void copyResultVariable(RModel &model,const RModel &source,RVariableType type)
+{
+    const uint sourcePosition = source.findVariable(type);
+    if (sourcePosition == RConstants::eod)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Cable transient mechanical publisher omitted a result variable.");
+    }
+    uint targetPosition = model.findVariable(type);
+    if (targetPosition == RConstants::eod)
+    {
+        targetPosition = model.addVariable(type);
+    }
+    model.getVariable(targetPosition) = source.getVariable(sourcePosition);
+}
+
 void validateTransientResult(const RModel &model,
                              const RStructuralCableDynamicsResult &result,
                              std::size_t memberCount)
@@ -270,6 +309,39 @@ void validateTransientResult(const RModel &model,
     }
 }
 
+RStructuralCableDynamicsOptions cableDynamicsOptions(const RModel &model)
+{
+    const RStructuralCableSetup &cable =
+        model.getProblemSetup().getStructuralCableSetup();
+    const RStructuralDynamicsSetup &dynamics =
+        model.getProblemSetup().getStructuralDynamicsSetup();
+    RStructuralCableDynamicsOptions options;
+    options.dt = dynamics.getTimeStep();
+    options.beta = dynamics.getNewmarkBeta();
+    options.gamma = dynamics.getNewmarkGamma();
+    options.maxIterations = cable.maxIterations;
+    options.maxLineSearchIterations = cable.maxLineSearchIterations;
+    options.absForceTol = cable.absoluteForceTolerance;
+    options.relForceTol = cable.relativeForceTolerance;
+    return options;
+}
+
+QString cableDynamicsSystemFingerprint(const RModel &model,
+                                       const CableModelData &data,
+                                       const RStructuralCableDynamicsOptions &options)
+{
+    std::vector<double> elementAreas;
+    elementAreas.reserve(data.common.members.size());
+    for (const RStructuralStaticTrussMember &member : data.common.members)
+    {
+        elementAreas.push_back(member.area);
+    }
+    return RStructuralCableDynamicsRestartAdapter::computeSystemFingerprint(
+        model,data.common.nodes,data.members,elementAreas,data.nodalLumpedMass,
+        data.common.prescribedMask,data.common.prescribedDisplacements,
+        data.common.deadNodalLoads,options);
+}
+
 }
 
 void RStructuralCableModelAdapter::validate(const RModel &model)
@@ -280,7 +352,14 @@ void RStructuralCableModelAdapter::validate(const RModel &model)
     }
     const bool dynamics =
         model.getProblemSetup().getStructuralDynamicsSetup().getEnabled();
-    (void)buildCableModelData(model,dynamics);
+    const CableModelData data = buildCableModelData(model,dynamics);
+    if (dynamics)
+    {
+        const RStructuralCableDynamicsOptions options = cableDynamicsOptions(model);
+        const QString fingerprint = cableDynamicsSystemFingerprint(model,data,options);
+        RStructuralCableDynamicsRestartAdapter::validateAcceptedState(
+            model,fingerprint,data.common.deadNodalLoads);
+    }
 }
 
 RStructuralCableEquilibriumResult RStructuralCableModelAdapter::solve(const RModel &model)
@@ -304,23 +383,18 @@ RStructuralCableDynamicsResult RStructuralCableModelAdapter::solveDynamics(
     const std::vector<double> &previousAccelerations)
 {
     const CableModelData data = buildCableModelData(model,true);
-    const RStructuralCableSetup &cable =
-        model.getProblemSetup().getStructuralCableSetup();
-    const RStructuralDynamicsSetup &dynamics =
-        model.getProblemSetup().getStructuralDynamicsSetup();
-
-    RStructuralCableDynamicsOptions options;
-    options.dt = dynamics.getTimeStep();
-    options.beta = dynamics.getNewmarkBeta();
-    options.gamma = dynamics.getNewmarkGamma();
-    options.maxIterations = cable.maxIterations;
-    options.maxLineSearchIterations = cable.maxLineSearchIterations;
-    options.absForceTol = cable.absoluteForceTolerance;
-    options.relForceTol = cable.relativeForceTolerance;
+    const RStructuralCableDynamicsOptions options = cableDynamicsOptions(model);
+    const QString fingerprint = cableDynamicsSystemFingerprint(model,data,options);
+    std::vector<double> acceptedDisplacements = previousDisplacements;
+    std::vector<double> acceptedVelocities = previousVelocities;
+    std::vector<double> acceptedAccelerations = previousAccelerations;
+    RStructuralCableDynamicsRestartAdapter::restoreAcceptedState(
+        model,fingerprint,data.common.deadNodalLoads,
+        acceptedDisplacements,acceptedVelocities,acceptedAccelerations);
 
     return RStructuralCableDynamicsSolver::step(
         data.common.nodes,data.members,data.nodalLumpedMass,
-        previousDisplacements,previousVelocities,previousAccelerations,
+        acceptedDisplacements,acceptedVelocities,acceptedAccelerations,
         data.common.prescribedMask,data.common.prescribedDisplacements,
         data.common.deadNodalLoads,options);
 }
@@ -358,12 +432,44 @@ void RStructuralCableModelAdapter::publishDynamics(
 {
     const CableModelData data = buildCableModelData(model,true);
     validateTransientResult(model,result,data.common.members.size());
+    const RStructuralCableDynamicsOptions options = cableDynamicsOptions(model);
+    const QString fingerprint = cableDynamicsSystemFingerprint(model,data,options);
+    RStructuralDynamicsRestartData checkpoint =
+        RStructuralCableDynamicsRestartAdapter::stageAcceptedState(
+            model,result,fingerprint,data.common.deadNodalLoads);
 
-    // The common publisher validates the complete mechanical response and the
-    // current model before its first write. Kinematic vectors were validated
-    // above, so the remaining writes cannot expose a partial failed candidate.
-    RStructuralStaticTrussModel::publishMechanical(
-        model,result.displacements,result.internalForces,result.elementTensions,true);
+    // The static publisher's common data builder rejects persisted restart
+    // records. Keep the live accepted checkpoint untouched while publishing
+    // outputs through a clean, temporary copy in that case.
+    const RProblemSetup &problemSetup = model.getProblemSetup();
+    if (problemSetup.getRestart() ||
+        problemSetup.getStructuralDynamicsRestartData().available)
+    {
+        RModel publicationModel(model);
+        publicationModel.getProblemSetup().setRestart(false);
+        publicationModel.getProblemSetup().getStructuralDynamicsRestartData().clear();
+        RStructuralStaticTrussModel::publishMechanical(
+            publicationModel,result.displacements,result.internalForces,
+            result.elementTensions,true);
+        const RVariableType publishedTypes[] = {
+            R_VARIABLE_DISPLACEMENT,
+            R_VARIABLE_FORCE,
+            R_VARIABLE_STRESS_NORMAL,
+            R_VARIABLE_STRESS_VON_MISES,
+            R_VARIABLE_STRESS_X
+        };
+        for (RVariableType type : publishedTypes)
+        {
+            copyResultVariable(model,publicationModel,type);
+        }
+    }
+    else
+    {
+        RStructuralStaticTrussModel::publishMechanical(
+            model,result.displacements,result.internalForces,result.elementTensions,true);
+    }
     storeNodalKinematics(model,R_VARIABLE_VELOCITY,result.velocities);
     storeNodalKinematics(model,R_VARIABLE_ACCELERATION,result.accelerations);
+    RStructuralCableDynamicsRestartAdapter::commitAcceptedState(
+        model,std::move(checkpoint));
 }

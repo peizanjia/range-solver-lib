@@ -32,6 +32,7 @@ qt_add_library(range-solver-lib
         src/rstructural_dynamics_integrator.cpp
         src/rstructural_cable_kernel.cpp
         src/rstructural_cable_equilibrium.cpp
+        src/rstructural_cable_dynamics_restart_adapter.cpp
         src/rstructural_cable_model_adapter.cpp
         src/rstructural_static_truss_model.cpp
         src/rstructural_piezo_model_adapter.cpp
@@ -81,6 +82,7 @@ qt_add_library(range-solver-lib
         include/rstructural_dynamics_integrator.h
         include/rstructural_cable_kernel.h
         include/rstructural_cable_equilibrium.h
+        include/rstructural_cable_dynamics_restart_adapter.h
         include/rstructural_cable_model_adapter.h
         include/rstructural_static_truss_model.h
         include/rstructural_piezo_model_adapter.h
