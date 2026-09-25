@@ -164,6 +164,10 @@ class RSolverGeneric
         virtual void rollbackStepTransaction();
         virtual void commitStepTransaction();
 
+        //! Validate mutable model settings before the run changes scales,
+        //! results or solver state. Most solvers have no additional gate.
+        virtual void validateRunConfiguration() const;
+
         //! Apply displacement if possible.
         void applyDisplacement();
 

@@ -25,6 +25,8 @@ set(range_solver_lib_tests
     tst_parallel_execution_context
     tst_structural_dynamics_integrator
     tst_structural_cable_kernel
+    tst_structural_cable_equilibrium
+    tst_structural_cable_fe
     tst_structural_piezo_kernel
     tst_structural_control_force_map
     tst_structural_control_conditioner

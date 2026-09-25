@@ -19,6 +19,7 @@
 #include "rsolvermesh.h"
 #include "rsolverradiativeheat.h"
 #include "rsolverstress.h"
+#include "rstructural_cable_model_adapter.h"
 #include "rparallel_execution_context.h"
 #include "rsolverwave.h"
 
@@ -29,6 +30,13 @@ void RSolver::_init()
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                      "No solver problem task is configured.");
+    }
+
+    if (this->pModel->getProblemSetup().getStructuralCableSetup().enabled)
+    {
+        // This gate deliberately precedes solver construction and the result
+        // cleanup below for every execution policy.
+        RStructuralCableModelAdapter::validate(*this->pModel);
     }
 
     if (this->executionPolicy == ExecutionPolicy::StructuralProduct)
@@ -163,6 +171,11 @@ void RSolver::setParallelExecutionReportObserver(ParallelExecutionReportObserver
 
 void RSolver::setStructuralSupportResponseObserver(StructuralSupportResponseObserver observer)
 {
+    if (this->pModel->getProblemSetup().getStructuralCableSetup().enabled && observer)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural support-response observers are unsupported in static cable mode.");
+    }
     this->structuralSupportResponseObserver = std::move(observer);
     auto it = this->solvers.find(R_PROBLEM_STRESS);
     if (it != this->solvers.end())
@@ -186,8 +199,13 @@ std::vector<RStructuralSupportSample> RSolver::getStructuralSupportSamples() con
 
 void RSolver::setStructuralControlCallback(const QString &controllerId,
                                            const QString &controllerRevision,
-                                           StructuralControlCallback callback)
+                                          StructuralControlCallback callback)
 {
+    if (this->pModel->getProblemSetup().getStructuralCableSetup().enabled && callback)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural control callbacks are unsupported in static cable mode.");
+    }
     this->structuralControllerId = controllerId;
     this->structuralControllerRevision = controllerRevision;
     this->structuralControlCallback = std::move(callback);
@@ -199,6 +217,11 @@ void RSolver::setStructuralControlCallback(const QString &controllerId,
 
 void RSolver::setStructuralControlStepObserver(StructuralControlStepObserver observer)
 {
+    if (this->pModel->getProblemSetup().getStructuralCableSetup().enabled && observer)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural control observers are unsupported in static cable mode.");
+    }
     this->structuralControlStepObserver = std::move(observer);
     auto it = this->solvers.find(R_PROBLEM_STRESS);
     if (it != this->solvers.end())
@@ -217,6 +240,17 @@ std::vector<RStructuralControlChannelSample> RSolver::getStructuralControlSample
 
 void RSolver::run()
 {
+    if (this->pModel->getProblemSetup().getStructuralCableSetup().enabled)
+    {
+        // Recheck because the referenced RModel remains mutable after _init().
+        RStructuralCableModelAdapter::validate(*this->pModel);
+        if (this->structuralSupportResponseObserver || this->structuralControlCallback ||
+            this->structuralControlStepObserver)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Structural support/control observers are unsupported in static cable mode.");
+        }
+    }
     RParallelExecutionContext parallelContext(this->pModel->getProblemSetup().getParallelExecutionConfig());
     const RParallelExecutionReport &parallel = parallelContext.getReport();
     if (this->parallelExecutionReportObserver)

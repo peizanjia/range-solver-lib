@@ -12,6 +12,7 @@
 #include "reigenvaluesolver.h"
 #include "rstructural_dynamics_integrator.h"
 #include "rstructural_control_force_map.h"
+#include "rstructural_cable_model_adapter.h"
 
 namespace
 {
@@ -580,6 +581,17 @@ RSolverStress::RSolverStress(RModel *pModel, const QString &modelFileName, const
     , nLinearConstraintEquations(0)
 {
     this->problemType = modalAnalysis ? R_PROBLEM_STRESS_MODAL : R_PROBLEM_STRESS;
+    this->structuralCableModeAtConstruction =
+        this->pModel->getProblemSetup().getStructuralCableSetup().enabled;
+    if (this->structuralCableModeAtConstruction)
+    {
+        if (modalAnalysis)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Enabled structural cable mode requires a non-modal static stress solver.");
+        }
+        RStructuralCableModelAdapter::validate(*this->pModel);
+    }
 }
 
 RSolverStress::~RSolverStress()
@@ -762,6 +774,11 @@ void RSolverStress::setControlCallback(
     const QString &id, const QString &revision,
     std::function<RStructuralControlDecision(const RStructuralControlObservation &)> callback)
 {
+    if (this->isStructuralCableMode() && callback)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural control callbacks are unsupported in static cable mode.");
+    }
     this->controllerId = id;
     this->controllerRevision = revision;
     this->controlCallback = std::move(callback);
@@ -770,6 +787,11 @@ void RSolverStress::setControlCallback(
 void RSolverStress::setControlStepObserver(
     std::function<void(const RStructuralControlStepRecord &)> observer)
 {
+    if (this->isStructuralCableMode() && observer)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural control observers are unsupported in static cable mode.");
+    }
     this->controlStepObserver = std::move(observer);
 }
 
@@ -787,6 +809,11 @@ QString RSolverStress::getPendingControlObserverFailure() const
 void RSolverStress::setSupportResponseObserver(
     std::function<void(const std::vector<RStructuralSupportSample> &)> observer)
 {
+    if (this->isStructuralCableMode() && observer)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural support-response observers are unsupported in static cable mode.");
+    }
     this->supportResponseObserver = std::move(observer);
 }
 
@@ -797,7 +824,53 @@ std::vector<RStructuralSupportSample> RSolverStress::getAcceptedSupportSamples()
 
 bool RSolverStress::hasConverged() const
 {
+    if (this->isStructuralCableMode())
+    {
+        return this->structuralCableResultReady;
+    }
     return true;
+}
+
+void RSolverStress::validateRunConfiguration() const
+{
+    const bool cableEnabled = this->pModel->getProblemSetup().getStructuralCableSetup().enabled;
+    if (cableEnabled != this->structuralCableModeAtConstruction)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural cable mode cannot be enabled or disabled after constructing RSolverStress.");
+    }
+    if (!cableEnabled)
+    {
+        return;
+    }
+    if (this->problemType != R_PROBLEM_STRESS)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Enabled structural cable mode requires a non-modal static stress solver.");
+    }
+    RStructuralCableModelAdapter::validate(*this->pModel);
+    if (this->supportResponseObserver || this->controlCallback || this->controlStepObserver)
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Structural support/control observers are unsupported in static cable mode.");
+    }
+
+    const RRVector &sharedTemperature = this->pSharedData->findData("element-temperature");
+    if (sharedTemperature.getNRows() != 0 &&
+        sharedTemperature.getNRows() != this->pModel->getNElements())
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Static cable mode requires one reference temperature per model element.");
+    }
+    for (uint element=0;element<sharedTemperature.getNRows();element++)
+    {
+        const double temperature = sharedTemperature[element];
+        if (!std::isfinite(temperature) || std::fabs(temperature-293.15) > 1.0e-10)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Static cable mode is isothermal at 293.15 K; shared element temperature is unsupported.");
+        }
+    }
 }
 
 uint RSolverStress::getNComputedModes() const
@@ -811,11 +884,49 @@ void RSolverStress::initialize()
 
 void RSolverStress::updateScales()
 {
+    if (this->isStructuralCableMode())
+    {
+        this->scales = RScales();
+        return;
+    }
     this->scales.setMetre(this->findMeshScale());
+}
+
+bool RSolverStress::isStructuralCableMode() const
+{
+    return this->problemType == R_PROBLEM_STRESS &&
+           this->pModel->getProblemSetup().getStructuralCableSetup().enabled;
+}
+
+void RSolverStress::findComputableElements(RProblemType problemType)
+{
+    if (this->isStructuralCableMode())
+    {
+        RStructuralCableModelAdapter::validate(*this->pModel);
+        this->computableElements.resize(this->pModel->getNElements(),false);
+        this->computableElements.fill(false);
+        for (uint elementId=0;elementId<this->pModel->getNElements();elementId++)
+        {
+            if (this->pModel->getElement(elementId).getType() != R_ELEMENT_POINT)
+            {
+                this->computableElements[elementId] = true;
+            }
+        }
+        return;
+    }
+    RSolverGeneric::findComputableElements(problemType);
 }
 
 void RSolverStress::recover()
 {
+    if (this->isStructuralCableMode())
+    {
+        RStructuralCableModelAdapter::validate(*this->pModel);
+        this->structuralCableResultReady = false;
+        this->structuralCableResult = RStructuralCableEquilibriumResult();
+        RStructuralCableModelAdapter::clearResults(*this->pModel);
+        return;
+    }
     this->recoverVariable(R_VARIABLE_DISPLACEMENT,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),0,this->nodeDisplacement.x,0.0);
     this->recoverVariable(R_VARIABLE_DISPLACEMENT,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),1,this->nodeDisplacement.y,0.0);
     this->recoverVariable(R_VARIABLE_DISPLACEMENT,R_VARIABLE_APPLY_NODE,this->pModel->getNNodes(),2,this->nodeDisplacement.z,0.0);
@@ -926,6 +1037,11 @@ void RSolverStress::recover()
 
 void RSolverStress::prepare()
 {
+    if (this->isStructuralCableMode())
+    {
+        RStructuralCableModelAdapter::validate(*this->pModel);
+        return;
+    }
     const bool structuralDynamics = this->problemType == R_PROBLEM_STRESS &&
         this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
     if (structuralDynamics && !this->dynamicsIntegrator && !this->preparingInitialForce)
@@ -1857,7 +1973,14 @@ void RSolverStress::solve()
 {
     try
     {
-        if (this->problemType == R_PROBLEM_STRESS_MODAL)
+        if (this->isStructuralCableMode())
+        {
+            RStructuralCableModelAdapter::validate(*this->pModel);
+            this->structuralCableResultReady = false;
+            this->structuralCableResult = RStructuralCableModelAdapter::solve(*this->pModel);
+            this->structuralCableResultReady = true;
+        }
+        else if (this->problemType == R_PROBLEM_STRESS_MODAL)
         {
             this->solveEigenValue();
         }
@@ -3509,6 +3632,15 @@ void RSolverStress::setDisplacement(const RRVector &v)
 
 void RSolverStress::process()
 {
+    if (this->isStructuralCableMode())
+    {
+        if (!this->structuralCableResultReady)
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Cable results cannot be processed before equilibrium convergence.");
+        }
+        return;
+    }
 
     if (this->problemType == R_PROBLEM_STRESS_MODAL)
     {
@@ -4233,6 +4365,16 @@ void RSolverStress::process()
 
 void RSolverStress::store()
 {
+    if (this->isStructuralCableMode())
+    {
+        if (!this->structuralCableResultReady)
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Cable results cannot be published before equilibrium convergence.");
+        }
+        RStructuralCableModelAdapter::publish(*this->pModel,this->structuralCableResult);
+        return;
+    }
     RLogger::info("Storing results\n");
     RLogger::indent();
 
@@ -4552,6 +4694,22 @@ void RSolverStress::store()
 
 void RSolverStress::statistics()
 {
+    if (this->isStructuralCableMode())
+    {
+        if (!this->structuralCableResultReady)
+        {
+            throw RError(RError::Type::Application,R_ERROR_REF,
+                         "Cable statistics require a converged equilibrium.");
+        }
+        RLogger::info("Cable equilibrium converged: iterations=%zu free-residual=%g energy=%g\n",
+                      this->structuralCableResult.iterations,
+                      this->structuralCableResult.residualNorm,
+                      this->structuralCableResult.energy);
+        this->printStats(R_VARIABLE_DISPLACEMENT);
+        this->printStats(R_VARIABLE_STRESS_VON_MISES);
+        this->printStats(R_VARIABLE_FORCE);
+        return;
+    }
     this->printStats(R_VARIABLE_DISPLACEMENT);
     if (this->pModel->findVariable(R_VARIABLE_ROTATION) != RConstants::eod)
     {

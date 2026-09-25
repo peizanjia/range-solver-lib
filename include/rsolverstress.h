@@ -11,6 +11,7 @@
 #include "rstructural_support_response.h"
 #include "rstructural_control_protocol.h"
 #include "rstructural_control_conditioner.h"
+#include "rstructural_cable_model_adapter.h"
 #include "rsolvergeneric.h"
 
 class RStructuralDynamicsIntegrator;
@@ -136,6 +137,10 @@ class RSolverStress : public RSolverGeneric
         QByteArray candidateControllerState;
         RStructuralControlStepRecord trialControlRecord;
         QString pendingControlObserverFailure;
+        //! Last converged result from the dedicated static cable equilibrium path.
+        RStructuralCableEquilibriumResult structuralCableResult;
+        bool structuralCableResultReady = false;
+        bool structuralCableModeAtConstruction = false;
         struct ControlSensorMap
         {
             QString id;
@@ -190,9 +195,14 @@ class RSolverStress : public RSolverGeneric
         void beginStepTransaction() override;
         void rollbackStepTransaction() override;
         void commitStepTransaction() override;
+        void validateRunConfiguration() const override;
 
         //! Update scales.
         void updateScales() override;
+
+        //! Cable mode has its own validated TRUSS1 topology and bypasses the
+        //! legacy material-driven computability scan.
+        void findComputableElements(RProblemType problemType) override;
 
         //! Recover previously computed results.
         void recover() override;
@@ -233,6 +243,8 @@ class RSolverStress : public RSolverGeneric
 
         //! Process statistics.
         void statistics() override;
+
+        bool isStructuralCableMode() const;
 
         //! Local rotations are built from the constraints themselves, see
         //! generateLocalConstraints(), so the generic geometric pass is not used.

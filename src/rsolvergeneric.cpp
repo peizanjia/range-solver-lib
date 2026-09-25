@@ -38,9 +38,11 @@ RSolverGeneric::~RSolverGeneric()
 void RSolverGeneric::beginStepTransaction() {}
 void RSolverGeneric::rollbackStepTransaction() {}
 void RSolverGeneric::commitStepTransaction() {}
+void RSolverGeneric::validateRunConfiguration() const {}
 
 void RSolverGeneric::run(bool firstExecution, uint taskIteration)
 {
+    this->validateRunConfiguration();
     this->firstRun = firstExecution && !this->pModel->getProblemSetup().getRestart();
     this->taskIteration = taskIteration;
 
