@@ -3,6 +3,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 #include "rml_model.h"
 #include "rsolver.h"
@@ -22,6 +23,8 @@ constexpr double barSide = 0.1;              // [m]
 constexpr double barArea = barSide * barSide;
 constexpr uint   nSlices = 30;
 constexpr double gravityAcceleration = -9.80665; // [m/s^2]
+
+bool runSolver(RModel &model, QString &errorMessage);
 
 uint nodeId(uint i, uint j, uint k)
 {
@@ -441,6 +444,381 @@ RModel buildQuadraticTruss(double tipForce)
     model.getMatrixSolverConf(RMatrixSolverConf::CG).setOutputFrequency(0);
     model.getTimeSolver().setEnabled(false);
     return model;
+}
+
+//! Build a fixed-free axial continuum mesh for spatial eigenfrequency checks.
+//! The bar has no lateral deformation, so its first mode is the one-dimensional
+//! quarter-wave solution c/(4L), while each element family still has a finite
+//! approximation error in the axial direction.
+RModel buildAxialModalMesh(uint axialSlices, RElementType elementType)
+{
+    RModel model;
+    const bool isTruss = elementType == R_ELEMENT_TRUSS2;
+    const uint axialNodeCount = isTruss ? 2*axialSlices+1 : axialSlices+1;
+    model.setNNodes(isTruss ? axialNodeCount : 4*axialNodeCount);
+
+    if (isTruss)
+    {
+        for (uint i=0;i<axialNodeCount;i++)
+        {
+            model.getNode(i).set(barLength*double(i)/double(2*axialSlices),0.0,0.0);
+        }
+        for (uint i=0;i<axialSlices;i++)
+        {
+            RElement element(R_ELEMENT_TRUSS2);
+            element.setNodeId(0,2*i);
+            element.setNodeId(1,2*i+2);
+            element.setNodeId(2,2*i+1);
+            model.addElement(element,true,0);
+        }
+    }
+    else
+    {
+        for (uint i=0;i<=axialSlices;i++)
+        {
+            const double x = barLength*double(i)/double(axialSlices);
+            for (uint j=0;j<2;j++)
+            {
+                for (uint k=0;k<2;k++)
+                {
+                    model.getNode(nodeId(i,j,k)).set(x,double(j)*barSide,double(k)*barSide);
+                }
+            }
+        }
+
+        for (uint i=0;i<axialSlices;i++)
+        {
+            const uint v000 = nodeId(i,0,0);
+            const uint v001 = nodeId(i,0,1);
+            const uint v010 = nodeId(i,1,0);
+            const uint v011 = nodeId(i,1,1);
+            const uint v100 = nodeId(i+1,0,0);
+            const uint v101 = nodeId(i+1,0,1);
+            const uint v110 = nodeId(i+1,1,0);
+            const uint v111 = nodeId(i+1,1,1);
+
+            if (elementType == R_ELEMENT_TETRA1)
+            {
+                addTetrahedron(model,v000,v100,v110,v111);
+                addTetrahedron(model,v000,v110,v010,v111);
+                addTetrahedron(model,v000,v010,v011,v111);
+                addTetrahedron(model,v000,v011,v001,v111);
+                addTetrahedron(model,v000,v001,v101,v111);
+                addTetrahedron(model,v000,v101,v100,v111);
+            }
+            else if (elementType == R_ELEMENT_WEDGE1)
+            {
+                RElement lower(R_ELEMENT_WEDGE1);
+                lower.setNodeId(0,v000);
+                lower.setNodeId(1,v010);
+                lower.setNodeId(2,v001);
+                lower.setNodeId(3,v100);
+                lower.setNodeId(4,v110);
+                lower.setNodeId(5,v101);
+                model.addElement(lower,true,0);
+
+                RElement upper(R_ELEMENT_WEDGE1);
+                upper.setNodeId(0,v011);
+                upper.setNodeId(1,v001);
+                upper.setNodeId(2,v010);
+                upper.setNodeId(3,v111);
+                upper.setNodeId(4,v101);
+                upper.setNodeId(5,v110);
+                model.addElement(upper,true,0);
+            }
+            else if (elementType == R_ELEMENT_HEXA1)
+            {
+                RElement element(R_ELEMENT_HEXA1);
+                element.setNodeId(0,v000);
+                element.setNodeId(1,v100);
+                element.setNodeId(2,v110);
+                element.setNodeId(3,v010);
+                element.setNodeId(4,v001);
+                element.setNodeId(5,v101);
+                element.setNodeId(6,v111);
+                element.setNodeId(7,v011);
+                model.addElement(element,true,0);
+            }
+            else
+            {
+                throw std::invalid_argument("Unsupported element in axial modal mesh");
+            }
+        }
+    }
+
+    RMaterial material(RMaterial::Solid);
+    RMaterialProperty modulus(RMaterialProperty::ModulusOfElasiticity);
+    modulus.add(293.15,elasticityModulus);
+    material.add(modulus);
+    RMaterialProperty poisson(RMaterialProperty::PoissonRatio);
+    poisson.add(293.15,poissonRatio);
+    material.add(poisson);
+    RMaterialProperty materialDensity(RMaterialProperty::Density);
+    materialDensity.add(293.15,density);
+    material.add(materialDensity);
+    RMaterialProperty expansion(RMaterialProperty::ThermalExpansionCoefficient);
+    expansion.add(293.15,thermalExpansion);
+    material.add(expansion);
+
+    if (isTruss)
+    {
+        RLine &line = model.getLine(0);
+        line.setName("Quadratic modal bar");
+        line.setCrossArea(barArea);
+        line.setMaterial(material);
+        RBoundaryCondition lateral(R_BOUNDARY_CONDITION_DISPLACEMENT);
+        lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).setEnabled(false);
+        lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+        lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+        line.addBoundaryCondition(lateral);
+    }
+    else
+    {
+        RVolume &volume = model.getVolume(0);
+        volume.setName("Axial modal bar");
+        volume.setMaterial(material);
+        RBoundaryCondition lateral(R_BOUNDARY_CONDITION_DISPLACEMENT);
+        lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).setEnabled(false);
+        lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+        lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+        volume.addBoundaryCondition(lateral);
+    }
+
+    const uint rootNodeCount = isTruss ? 1u : 4u;
+    for (uint i=0;i<rootNodeCount;i++)
+    {
+        RElement point(R_ELEMENT_POINT);
+        point.setNodeId(0,isTruss ? 0u : nodeId(0,i/2,i%2));
+        model.addElement(point,true,0);
+    }
+    RBoundaryCondition fixed(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    fixed.getComponent(fixed.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).add(0.0,0.0);
+    fixed.getComponent(fixed.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+    fixed.getComponent(fixed.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+    model.getPoint(0).addBoundaryCondition(fixed);
+
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setNInnerIterations(500);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setNOuterIterations(5000);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setSolverCvgValue(1.0e-13);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setOutputFrequency(0);
+    model.getTimeSolver().setEnabled(false);
+    return model;
+}
+
+//! Build a cantilever beam mesh using either linear two-node or quadratic
+//! three-node beam elements for the Euler-Bernoulli modal convergence check.
+RModel buildBeamModalMesh(uint beamSlices, RElementType elementType)
+{
+    const bool quadratic = elementType == R_ELEMENT_BEAM2;
+    const uint nNodes = quadratic ? 2*beamSlices+1 : beamSlices+1;
+    RModel model;
+    model.setNNodes(nNodes);
+    for (uint i=0;i<nNodes;i++)
+    {
+        model.getNode(i).set(barLength*double(i)/double(nNodes-1),0.0,0.0);
+    }
+    for (uint i=0;i<beamSlices;i++)
+    {
+        RElement element(elementType);
+        element.setNodeId(0,quadratic ? 2*i : i);
+        element.setNodeId(1,quadratic ? 2*i+2 : i+1);
+        if (quadratic)
+        {
+            element.setNodeId(2,2*i+1);
+        }
+        model.addElement(element,true,0);
+    }
+
+    RMaterial material(RMaterial::Solid);
+    RMaterialProperty modulus(RMaterialProperty::ModulusOfElasiticity);
+    modulus.add(293.15,elasticityModulus); material.add(modulus);
+    RMaterialProperty poisson(RMaterialProperty::PoissonRatio);
+    poisson.add(293.15,0.3); material.add(poisson);
+    RMaterialProperty materialDensity(RMaterialProperty::Density);
+    materialDensity.add(293.15,density); material.add(materialDensity);
+    RMaterialProperty expansion(RMaterialProperty::ThermalExpansionCoefficient);
+    expansion.add(293.15,thermalExpansion); material.add(expansion);
+    RLine &line = model.getLine(0);
+    line.setName("Modal cantilever");
+    line.setCrossArea(barArea);
+    line.setSecondMomentY(2.0e-5);
+    line.setSecondMomentZ(5.0e-5);
+    line.setTorsionalConstant(7.0e-5);
+    line.setSectionModulusY(4.0e-4);
+    line.setSectionModulusZ(5.0e-4);
+    line.setTorsionalSectionModulus(6.0e-4);
+    line.setLocalYDirection(RR3Vector(0.0,1.0,0.0));
+    line.setMaterial(material);
+
+    RElement root(R_ELEMENT_POINT);
+    root.setNodeId(0,0);
+    model.addElement(root,true,0);
+    RBoundaryCondition fixed(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    fixed.getComponent(fixed.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).add(0.0,0.0);
+    fixed.getComponent(fixed.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+    fixed.getComponent(fixed.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+    model.getPoint(0).addBoundaryCondition(fixed);
+    RBoundaryCondition fixedRotation(R_BOUNDARY_CONDITION_ROTATION);
+    fixedRotation.getComponent(fixedRotation.findComponentPosition(R_VARIABLE_ROTATION_X)).add(0.0,0.0);
+    fixedRotation.getComponent(fixedRotation.findComponentPosition(R_VARIABLE_ROTATION_Y)).add(0.0,0.0);
+    fixedRotation.getComponent(fixedRotation.findComponentPosition(R_VARIABLE_ROTATION_Z)).add(0.0,0.0);
+    model.getPoint(0).addBoundaryCondition(fixedRotation);
+
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setNInnerIterations(1000);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setNOuterIterations(10000);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setSolverCvgValue(1.0e-13);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setOutputFrequency(0);
+    model.getTimeSolver().setEnabled(false);
+    return model;
+}
+
+//! Build a plane-stress membrane cantilever for linear and quadratic triangle
+//! and quadrilateral meshes. The analytical axial mode has
+//! c = sqrt(E/(rho*(1-v^2))).
+RModel buildSurfaceModalMesh(uint axialSlices, RElementType elementType)
+{
+    const bool triangular = elementType == R_ELEMENT_TRI1 || elementType == R_ELEMENT_TRI2;
+    const bool quadratic = elementType == R_ELEMENT_TRI2 || elementType == R_ELEMENT_QUAD2;
+    constexpr double width = 0.1;
+    constexpr double thickness = 0.02;
+    const uint nRadialNodes = quadratic ? 2*axialSlices+1 : axialSlices+1;
+    const uint nNodes = quadratic ? 3*nRadialNodes : 2*nRadialNodes;
+
+    RModel model;
+    model.setNNodes(nNodes);
+    if (quadratic)
+    {
+        for (uint i=0;i<nRadialNodes;i++)
+        {
+            for (uint j=0;j<3;j++)
+            {
+                model.getNode(3*i+j).set(barLength*double(i)/double(2*axialSlices),
+                                         width*double(j)/2.0,0.0);
+            }
+        }
+    }
+    else
+    {
+        for (uint i=0;i<=axialSlices;i++)
+        {
+            model.getNode(2*i).set(barLength*double(i)/double(axialSlices),0.0,0.0);
+            model.getNode(2*i+1).set(barLength*double(i)/double(axialSlices),width,0.0);
+        }
+    }
+
+    for (uint i=0;i<axialSlices;i++)
+    {
+        if (triangular && !quadratic)
+        {
+            const uint n00 = 2*i;
+            const uint n01 = n00+1;
+            const uint n10 = 2*(i+1);
+            const uint n11 = n10+1;
+            RElement lower(R_ELEMENT_TRI1);
+            lower.setNodeId(0,n00); lower.setNodeId(1,n10); lower.setNodeId(2,n11);
+            model.addElement(lower,true,0);
+            RElement upper(R_ELEMENT_TRI1);
+            upper.setNodeId(0,n11); upper.setNodeId(1,n01); upper.setNodeId(2,n00);
+            model.addElement(upper,true,0);
+        }
+        else if (triangular)
+        {
+            const uint n00 = 3*(2*i)+0;
+            const uint n01 = n00+2;
+            const uint n10 = 3*(2*i+2)+0;
+            const uint n11 = n10+2;
+            const uint bottomMid = 3*(2*i+1)+0;
+            const uint topMid = bottomMid+2;
+            const uint leftMid = n00+1;
+            const uint rightMid = n10+1;
+            const uint diagonalMid = bottomMid+1;
+
+            RElement lower(R_ELEMENT_TRI2);
+            lower.setNodeId(0,n00); lower.setNodeId(1,n10); lower.setNodeId(2,n11);
+            lower.setNodeId(3,bottomMid); lower.setNodeId(4,rightMid); lower.setNodeId(5,diagonalMid);
+            model.addElement(lower,true,0);
+            RElement upper(R_ELEMENT_TRI2);
+            upper.setNodeId(0,n11); upper.setNodeId(1,n01); upper.setNodeId(2,n00);
+            upper.setNodeId(3,topMid); upper.setNodeId(4,leftMid); upper.setNodeId(5,diagonalMid);
+            model.addElement(upper,true,0);
+        }
+        else
+        {
+            const uint n00 = 3*(2*i)+0;
+            const uint n01 = n00+2;
+            const uint n10 = 3*(2*i+2)+0;
+            const uint n11 = n10+2;
+            const uint bottomMid = 3*(2*i+1)+0;
+            const uint topMid = bottomMid+2;
+            const uint leftMid = n00+1;
+            const uint rightMid = n10+1;
+            const uint center = bottomMid+1;
+
+            RElement element(R_ELEMENT_QUAD2);
+            element.setNodeId(0,n00); element.setNodeId(1,n10);
+            element.setNodeId(2,n11); element.setNodeId(3,n01);
+            element.setNodeId(4,bottomMid); element.setNodeId(5,rightMid);
+            element.setNodeId(6,topMid); element.setNodeId(7,leftMid);
+            element.setNodeId(8,center);
+            model.addElement(element,true,0);
+        }
+    }
+
+    RMaterial material(RMaterial::Solid);
+    RMaterialProperty modulus(RMaterialProperty::ModulusOfElasiticity);
+    modulus.add(293.15,elasticityModulus); material.add(modulus);
+    RMaterialProperty poisson(RMaterialProperty::PoissonRatio);
+    poisson.add(293.15,0.25); material.add(poisson);
+    RMaterialProperty materialDensity(RMaterialProperty::Density);
+    materialDensity.add(293.15,density); material.add(materialDensity);
+    RMaterialProperty expansion(RMaterialProperty::ThermalExpansionCoefficient);
+    expansion.add(293.15,thermalExpansion); material.add(expansion);
+    RSurface &surface = model.getSurface(0);
+    surface.setName("Membrane modal bar");
+    surface.setThickness(thickness);
+    surface.setStructuralFormulation(RElementFormulation::PlaneStress);
+    surface.setMaterial(material);
+    RBoundaryCondition lateral(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).setEnabled(false);
+    lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+    lateral.getComponent(lateral.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+    surface.addBoundaryCondition(lateral);
+
+    const uint rootNodeCount = quadratic ? 3u : 2u;
+    for (uint j=0;j<rootNodeCount;j++)
+    {
+        RElement root(R_ELEMENT_POINT);
+        root.setNodeId(0,j);
+        model.addElement(root,true,0);
+    }
+    RBoundaryCondition fixed(R_BOUNDARY_CONDITION_DISPLACEMENT);
+    fixed.getComponent(fixed.findComponentPosition(R_VARIABLE_DISPLACEMENT_X)).add(0.0,0.0);
+    fixed.getComponent(fixed.findComponentPosition(R_VARIABLE_DISPLACEMENT_Y)).add(0.0,0.0);
+    fixed.getComponent(fixed.findComponentPosition(R_VARIABLE_DISPLACEMENT_Z)).add(0.0,0.0);
+    model.getPoint(0).addBoundaryCondition(fixed);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setNInnerIterations(1000);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setNOuterIterations(10000);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setSolverCvgValue(1.0e-13);
+    model.getMatrixSolverConf(RMatrixSolverConf::CG).setOutputFrequency(0);
+    model.getTimeSolver().setEnabled(false);
+    return model;
+}
+
+double solveFundamentalFrequency(RModel &model, QString &errorMessage)
+{
+    model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS_MODAL));
+    model.getProblemSetup().setMassMatrixType(RMassMatrixType::Consistent);
+    RModalSetup &modal = model.getProblemSetup().getModalSetup();
+    modal.setMethod(R_MODAL_MULTIPLE_MODES);
+    modal.setNModesToExtract(1);
+    modal.setNIterations(150);
+    modal.setConvergenceValue(1.0e-12);
+    modal.setMode(0);
+    if (!runSolver(model,errorMessage))
+    {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return modal.getFrequency();
 }
 
 RModel buildQuadraticSurfacePatch(RElementType type, double axialStrain)
@@ -1101,6 +1479,8 @@ private slots:
     void vonMisesMatchesComponents();
     void modalAxialBar_data();
     void modalAxialBar();
+    void elementSpatialModesConverge_data();
+    void elementSpatialModesConverge();
     void staticTrussBar();
     void staticTrussRejectsUnderiteratedCg();
     void staticQuadraticTrussBar();
@@ -1635,6 +2015,130 @@ void TestSolverStress::modalAxialBar()
         maxDisplacement = std::max(maxDisplacement,std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,i)));
     }
     QVERIFY2(maxDisplacement > 0.0,"The mode shape is identically zero");
+}
+
+//! Spatial refinement must improve the first eigenfrequency for every
+//! exposed structural interpolation family. Each row uses an independent
+//! continuum mode, so the comparison retains a real discretization error.
+void TestSolverStress::elementSpatialModesConverge_data()
+{
+    QTest::addColumn<int>("elementType");
+    QTest::newRow("truss2-axial") << int(R_ELEMENT_TRUSS2);
+    QTest::newRow("beam1-cantilever") << int(R_ELEMENT_BEAM1);
+    QTest::newRow("beam2-cantilever") << int(R_ELEMENT_BEAM2);
+    QTest::newRow("tri1-membrane") << int(R_ELEMENT_TRI1);
+    QTest::newRow("tri2-membrane") << int(R_ELEMENT_TRI2);
+    QTest::newRow("quad2-membrane") << int(R_ELEMENT_QUAD2);
+    QTest::newRow("tetra1-axial") << int(R_ELEMENT_TETRA1);
+    QTest::newRow("wedge1-axial") << int(R_ELEMENT_WEDGE1);
+    QTest::newRow("hexa1-axial") << int(R_ELEMENT_HEXA1);
+}
+
+void TestSolverStress::elementSpatialModesConverge()
+{
+    QFETCH(int,elementType);
+    const RElementType type = static_cast<RElementType>(elementType);
+    const QString family = QString::fromLatin1(QTest::currentDataTag());
+    constexpr double beamBeta1 = 1.875104068711961;
+    double exactFrequency = 0.0;
+    if (type == R_ELEMENT_BEAM1 || type == R_ELEMENT_BEAM2)
+    {
+        constexpr double bendingSecondMoment = 2.0e-5;
+        exactFrequency = beamBeta1*beamBeta1/(2.0*std::acos(-1.0))
+                       * std::sqrt(elasticityModulus*bendingSecondMoment
+                                   /(density*barArea*std::pow(barLength,4)));
+    }
+    else if (type == R_ELEMENT_TRI1 || type == R_ELEMENT_TRI2 || type == R_ELEMENT_QUAD2)
+    {
+        constexpr double v = 0.25;
+        const double extensionalModulus = elasticityModulus/(1.0-v*v);
+        exactFrequency = std::sqrt(extensionalModulus/density)/(4.0*barLength);
+    }
+    else
+    {
+        const double axialWaveSpeed = std::sqrt(elasticityModulus/density);
+        exactFrequency = axialWaveSpeed/(4.0*barLength);
+    }
+    QVERIFY(std::isfinite(exactFrequency) && exactFrequency > 0.0);
+
+    double previousError = std::numeric_limits<double>::infinity();
+    for (uint slices : {2u,4u,8u,16u})
+    {
+        RModel model;
+        if (type == R_ELEMENT_BEAM1 || type == R_ELEMENT_BEAM2)
+        {
+            model = buildBeamModalMesh(slices,type);
+        }
+        else if (type == R_ELEMENT_TRI1 || type == R_ELEMENT_TRI2 || type == R_ELEMENT_QUAD2)
+        {
+            model = buildSurfaceModalMesh(slices,type);
+        }
+        else
+        {
+            model = buildAxialModalMesh(slices,type);
+        }
+
+        QString solverError;
+        const double frequency = solveFundamentalFrequency(model,solverError);
+        QVERIFY2(std::isfinite(frequency) && frequency > 0.0,
+                 qPrintable(QString("%1 slices: unusable frequency %2; %3")
+                            .arg(slices).arg(frequency).arg(solverError)));
+
+        std::vector<uint> rootNodes;
+        if (type == R_ELEMENT_BEAM1 || type == R_ELEMENT_BEAM2 || type == R_ELEMENT_TRUSS2)
+        {
+            rootNodes = {0u};
+        }
+        else if (type == R_ELEMENT_TRI1)
+        {
+            rootNodes = {0u,1u};
+        }
+        else if (type == R_ELEMENT_TRI2 || type == R_ELEMENT_QUAD2)
+        {
+            rootNodes = {0u,1u,2u};
+        }
+        else
+        {
+            rootNodes = {0u,1u,2u,3u};
+        }
+        for (uint node : rootNodes)
+        {
+            for (uint component=0;component<3;component++)
+            {
+                const double supportDisplacement = nodeValue(model,R_VARIABLE_DISPLACEMENT,component,node);
+                QVERIFY2(std::fabs(supportDisplacement) < 1.0e-12,
+                         qPrintable(QString("%1: clamped root node %2 component %3 is %4 m")
+                                    .arg(family).arg(node).arg(component).arg(supportDisplacement)));
+            }
+        }
+        double maximumDisplacement = 0.0;
+        for (uint node=0;node<model.getNNodes();node++)
+        {
+            for (uint component=0;component<3;component++)
+            {
+                maximumDisplacement = std::max(maximumDisplacement,
+                    std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,component,node)));
+            }
+        }
+        QVERIFY2(maximumDisplacement > 0.0,
+                 qPrintable(QString("%1: extracted mode has no displacement")
+                            .arg(family)));
+
+        const double error = std::fabs(frequency-exactFrequency);
+        if (slices == 2)
+        {
+            QVERIFY2(error > 1.0e-7*exactFrequency,
+                     qPrintable(QString("%1 has no measurable coarse-mesh error")
+                                .arg(family)));
+        }
+        QVERIFY2(error < previousError,
+                 qPrintable(QString("%1: frequency error did not decrease at %2 slices: %3 >= %4 Hz")
+                            .arg(family).arg(slices).arg(error).arg(previousError)));
+        previousError = error;
+    }
+    QVERIFY2(previousError < 0.05*exactFrequency,
+             qPrintable(QString("%1: refined frequency error remains %2 Hz (reference %3 Hz)")
+                        .arg(family).arg(previousError).arg(exactFrequency)));
 }
 
 //! The same bar built from truss elements has to give the same closed form
