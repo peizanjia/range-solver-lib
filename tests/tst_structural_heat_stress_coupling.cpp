@@ -307,6 +307,21 @@ void TestStructuralHeatStressCoupling::heatStressNodalPiezoBalancesThermalPowerA
     QVERIFY(std::isfinite(elemental(baselineModel,R_VARIABLE_STRESS_X,0,0)));
     QVERIFY(std::isfinite(nodal(baselineModel,R_VARIABLE_ELECTRIC_CHARGE,0,0)));
 
+    // The same FE task must also certify a large, self-equilibrated thermal
+    // stress without mistaking force-cancellation roundoff for imbalance.
+    RModel stiffModel = model;
+    RMaterial stiffMaterial = stiffModel.getLine(0).getMaterial();
+    setMaterialProperty(stiffMaterial,RMaterialProperty::ModulusOfElasiticity,modulus);
+    setMaterialProperty(stiffMaterial,RMaterialProperty::ThermalExpansionCoefficient,expansion);
+    stiffModel.getLine(0).setMaterial(stiffMaterial);
+    RSolver stiffSolver(stiffModel,QString(),QString());
+    stiffSolver.run();
+    const double stiffExpectedStress = -modulus*expansion*(350.0-referenceKelvin);
+    for (uint element=0;element<2;element++)
+        QVERIFY(std::fabs(elemental(stiffModel,R_VARIABLE_STRESS_X,0,element)-
+                          stiffExpectedStress) < 1.0e3);
+    QVERIFY(std::fabs(nodal(stiffModel,R_VARIABLE_TEMPERATURE,0,1)-350.0) < 1.0e-8);
+
     // A directory at the result-record path injects a failure after both FE
     // tasks have converged but before the accepted model record can publish.
     QVERIFY(QDir().mkpath(trialRecord));
