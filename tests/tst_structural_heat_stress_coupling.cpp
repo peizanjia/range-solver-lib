@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <utility>
 
 #include <rbl_error.h>
 #include <rml_file_utils.h>
@@ -184,6 +185,7 @@ private slots:
     void heatStressNodalPiezoBalancesThermalPowerAndRetriesAtomically();
     void temperatureDependentExpansionUsesIntegratedAlpha();
     void persistedTemperatureChangesModalFrequency();
+    void solvedHeatChangesModalFrequency();
     void stressFailureDoesNotPublishAndCanRetry();
     void resultWriteFailureRollsBackAndCanRetry();
     void transientSequenceAdvancesHeatThenStressAtEachTime();
@@ -459,6 +461,50 @@ void TestStructuralHeatStressCoupling::persistedTemperatureChangesModalFrequency
     QVERIFY2(std::fabs(hot/cold-expectedRatio) < 0.01,
              qPrintable(QString("Thermal modal ratio = %1, expected %2")
                         .arg(hot/cold).arg(expectedRatio)));
+}
+
+void TestStructuralHeatStressCoupling::solvedHeatChangesModalFrequency()
+{
+    auto solveAt = [](double kelvin) {
+        RModel model = heatedRod(false);
+        RMaterial material = model.getLine(0).getMaterial();
+        RMaterialProperty youngsModulus(RMaterialProperty::ModulusOfElasiticity);
+        youngsModulus.add(300.0,modulus);
+        youngsModulus.add(400.0,0.5*modulus);
+        material.add(youngsModulus);
+        model.getLine(0).setMaterial(material);
+        for (uint point : {0u,2u})
+        {
+            RBoundaryCondition &temperature = model.getPoint(point)
+                .getBoundaryCondition(R_BOUNDARY_CONDITION_TEMPERATURE);
+            setComponent(temperature,R_VARIABLE_TEMPERATURE,kelvin);
+        }
+        RProblemTaskItem sequence;
+        sequence.addChild(RProblemTaskItem(R_PROBLEM_HEAT));
+        sequence.addChild(RProblemTaskItem(R_PROBLEM_STRESS_MODAL));
+        model.setProblemTaskTree(sequence);
+        RModalSetup &modal = model.getProblemSetup().getModalSetup();
+        modal.setMethod(R_MODAL_MULTIPLE_MODES);
+        modal.setNModesToExtract(1);
+        modal.setNIterations(300);
+        modal.setConvergenceValue(1.0e-12);
+        RSolver solver(model,QString(),QString());
+        solver.run();
+        return std::make_pair(nodal(model,R_VARIABLE_TEMPERATURE,0,1),modal.getFrequency());
+    };
+
+    const auto cold = solveAt(300.0);
+    const auto hot = solveAt(400.0);
+    QVERIFY(std::fabs(cold.first-300.0) < 1.0e-8);
+    QVERIFY(std::fabs(hot.first-400.0) < 1.0e-8);
+    QVERIFY(std::isfinite(cold.second) && cold.second > 0.0);
+    QVERIFY(std::isfinite(hot.second) && hot.second > 0.0);
+    // This checks E(T) in the actual Heat -> Modal FE task sequence. The
+    // modal path does not include initial-stress geometric stiffness.
+    const double expectedRatio = std::sqrt(0.5);
+    QVERIFY2(std::fabs(hot.second/cold.second-expectedRatio) < 0.01,
+             qPrintable(QString("Solved-heat modal ratio = %1, expected %2")
+                        .arg(hot.second/cold.second).arg(expectedRatio)));
 }
 
 void TestStructuralHeatStressCoupling::stressFailureDoesNotPublishAndCanRetry()
