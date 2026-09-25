@@ -8,11 +8,13 @@
 
 #include <cmath>
 #include <limits>
+#include <memory>
 
 #include <rbl_error.h>
 #include <rml_file_utils.h>
 #include <rml_monitoring_point.h>
 #include <rml_model.h>
+#include <rml_structural_piezo_setup.h>
 
 #include "rsolver.h"
 
@@ -37,6 +39,32 @@ void setMaterialProperty(RMaterial &material,RMaterialProperty::Type type,double
     RMaterialProperty entry(type);
     entry.add(referenceKelvin,value);
     material.add(entry);
+}
+
+void setZeroGravity(RModel &model)
+{
+    const RVariableType gravityTypes[3] = {
+        R_VARIABLE_G_ACCELERATION_X,
+        R_VARIABLE_G_ACCELERATION_Y,
+        R_VARIABLE_G_ACCELERATION_Z
+    };
+    for (uint groupId=0;groupId<model.getNElementGroups();groupId++)
+    {
+        RElementGroup *group = model.getElementGroupPtr(groupId);
+        if (!group)
+            continue;
+        REnvironmentCondition &gravity =
+            group->getEnvironmentCondition(R_ENVIRONMENT_CONDITION_G_ACCELERATION);
+        for (RVariableType type : gravityTypes)
+        {
+            const uint position = gravity.findComponentPosition(type);
+            Q_ASSERT(position != RConstants::eod);
+            RConditionComponent &component = gravity.getComponent(position);
+            component.setEnabled(true);
+            component.clear();
+            component.add(0.0,0.0);
+        }
+    }
 }
 
 RModel heatedRod(bool fixRight,
@@ -153,6 +181,7 @@ class TestStructuralHeatStressCoupling : public QObject
 private slots:
     void heatThenFreeExpansion();
     void heatThenConstrainedCompression();
+    void heatStressNodalPiezoBalancesThermalPowerAndRetriesAtomically();
     void temperatureDependentExpansionUsesIntegratedAlpha();
     void persistedTemperatureChangesModalFrequency();
     void stressFailureDoesNotPublishAndCanRetry();
@@ -192,6 +221,190 @@ void TestStructuralHeatStressCoupling::heatThenConstrainedCompression()
     QVERIFY(std::fabs(nodal(model,R_VARIABLE_DISPLACEMENT,0,2)) < 1.0e-9);
     QVERIFY(std::fabs(elemental(model,R_VARIABLE_STRESS_X,0,0)-expectedStress) < 1.0e5);
     QVERIFY(std::fabs(elemental(model,R_VARIABLE_STRESS_X,0,1)-expectedStress) < 1.0e5);
+}
+
+void TestStructuralHeatStressCoupling::heatStressNodalPiezoBalancesThermalPowerAndRetriesAtomically()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString latestPath = directory.filePath("thermal-piezo.ram");
+    seedAcceptedArtifact(latestPath);
+    const QByteArray acceptedLink = readBytes(latestPath);
+    QVERIFY(!acceptedLink.isEmpty());
+    const QString trialRecord = RFileUtils::getFileNameWithTimeStep(latestPath,0);
+    QVERIFY(!QFileInfo::exists(trialRecord));
+
+    RModel model = heatedRod(true);
+    setZeroGravity(model);
+    constexpr double piezoModulus = 10.0;
+    constexpr double piezoExpansion = 1.0e-3;
+    RMaterial piezoMaterial(RMaterial::Solid);
+    setMaterialProperty(piezoMaterial,RMaterialProperty::ModulusOfElasiticity,piezoModulus);
+    setMaterialProperty(piezoMaterial,RMaterialProperty::PoissonRatio,0.0);
+    setMaterialProperty(piezoMaterial,RMaterialProperty::Density,8000.0);
+    setMaterialProperty(piezoMaterial,RMaterialProperty::ThermalExpansionCoefficient,piezoExpansion);
+    setMaterialProperty(piezoMaterial,RMaterialProperty::ThermalConductivity,2.0);
+    setMaterialProperty(piezoMaterial,RMaterialProperty::HeatCapacity,500.0);
+    setMaterialProperty(piezoMaterial,RMaterialProperty::Emissivity,0.0);
+    model.getLine(0).setMaterial(piezoMaterial);
+    RStructuralPiezoSetup &piezo = model.getProblemSetup().getStructuralPiezoSetup();
+    piezo.enabled = true;
+    piezo.electricalMode = RStructuralPiezoElectricalMode::NodalPotential;
+    for (uint element=0;element<2;element++)
+    {
+        RStructuralPiezoPort port;
+        port.id = QStringLiteral("thermal-rod-port-%1").arg(element);
+        port.elementId = element;
+        port.coupling = 2.0;
+        port.permittivity = 4.0;
+        port.voltage = 0.0;
+        piezo.ports.push_back(port);
+    }
+    // Short every electrode while constraining both rod ends. The nonuniform
+    // steady thermal strain then produces a self-equilibrated interior force
+    // and equal-and-opposite electrode charge reactions.
+    for (uint node=0;node<model.getNNodes();node++)
+    {
+        piezo.nodalBoundaryConditions.push_back(
+            {node,RStructuralPiezoBoundaryType::Potential,0.0});
+    }
+    try
+    {
+        piezo.bindToModel(model);
+    }
+    catch (const RError &error)
+    {
+        QFAIL(qPrintable(QString("Could not bind thermal-piezo setup: %1")
+                         .arg(error.getMessage())));
+    }
+    catch (const std::exception &error)
+    {
+        QFAIL(qPrintable(QString("Could not bind thermal-piezo setup: %1")
+                         .arg(QString::fromUtf8(error.what()))));
+    }
+    model.getMatrixSolverConf(RMatrixSolverConf::GMRES).setNInnerIterations(30);
+    model.getMatrixSolverConf(RMatrixSolverConf::GMRES).setNOuterIterations(20);
+    model.getMatrixSolverConf(RMatrixSolverConf::GMRES).setSolverCvgValue(1.0e-12);
+
+    // Establish that this exact thermal-piezo FE fixture converges and
+    // publishes normally before injecting a file-commit failure in its copy.
+    RModel baselineModel = model;
+    const QString baselinePath = directory.filePath("thermal-piezo-baseline.ram");
+    RSolver baselineSolver(baselineModel,baselinePath,QString());
+    try
+    {
+        baselineSolver.run();
+    }
+    catch (const RError &error)
+    {
+        QFAIL(qPrintable(QString("Thermal-piezo baseline solve failed: %1")
+                         .arg(error.getMessage())));
+    }
+    QVERIFY(std::isfinite(elemental(baselineModel,R_VARIABLE_STRESS_X,0,0)));
+    QVERIFY(std::isfinite(nodal(baselineModel,R_VARIABLE_ELECTRIC_CHARGE,0,0)));
+
+    // A directory at the result-record path injects a failure after both FE
+    // tasks have converged but before the accepted model record can publish.
+    QVERIFY(QDir().mkpath(trialRecord));
+    std::unique_ptr<RSolver> solver;
+    try
+    {
+        solver.reset(new RSolver(model,latestPath,QString()));
+    }
+    catch (const RError &error)
+    {
+        QFAIL(qPrintable(QString("Could not construct thermal-piezo solver: %1")
+                         .arg(error.getMessage())));
+    }
+    catch (const std::exception &error)
+    {
+        QFAIL(qPrintable(QString("Could not construct thermal-piezo solver: %1")
+                         .arg(QString::fromUtf8(error.what()))));
+    }
+    QString injectedFailure;
+    try
+    {
+        solver->run();
+    }
+    catch (const RError &error)
+    {
+        injectedFailure = error.getMessage();
+    }
+    QVERIFY2(!injectedFailure.isEmpty(),"The blocked coupled output record did not fail publication.");
+    QVERIFY2(injectedFailure.contains(QStringLiteral("Failed to open the file"),Qt::CaseInsensitive),
+             qPrintable(QString("Expected the injected record-write failure, got: %1")
+                        .arg(injectedFailure)));
+    QCOMPARE(readBytes(latestPath),acceptedLink);
+    QVERIFY(QFileInfo(trialRecord).isDir());
+    QVERIFY(model.findVariable(R_VARIABLE_TEMPERATURE) == RConstants::eod);
+    QVERIFY(model.findVariable(R_VARIABLE_HEAT_FLUX) == RConstants::eod);
+    QVERIFY(model.findVariable(R_VARIABLE_DISPLACEMENT) == RConstants::eod);
+    QVERIFY(model.findVariable(R_VARIABLE_STRESS_X) == RConstants::eod);
+    QVERIFY(model.findVariable(R_VARIABLE_ELECTRIC_POTENTIAL) == RConstants::eod);
+    QVERIFY(model.findVariable(R_VARIABLE_ELECTRIC_CHARGE) == RConstants::eod);
+    RModel persistedBeforeRetry;
+    persistedBeforeRetry.read(latestPath);
+    QCOMPARE(persistedBeforeRetry.getName(),QStringLiteral("accepted-before-heat-stress"));
+
+    QVERIFY(QDir().rmdir(trialRecord));
+    try
+    {
+        solver->run();
+    }
+    catch (const RError &error)
+    {
+        QFAIL(qPrintable(QString("Thermal-piezo retry failed: %1").arg(error.getMessage())));
+    }
+    catch (const std::exception &error)
+    {
+        QFAIL(qPrintable(QString("Thermal-piezo retry failed: %1")
+                         .arg(QString::fromUtf8(error.what()))));
+    }
+
+    // The exact 1-D steady conduction solution is 50 K/m. Heat flux is
+    // reported per area, so each 0.01 m^2 member carries 1 W in the same
+    // -x direction; matching member powers certify the interior energy
+    // balance with no volumetric heat source.
+    QVERIFY(std::fabs(nodal(model,R_VARIABLE_TEMPERATURE,0,0)-300.0) < 1.0e-8);
+    QVERIFY(std::fabs(nodal(model,R_VARIABLE_TEMPERATURE,0,1)-350.0) < 1.0e-8);
+    QVERIFY(std::fabs(nodal(model,R_VARIABLE_TEMPERATURE,0,2)-400.0) < 1.0e-8);
+    const double firstPower = elemental(model,R_VARIABLE_HEAT_FLUX,0,0)*0.01;
+    const double secondPower = elemental(model,R_VARIABLE_HEAT_FLUX,0,1)*0.01;
+    QVERIFY(std::fabs(firstPower+1.0) < 1.0e-8);
+    QVERIFY(std::fabs(secondPower+1.0) < 1.0e-8);
+    QVERIFY(std::fabs(firstPower-secondPower) < 1.0e-10);
+
+    // Thermal expansion is restrained over the total two-metre length. With
+    // equal E and area, equilibrium gives one uniform stress equal to minus E
+    // times the length-averaged integrated thermal strain.
+    const double firstThermalStrain = piezoExpansion*(325.0-referenceKelvin);
+    const double secondThermalStrain = piezoExpansion*(375.0-referenceKelvin);
+    const double expectedStress = -piezoModulus*0.5*(firstThermalStrain+secondThermalStrain);
+    QVERIFY(std::fabs(elemental(model,R_VARIABLE_STRESS_X,0,0)-expectedStress) < 1.0e-9);
+    QVERIFY(std::fabs(elemental(model,R_VARIABLE_STRESS_X,0,1)-expectedStress) < 1.0e-9);
+    for (uint node=0;node<model.getNNodes();node++)
+        QVERIFY(std::fabs(nodal(model,R_VARIABLE_ELECTRIC_POTENTIAL,0,node)) < 1.0e-12);
+    const double leftCharge = nodal(model,R_VARIABLE_ELECTRIC_CHARGE,0,0);
+    const double middleCharge = nodal(model,R_VARIABLE_ELECTRIC_CHARGE,0,1);
+    const double rightCharge = nodal(model,R_VARIABLE_ELECTRIC_CHARGE,0,2);
+    const double expectedEndChargeMagnitude =
+        2.0*0.01*0.5*(firstThermalStrain+secondThermalStrain);
+    QVERIFY(std::fabs(std::fabs(leftCharge)-expectedEndChargeMagnitude) < 1.0e-10);
+    QVERIFY(std::fabs(middleCharge) < 1.0e-10);
+    QVERIFY(std::fabs(std::fabs(rightCharge)-expectedEndChargeMagnitude) < 1.0e-10);
+    QVERIFY(leftCharge*rightCharge < 0.0);
+    const double totalConductorCharge = leftCharge+middleCharge+rightCharge;
+    QVERIFY(std::isfinite(totalConductorCharge));
+    QVERIFY(std::fabs(totalConductorCharge) < 1.0e-10);
+
+    QVERIFY(QFileInfo::exists(trialRecord));
+    RModel persistedAfterRetry;
+    persistedAfterRetry.read(latestPath);
+    QVERIFY(persistedAfterRetry.findVariable(R_VARIABLE_TEMPERATURE) != RConstants::eod);
+    QVERIFY(persistedAfterRetry.findVariable(R_VARIABLE_HEAT_FLUX) != RConstants::eod);
+    QVERIFY(persistedAfterRetry.findVariable(R_VARIABLE_STRESS_X) != RConstants::eod);
+    QVERIFY(persistedAfterRetry.findVariable(R_VARIABLE_ELECTRIC_CHARGE) != RConstants::eod);
+    QVERIFY(std::fabs(nodal(persistedAfterRetry,R_VARIABLE_TEMPERATURE,0,1)-350.0) < 1.0e-3);
 }
 
 void TestStructuralHeatStressCoupling::temperatureDependentExpansionUsesIntegratedAlpha()
