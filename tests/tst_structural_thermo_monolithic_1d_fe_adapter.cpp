@@ -1,6 +1,7 @@
 #include <QtTest>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -21,6 +22,8 @@
 
 namespace
 {
+using Vector3 = std::array<double,3>;
+
 RModel makeTwoRodModel(bool temperatureDependentYoungModulus = false)
 {
     RModel model;
@@ -137,6 +140,27 @@ RStructuralThermoMonolithicFEViscosityByElement twoRodViscosity()
     return {{0U,2000.0},{1U,2000.0}};
 }
 
+void orientModel(RModel &model,const Vector3 &direction,bool reverseConnectivity)
+{
+    for (uint node=0;node<model.getNNodes();node++)
+    {
+        const double axialCoordinate = model.getNode(node).getX();
+        model.getNode(node).set(4.0+axialCoordinate*direction[0],
+                                -3.0+axialCoordinate*direction[1],
+                                8.0+axialCoordinate*direction[2]);
+    }
+    if (reverseConnectivity)
+    {
+        for (uint elementIndex=0;elementIndex<model.getNElements();elementIndex++)
+        {
+            RElement &element = model.getElement(elementIndex);
+            const uint firstNode = element.getNodeId(0U);
+            element.setNodeId(0U,element.getNodeId(1U));
+            element.setNodeId(1U,firstNode);
+        }
+    }
+}
+
 double value(const RModel &model,RVariableType type,uint vector,uint entity)
 {
     const uint position = model.findVariable(type);
@@ -160,9 +184,12 @@ class TestStructuralThermoMonolithic1DFEAdapter : public QObject
 
 private slots:
     void twoRodRModelMatchesIndependentMonolithicResult();
+    void arbitraryOrientationAndReversedConnectivityMatchScalarKernel();
+    void tiedDominantAxisUsesDeterministicPositiveSign();
     void malformedConditionsFailWithoutChangingAcceptedModel();
     void everyElementRequiresExplicitCurrentIndexViscosity();
     void unsupportedGeometryOrTemperatureDependentMaterialIsRejected();
+    void transverseAcceptedDisplacementIsRejectedAtomically();
     void activeModelBoundaryConditionIsRejected();
 };
 
@@ -251,6 +278,106 @@ void TestStructuralThermoMonolithic1DFEAdapter::twoRodRModelMatchesIndependentMo
     QCOMPARE(model.getNVariables(),initialVariableCount+6U);
 }
 
+void TestStructuralThermoMonolithic1DFEAdapter::arbitraryOrientationAndReversedConnectivityMatchScalarKernel()
+{
+    RModel axialModel = makeTwoRodModel();
+    RModel rotatedModel = makeTwoRodModel();
+    const Vector3 physicalDirection = {-2.0/3.0,1.0/3.0,2.0/3.0};
+    orientModel(rotatedModel,physicalDirection,true);
+
+    RStructuralThermoMonolithic1DResult axialResult;
+    RStructuralThermoMonolithic1DResult rotatedResult;
+    auto axialConditions = endLoadConditions();
+    axialConditions.prescribedDisplacementMetres[0U] = 0.02;
+    auto rotatedConditions = endLoadConditions();
+    rotatedConditions.mechanicalForceNewtons.back() = -10.0;
+    rotatedConditions.prescribedDisplacementMetres[0U] = -0.02;
+    // Second advance reprojects the nonzero accepted global displacement.
+    for (unsigned int acceptedStep = 0; acceptedStep < 2U; ++acceptedStep)
+    {
+    try
+    {
+        axialResult = RStructuralThermoMonolithic1DFEAdapter::advance(
+            axialModel,twoRodViscosity(),axialConditions,coupledOptions(),300.0);
+        rotatedResult = RStructuralThermoMonolithic1DFEAdapter::advance(
+            rotatedModel,twoRodViscosity(),rotatedConditions,coupledOptions(),300.0);
+    }
+    catch (const std::exception &error)
+    {
+        QFAIL(error.what());
+    }
+
+    for (uint node=0;node<axialModel.getNNodes();node++)
+    {
+        QVERIFY(near(rotatedResult.nextState.temperatureKelvin[node],
+                     axialResult.nextState.temperatureKelvin[node]));
+        QVERIFY(near(rotatedResult.nextState.axialDisplacementMetres[node],
+                     -axialResult.nextState.axialDisplacementMetres[node]));
+        QVERIFY(near(value(rotatedModel,R_VARIABLE_TEMPERATURE,0U,node),
+                     value(axialModel,R_VARIABLE_TEMPERATURE,0U,node)));
+        for (uint component=0;component<3U;component++)
+        {
+            QVERIFY(near(value(rotatedModel,R_VARIABLE_DISPLACEMENT,component,node),
+                         physicalDirection[component]*
+                             axialResult.nextState.axialDisplacementMetres[node]));
+        }
+    }
+    for (uint element=0;element<axialModel.getNElements();element++)
+    {
+        QVERIFY(near(rotatedResult.memberAxialStressPascals[element],
+                     axialResult.memberAxialStressPascals[element]));
+        QVERIFY(near(rotatedResult.memberDissipatedEnergyJoules[element],
+                     axialResult.memberDissipatedEnergyJoules[element]));
+        QVERIFY(near(value(rotatedModel,R_VARIABLE_STRESS_X,0U,element),
+                     value(axialModel,R_VARIABLE_STRESS_X,0U,element)));
+    }
+    QVERIFY(near(rotatedResult.thermalEnergyChangeJoules,
+                 axialResult.thermalEnergyChangeJoules));
+    QVERIFY(near(rotatedResult.heaterEnergyJoules,axialResult.heaterEnergyJoules));
+    QVERIFY(near(rotatedResult.reversibleThermoelasticEnergyJoules,
+                 axialResult.reversibleThermoelasticEnergyJoules));
+    QVERIFY(near(rotatedResult.viscousDissipationEnergyJoules,
+                 axialResult.viscousDissipationEnergyJoules));
+    QVERIFY(near(rotatedResult.dissipationHeatEnergyJoules,
+                 axialResult.dissipationHeatEnergyJoules));
+    QVERIFY(near(rotatedResult.thermalBoundaryEnergyJoules,
+                 axialResult.thermalBoundaryEnergyJoules));
+    QVERIFY(near(rotatedResult.thermalEnergyBalanceResidualJoules,
+                 axialResult.thermalEnergyBalanceResidualJoules));
+    }
+}
+
+void TestStructuralThermoMonolithic1DFEAdapter::tiedDominantAxisUsesDeterministicPositiveSign()
+{
+    RModel model = makeTwoRodModel();
+    const double diagonal = std::sqrt(0.5);
+    const Vector3 physicalDirection = {-diagonal,diagonal,0.0};
+    orientModel(model,physicalDirection,false);
+    auto conditions = endLoadConditions();
+    conditions.mechanicalForceNewtons.back() = -10.0;
+
+    RStructuralThermoMonolithic1DResult result;
+    try
+    {
+        result = RStructuralThermoMonolithic1DFEAdapter::advance(
+            model,twoRodViscosity(),conditions,coupledOptions(),300.0);
+    }
+    catch (const std::exception &error)
+    {
+        QFAIL(error.what());
+    }
+
+    // X and Y tie for the dominant component. X wins the tie and is made
+    // positive, so the scalar state has the opposite sign to this geometry.
+    QVERIFY(result.nextState.axialDisplacementMetres[2U] < 0.0);
+    for (uint component=0;component<3U;component++)
+    {
+        QVERIFY(near(value(model,R_VARIABLE_DISPLACEMENT,component,2U),
+                     physicalDirection[component]*
+                         std::abs(result.nextState.axialDisplacementMetres[2U])));
+    }
+}
+
 void TestStructuralThermoMonolithic1DFEAdapter::malformedConditionsFailWithoutChangingAcceptedModel()
 {
     RModel model = makeTwoRodModel();
@@ -300,10 +427,17 @@ void TestStructuralThermoMonolithic1DFEAdapter::unsupportedGeometryOrTemperature
 {
     RModel misaligned = makeTwoRodModel();
     misaligned.getNode(2U).set(2.0,0.01,0.0);
+    const double acceptedTemperature = value(misaligned,R_VARIABLE_TEMPERATURE,0U,2U);
+    const double acceptedDisplacement = value(misaligned,R_VARIABLE_DISPLACEMENT,0U,2U);
+    const double acceptedStress = value(misaligned,R_VARIABLE_STRESS_VON_MISES,0U,0U);
+    const uint variableCount = misaligned.getNVariables();
     QVERIFY_EXCEPTION_THROWN(RStructuralThermoMonolithic1DFEAdapter::advance(
         misaligned,twoRodViscosity(),endLoadConditions(),coupledOptions(),300.0),
         std::invalid_argument);
-    QCOMPARE(value(misaligned,R_VARIABLE_TEMPERATURE,0U,2U),300.0);
+    QCOMPARE(value(misaligned,R_VARIABLE_TEMPERATURE,0U,2U),acceptedTemperature);
+    QCOMPARE(value(misaligned,R_VARIABLE_DISPLACEMENT,0U,2U),acceptedDisplacement);
+    QCOMPARE(value(misaligned,R_VARIABLE_STRESS_VON_MISES,0U,0U),acceptedStress);
+    QCOMPARE(misaligned.getNVariables(),variableCount);
     QCOMPARE(misaligned.getTimeSolver().getComputedTime(),0.0);
 
     RModel temperatureDependent = makeTwoRodModel(true);
@@ -312,6 +446,26 @@ void TestStructuralThermoMonolithic1DFEAdapter::unsupportedGeometryOrTemperature
         std::invalid_argument);
     QCOMPARE(value(temperatureDependent,R_VARIABLE_TEMPERATURE,0U,2U),300.0);
     QCOMPARE(temperatureDependent.getTimeSolver().getComputedTime(),0.0);
+}
+
+void TestStructuralThermoMonolithic1DFEAdapter::transverseAcceptedDisplacementIsRejectedAtomically()
+{
+    RModel model = makeTwoRodModel();
+    const uint displacementPosition = model.findVariable(R_VARIABLE_DISPLACEMENT);
+    model.getVariable(displacementPosition).setValue(1U,1U,0.01);
+    const double acceptedTemperature = value(model,R_VARIABLE_TEMPERATURE,0U,2U);
+    const double acceptedTransverseDisplacement = value(model,R_VARIABLE_DISPLACEMENT,1U,1U);
+    const double acceptedStress = value(model,R_VARIABLE_STRESS_VON_MISES,0U,0U);
+    const uint variableCount = model.getNVariables();
+
+    QVERIFY_EXCEPTION_THROWN(RStructuralThermoMonolithic1DFEAdapter::advance(
+        model,twoRodViscosity(),endLoadConditions(),coupledOptions(),300.0),
+        std::invalid_argument);
+    QCOMPARE(value(model,R_VARIABLE_TEMPERATURE,0U,2U),acceptedTemperature);
+    QCOMPARE(value(model,R_VARIABLE_DISPLACEMENT,1U,1U),acceptedTransverseDisplacement);
+    QCOMPARE(value(model,R_VARIABLE_STRESS_VON_MISES,0U,0U),acceptedStress);
+    QCOMPARE(model.getNVariables(),variableCount);
+    QCOMPARE(model.getTimeSolver().getComputedTime(),0.0);
 }
 
 void TestStructuralThermoMonolithic1DFEAdapter::activeModelBoundaryConditionIsRejected()

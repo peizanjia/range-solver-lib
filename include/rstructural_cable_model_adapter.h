@@ -26,6 +26,12 @@ class RStructuralCableModelAdapter
             const std::vector<double> &additionalNodalForces = {},
             bool refreshAcceptedAcceleration = false);
 
+        //! Initialize the fresh run's accepted acceleration from cable equilibrium.
+        static void initializeFreshStartAcceleration(
+            const RModel &model,
+            const std::vector<double> &displacements,
+            std::vector<double> &accelerations);
+
         //! Fingerprint the exact physical data used by the cable Newmark FE path.
         static QString computeDynamicsSystemFingerprint(const RModel &model);
 

@@ -374,6 +374,7 @@ class TestStructuralCableControl : public QObject
 
 private slots:
     void acceptedControlMatchesNewmarkWorkAndPower();
+    void freshStartAccelerationSensorAndFirstStepUseInitialEquilibrium();
     void velocityFeedbackReducesActualCableVibration();
     void persistedSplitControlMatchesFullRun_data();
     void persistedSplitControlMatchesFullRun();
@@ -433,6 +434,67 @@ void TestStructuralCableControl::acceptedControlMatchesNewmarkWorkAndPower()
     QVERIFY(close(record.appliedChannels[0].cumulativeWork,expectedControllerWork,2.0e-7));
     QVERIFY(std::isfinite(acceleration));
     QVERIFY(!checkpoint.controlControllerState.isEmpty());
+}
+
+void TestStructuralCableControl::freshStartAccelerationSensorAndFirstStepUseInitialEquilibrium()
+{
+    constexpr double initialDisplacement=0.05;
+    constexpr double initialVelocity=0.02;
+    constexpr double deadForce=9.0;
+    constexpr double mass=density*cableArea*cableLength/2.0;
+    constexpr double stiffness=youngModulus*cableArea/cableLength;
+    constexpr double beta=0.25;
+
+    RModel model=makeCable(1);
+    model.getProblemSetup().getStructuralControlSetup().channelConditioning.clear();
+    model.getProblemSetup().getStructuralInteractionSetup().getActuators().front().rateLimit=1000.0;
+    RBoundaryCondition &force =
+        model.getPoint(1).getBoundaryCondition(R_BOUNDARY_CONDITION_FORCE);
+    setComponent(force,R_VARIABLE_FORCE_X,true,deadForce);
+
+    RVariable &displacement = model.getVariable(model.addVariable(R_VARIABLE_DISPLACEMENT));
+    displacement.setApplyType(R_VARIABLE_APPLY_NODE);
+    displacement.resize(3,model.getNNodes());
+    displacement.setValue(0,1,initialDisplacement);
+    RVariable &velocity = model.getVariable(model.addVariable(R_VARIABLE_VELOCITY));
+    velocity.setApplyType(R_VARIABLE_APPLY_NODE);
+    velocity.resize(3,model.getNNodes());
+    velocity.setValue(0,1,initialVelocity);
+
+    Captures captures;
+    QString error;
+    QVERIFY2(solve(model,captures,QString(),error),qPrintable(error));
+    QCOMPARE(captures.observations.size(),std::size_t(1));
+    QCOMPARE(captures.acceptedSteps.size(),std::size_t(1));
+    const auto &observation=captures.observations.front();
+    double observedDisplacement=std::numeric_limits<double>::quiet_NaN();
+    double observedVelocity=std::numeric_limits<double>::quiet_NaN();
+    double observedAcceleration=std::numeric_limits<double>::quiet_NaN();
+    for (const auto &sensor : observation.sensors)
+    {
+        if (sensor.sensorId==QStringLiteral("tip-displacement")) observedDisplacement=sensor.value;
+        if (sensor.sensorId==QStringLiteral("tip-velocity")) observedVelocity=sensor.value;
+        if (sensor.sensorId==QStringLiteral("tip-acceleration")) observedAcceleration=sensor.value;
+    }
+
+    const double initialInternalForce=prestress+stiffness*initialDisplacement;
+    const double expectedInitialAcceleration=(deadForce-initialInternalForce)/mass;
+    QVERIFY(close(observedDisplacement,initialDisplacement));
+    QVERIFY(close(observedVelocity,initialVelocity));
+    QVERIFY(close(observedAcceleration,expectedInitialAcceleration));
+
+    const double appliedForce=captures.acceptedSteps.front().appliedChannels.front().command;
+    const double accelerationForStep=(deadForce+appliedForce-initialInternalForce)/mass;
+    const double predictor=initialDisplacement+timeStep*initialVelocity+
+        timeStep*timeStep*(0.5-beta)*accelerationForStep;
+    const double effectiveMass=mass/(beta*timeStep*timeStep);
+    const double expectedDisplacement=(deadForce+appliedForce-prestress+
+        effectiveMass*predictor)/(stiffness+effectiveMass);
+    const double expectedAcceleration=(expectedDisplacement-predictor)/
+        (beta*timeStep*timeStep);
+    const auto &checkpoint=model.getProblemSetup().getStructuralDynamicsRestartData();
+    QVERIFY(close(checkpoint.q[3],expectedDisplacement,2.0e-8));
+    QVERIFY(close(checkpoint.a[3],expectedAcceleration,2.0e-8));
 }
 
 void TestStructuralCableControl::velocityFeedbackReducesActualCableVibration()

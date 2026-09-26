@@ -2502,6 +2502,9 @@ void RSolverStress::solveStructuralCableDynamics()
         previousAccelerations[3*node+2] = this->nodeAcceleration.z[node];
     }
 
+    RStructuralCableModelAdapter::initializeFreshStartAcceleration(
+        *this->pModel,previousDisplacements,previousAccelerations);
+
     const RStructuralControlSetup &controlSetup =
         this->pModel->getProblemSetup().getStructuralControlSetup();
     if (controlSetup.enabled)

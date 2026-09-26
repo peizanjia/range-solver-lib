@@ -286,6 +286,7 @@ private slots:
     void changedAcceptedStepOrTimeRejectsRestart();
     void alteredSmallComponentBesideLargeValueRejectsRestore();
     void rejectedCandidateDoesNotAdvanceAcceptedCableCheckpoint();
+    void restartAccelerationIsNotReinitializedAsFreshStart();
     void structuralControlWithoutActuatorIsRejectedByCableAdapter();
 };
 
@@ -482,6 +483,34 @@ void TestStructuralCableRestart::alteredSmallComponentBesideLargeValueRejectsRes
              qPrintable(failureMessage.isEmpty()
                             ? QStringLiteral("A changed small displacement component must not be masked by a large component.")
                             : failureMessage));
+}
+
+void TestStructuralCableRestart::restartAccelerationIsNotReinitializedAsFreshStart()
+{
+    RModel model=makeVibratingCable(1);
+    QString error;
+    QVERIFY2(solve(model,error),qPrintable(error));
+    RStructuralDynamicsRestartData &checkpoint =
+        model.getProblemSetup().getStructuralDynamicsRestartData();
+    QVERIFY(checkpoint.available);
+    QVERIFY(!model.getProblemSetup().getRestart());
+    QCOMPARE(model.getTimeSolver().getCurrentTimeStep(),uint(0));
+    QVERIFY(std::fabs(checkpoint.a[3]) > 1.0e-6);
+
+    // Use a nonzero sentinel distinct from the instantaneous force-balance
+    // acceleration so the test detects any fresh-start recomputation.
+    const double restartAcceleration=checkpoint.a[3]+7.0;
+    checkpoint.a[3]=restartAcceleration;
+    model.getVariable(model.findVariable(R_VARIABLE_ACCELERATION))
+        .setValue(0,1,restartAcceleration);
+
+    std::vector<double> displacements=checkpoint.q;
+    std::vector<double> accelerations=checkpoint.a;
+    RStructuralCableModelAdapter::initializeFreshStartAcceleration(
+        model,displacements,accelerations);
+
+    QCOMPARE(accelerations[3],restartAcceleration);
+    QCOMPARE(displacements[3],checkpoint.q[3]);
 }
 
 void TestStructuralCableRestart::rejectedCandidateDoesNotAdvanceAcceptedCableCheckpoint()

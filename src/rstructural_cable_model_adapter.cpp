@@ -573,6 +573,24 @@ RStructuralCableDynamicsResult RStructuralCableModelAdapter::solveDynamics(
         externalForces,options);
 }
 
+void RStructuralCableModelAdapter::initializeFreshStartAcceleration(
+    const RModel &model,
+    const std::vector<double> &displacements,
+    std::vector<double> &accelerations)
+{
+    const RProblemSetup &problemSetup = model.getProblemSetup();
+    if (model.getTimeSolver().getCurrentTimeStep() != 0 ||
+        problemSetup.getRestart() ||
+        problemSetup.getStructuralDynamicsRestartData().available)
+    {
+        return;
+    }
+
+    const CableModelData data = buildCableModelData(model,true);
+    const std::vector<double> externalForces = totalCableExternalForces(data,{});
+    refreshCableAcceptedAcceleration(data,displacements,externalForces,accelerations);
+}
+
 void RStructuralCableModelAdapter::clearResults(RModel &model)
 {
     RStructuralStaticTrussModel::clearResults(model);

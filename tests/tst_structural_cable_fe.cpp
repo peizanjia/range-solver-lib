@@ -739,11 +739,17 @@ void TestStructuralCableFE::transientSingleCableMatchesNewmarkAverageAcceleratio
         QFAIL(message.constData());
     }
 
-    // rho*A*L = 2 kg, so the free endpoint receives one kilogram. For this
-    // axial member k=EA/L0=250 N/m and the Newmark mass tangent is 400 N/m.
-    const double expectedDisplacement = 10.0/(250.0+400.0);
-    const double expectedAcceleration = 400.0*expectedDisplacement;
-    const double expectedVelocity = 0.5*0.1*expectedAcceleration;
+    // rho*A*L = 2 kg, so the free endpoint receives one kilogram. The fresh
+    // acceleration is 10 m/s^2; include its Newmark predictor contribution.
+    const double beta = 0.25;
+    const double initialAcceleration = 10.0;
+    const double predictor = 0.1*0.1*(0.5-beta)*initialAcceleration;
+    const double effectiveMass = 1.0/(beta*0.1*0.1);
+    const double expectedDisplacement =
+        (10.0+effectiveMass*predictor)/(250.0+effectiveMass);
+    const double expectedAcceleration =
+        (expectedDisplacement-predictor)/(beta*0.1*0.1);
+    const double expectedVelocity = 0.5*0.1*(initialAcceleration+expectedAcceleration);
     const double expectedTension = 250.0*expectedDisplacement;
     QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,1)-expectedDisplacement) < 1.0e-11);
     QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_VELOCITY,0,1)-expectedVelocity) < 1.0e-10);
@@ -778,10 +784,11 @@ void TestStructuralCableFE::prestressedTransverseCableMatchesSmallStepGeometricR
         QFAIL(message.constData());
     }
 
-    // Starting from rest under a small transverse load, the one-step Newmark
-    // equation is m*q1/(beta*dt^2) + T(q1)*q1/L(q1) = F. This scalar
-    // reference includes both the initial geometric tension and the small
-    // axial material extension caused by the transverse motion.
+    // The fresh transverse acceleration is F/m. Include its predictor in the
+    // one-step Newmark equation; the scalar reference includes both the
+    // initial geometric tension and the small axial material extension.
+    const double initialAcceleration = transverseLoad/nodalMass;
+    const double predictor = dt*dt*(0.5-beta)*initialAcceleration;
     auto internalTransverseForce = [=](double q)
     {
         const double currentLength = std::hypot(length,q);
@@ -791,10 +798,11 @@ void TestStructuralCableFE::prestressedTransverseCableMatchesSmallStepGeometricR
     };
     auto residual = [&](double q)
     {
-        return nodalMass*q/(beta*dt*dt)+internalTransverseForce(q)-transverseLoad;
+        return nodalMass*(q-predictor)/(beta*dt*dt)+
+               internalTransverseForce(q)-transverseLoad;
     };
     double lower = 0.0;
-    double upper = transverseLoad*beta*dt*dt/nodalMass;
+    double upper = 2.0*transverseLoad*beta*dt*dt/nodalMass;
     for (uint iteration=0;iteration<100;iteration++)
     {
         const double middle = 0.5*(lower+upper);
@@ -804,7 +812,7 @@ void TestStructuralCableFE::prestressedTransverseCableMatchesSmallStepGeometricR
             upper = middle;
     }
     const double expectedDisplacement = 0.5*(lower+upper);
-    const double expectedAcceleration = expectedDisplacement/(beta*dt*dt);
+    const double expectedAcceleration = (expectedDisplacement-predictor)/(beta*dt*dt);
     const double displacement = nodeValue(model,R_VARIABLE_DISPLACEMENT,1,1);
     const double acceleration = nodeValue(model,R_VARIABLE_ACCELERATION,1,1);
     QVERIFY(std::isfinite(displacement));
@@ -827,7 +835,7 @@ void TestStructuralCableFE::failedSecondCableStepRollsBackToLastAcceptedState()
     model.getProblemSetup().getStructuralCableSetup().members[0].initialTension = 0.0;
     RBoundaryCondition &force =
         model.getPoint(1).getBoundaryCondition(R_BOUNDARY_CONDITION_FORCE);
-    setComponent(force,R_VARIABLE_FORCE_X,true,-1.6);
+    setComponent(force,R_VARIABLE_FORCE_X,true,-1.0);
     RStructuralDynamicsSetup &dynamics =
         model.getProblemSetup().getStructuralDynamicsSetup();
     dynamics.setEnabled(true);
@@ -851,12 +859,12 @@ void TestStructuralCableFE::failedSecondCableStepRollsBackToLastAcceptedState()
     QVERIFY2(failureMessage.contains("current length must be positive",Qt::CaseInsensitive),
              qPrintable(failureMessage));
 
-    // Step 1 reaches a valid slack state. The constant compression would
-    // collapse the element at step 2, so the rejected candidate must restore
-    // the already-published step-1 mechanics, kinematics, and accepted time.
-    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,1)+0.4) < 1.0e-10);
-    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_VELOCITY,0,1)+0.8) < 1.0e-10);
-    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_ACCELERATION,0,1)+1.6) < 1.0e-10);
+    // The initialized acceleration reaches a valid slack state in step 1. The
+    // constant compression collapses the element at step 2, so the rejected
+    // candidate must restore the already-published step-1 state and time.
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_DISPLACEMENT,0,1)+0.5) < 1.0e-10);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_VELOCITY,0,1)+1.0) < 1.0e-10);
+    QVERIFY(std::fabs(nodeValue(model,R_VARIABLE_ACCELERATION,0,1)+1.0) < 1.0e-10);
     QCOMPARE(model.getTimeSolver().getCurrentTimeStep(),uint(0));
     QVERIFY(std::fabs(model.getTimeSolver().getCurrentTime()-1.0) < 1.0e-14);
     QVERIFY(std::fabs(model.getTimeSolver().getComputedTime()-1.0) < 1.0e-14);

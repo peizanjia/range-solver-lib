@@ -1,7 +1,9 @@
 #include "rstructural_thermo_monolithic_1d_fe_adapter.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -21,9 +23,13 @@
 
 namespace
 {
-constexpr double geometryTolerance = 1.0e-12;
+constexpr double relativeGeometryTolerance = 1.0e-10;
+constexpr double absoluteDisplacementProjectionTolerance = 1.0e-12;
+constexpr double stateProjectionTolerance = 1.0e-10;
 constexpr unsigned int maximumNodeCount = 64U;
 constexpr unsigned int maximumMemberCount = 1024U;
+
+using Vector3 = std::array<double,3>;
 
 [[noreturn]] void invalidInput(const char *message)
 {
@@ -41,6 +47,128 @@ void require(bool condition,const char *message)
 void requireFinite(double value,const char *message)
 {
     require(std::isfinite(value),message);
+}
+
+Vector3 nodeCoordinates(const RNode &node)
+{
+    return {node.getX(),node.getY(),node.getZ()};
+}
+
+double norm(const Vector3 &value)
+{
+    return std::hypot(std::hypot(value[0],value[1]),value[2]);
+}
+
+double dotWithUnitVector(const Vector3 &value,const Vector3 &unitVector)
+{
+    const double scale = std::max({std::abs(value[0]),std::abs(value[1]),
+                                   std::abs(value[2])});
+    if (scale == 0.0)
+    {
+        return 0.0;
+    }
+    const double scaledDot = (value[0]/scale)*unitVector[0] +
+                             (value[1]/scale)*unitVector[1] +
+                             (value[2]/scale)*unitVector[2];
+    return scale*scaledDot;
+}
+
+struct AxisProjection
+{
+    Vector3 direction{};
+    std::vector<double> coordinates;
+};
+
+AxisProjection projectStraightGeometry(const RModel &model)
+{
+    std::vector<Vector3> coordinates(model.getNNodes());
+    double coordinateMagnitude = 0.0;
+    for (uint node=0;node<model.getNNodes();node++)
+    {
+        coordinates[node] = nodeCoordinates(model.getNode(node));
+        for (double coordinate : coordinates[node])
+        {
+            requireFinite(coordinate,"RModel coordinates must be finite.");
+            coordinateMagnitude = std::max(coordinateMagnitude,std::abs(coordinate));
+        }
+    }
+
+    double longestDistance = 0.0;
+    Vector3 axis{};
+    for (uint first=0;first<model.getNNodes();first++)
+    {
+        for (uint second=first+1U;second<model.getNNodes();second++)
+        {
+            const Vector3 difference = {
+                coordinates[second][0]-coordinates[first][0],
+                coordinates[second][1]-coordinates[first][1],
+                coordinates[second][2]-coordinates[first][2]
+            };
+            for (double component : difference)
+            {
+                requireFinite(component,"RModel coordinate differences must remain finite.");
+            }
+            const double distance = norm(difference);
+            requireFinite(distance,"RModel coordinate span must remain finite.");
+            if (distance > longestDistance)
+            {
+                longestDistance = distance;
+                axis = difference;
+            }
+        }
+    }
+    require(longestDistance > 0.0,"RModel nodes must span a nonzero straight axis.");
+    for (double &component : axis)
+    {
+        component /= longestDistance;
+    }
+
+    // Treat components within roundoff of the maximum as tied. Iterating in
+    // X/Y/Z order makes the sign choice stable for diagonal axes.
+    uint dominantComponent = 0U;
+    const double dominantTolerance = 32.0*std::numeric_limits<double>::epsilon();
+    for (uint component=1U;component<3U;component++)
+    {
+        if (std::abs(axis[component]) >
+            std::abs(axis[dominantComponent])+dominantTolerance)
+        {
+            dominantComponent = component;
+        }
+    }
+    if (axis[dominantComponent] < 0.0)
+    {
+        for (double &component : axis)
+        {
+            component = -component;
+        }
+    }
+
+    const double collinearityTolerance = std::max(
+        relativeGeometryTolerance*longestDistance,
+        16.0*std::numeric_limits<double>::epsilon()*coordinateMagnitude);
+    const Vector3 origin = coordinates.front();
+    AxisProjection projection;
+    projection.direction = axis;
+    projection.coordinates.reserve(model.getNNodes());
+    for (const Vector3 &coordinate : coordinates)
+    {
+        const Vector3 difference = {
+            coordinate[0]-origin[0],coordinate[1]-origin[1],coordinate[2]-origin[2]
+        };
+        const double axialCoordinate = dotWithUnitVector(difference,axis);
+        requireFinite(axialCoordinate,"Projected RModel coordinates must remain finite.");
+        const Vector3 transverse = {
+            difference[0]-axialCoordinate*axis[0],
+            difference[1]-axialCoordinate*axis[1],
+            difference[2]-axialCoordinate*axis[2]
+        };
+        const double transverseDistance = norm(transverse);
+        requireFinite(transverseDistance,"RModel transverse coordinate residual must remain finite.");
+        require(transverseDistance <= collinearityTolerance,
+                "Only straight, collinear TRUSS1 geometry is supported.");
+        projection.coordinates.push_back(axialCoordinate);
+    }
+    return projection;
 }
 
 bool isSingleHeatThenStressTask(const RProblemTaskItem &root)
@@ -361,25 +489,11 @@ RStructuralThermoMonolithic1DResult RStructuralThermoMonolithic1DFEAdapter::adva
                 "Element-index Kelvin-Voigt coefficients must be finite nonnegative Pa*s.");
     }
 
-    const RNode &firstPosition = model.getNode(0);
-    const double referenceY = firstPosition.getY();
-    const double referenceZ = firstPosition.getZ();
-    require(std::isfinite(referenceY) && std::isfinite(referenceZ),
-            "RModel reference coordinates must be finite.");
+    const AxisProjection projection = projectStraightGeometry(model);
     RStructuralThermoMonolithic1DModel kernelModel;
     kernelModel.referenceTemperatureKelvin = referenceTemperatureKelvin;
-    kernelModel.nodeCoordinatesMetres.reserve(model.getNNodes());
+    kernelModel.nodeCoordinatesMetres = projection.coordinates;
     std::vector<bool> usedNodes(model.getNNodes(),false);
-    for (uint node=0;node<model.getNNodes();node++)
-    {
-        const RNode &position = model.getNode(node);
-        require(std::isfinite(position.getX()) && std::isfinite(position.getY()) &&
-                    std::isfinite(position.getZ()),"RModel coordinates must be finite.");
-        require(std::abs(position.getY()-referenceY) <= geometryTolerance &&
-                    std::abs(position.getZ()-referenceZ) <= geometryTolerance,
-                "Only straight global-X TRUSS1 geometry is supported.");
-        kernelModel.nodeCoordinatesMetres.push_back(position.getX());
-    }
 
     const uint temperaturePosition = model.findVariable(R_VARIABLE_TEMPERATURE);
     const uint displacementPosition = model.findVariable(R_VARIABLE_DISPLACEMENT);
@@ -400,13 +514,33 @@ RStructuralThermoMonolithic1DResult RStructuralThermoMonolithic1DFEAdapter::adva
         if (displacementPosition != RConstants::eod)
         {
             const RVariable &displacement = model.getVariable(displacementPosition);
-            const double transverseY = displacement.getValue(1,node);
-            const double transverseZ = displacement.getValue(2,node);
-            require(std::isfinite(transverseY) && std::isfinite(transverseZ) &&
-                        std::abs(transverseY) <= geometryTolerance &&
-                        std::abs(transverseZ) <= geometryTolerance,
+            const Vector3 acceptedDisplacement = {
+                displacement.getValue(0,node),
+                displacement.getValue(1,node),
+                displacement.getValue(2,node)
+            };
+            for (double component : acceptedDisplacement)
+            {
+                requireFinite(component,"Existing displacement components must be finite.");
+            }
+            const double displacementMagnitude = norm(acceptedDisplacement);
+            requireFinite(displacementMagnitude,"Existing displacement magnitude must be finite.");
+            const double axialDisplacement =
+                dotWithUnitVector(acceptedDisplacement,projection.direction);
+            requireFinite(axialDisplacement,"Projected existing displacement must be finite.");
+            const Vector3 transverseDisplacement = {
+                acceptedDisplacement[0]-axialDisplacement*projection.direction[0],
+                acceptedDisplacement[1]-axialDisplacement*projection.direction[1],
+                acceptedDisplacement[2]-axialDisplacement*projection.direction[2]
+            };
+            const double transverseMagnitude = norm(transverseDisplacement);
+            const double allowedTransverseMagnitude = std::max(
+                absoluteDisplacementProjectionTolerance,
+                stateProjectionTolerance*displacementMagnitude);
+            require(std::isfinite(transverseMagnitude) &&
+                        transverseMagnitude <= allowedTransverseMagnitude,
                     "Existing transverse displacement is outside the 1-D adapter scope.");
-            accepted.axialDisplacementMetres[node] = displacement.getValue(0,node);
+            accepted.axialDisplacementMetres[node] = axialDisplacement;
         }
     }
 
@@ -420,10 +554,12 @@ RStructuralThermoMonolithic1DResult RStructuralThermoMonolithic1DFEAdapter::adva
         const unsigned int secondNode = element.getNodeId(1);
         require(firstNode < model.getNNodes() && secondNode < model.getNNodes(),
                 "TRUSS1 element references an invalid node.");
-        const double firstX = model.getNode(firstNode).getX();
-        const double secondX = model.getNode(secondNode).getX();
-        const unsigned int node0 = firstX < secondX ? firstNode : secondNode;
-        const unsigned int node1 = firstX < secondX ? secondNode : firstNode;
+        const double firstCoordinate = projection.coordinates[firstNode];
+        const double secondCoordinate = projection.coordinates[secondNode];
+        require(firstCoordinate != secondCoordinate,
+                "TRUSS1 members must have positive length along the inferred straight axis.");
+        const unsigned int node0 = firstCoordinate < secondCoordinate ? firstNode : secondNode;
+        const unsigned int node1 = firstCoordinate < secondCoordinate ? secondNode : firstNode;
         const ElementMaterialBinding &binding = bindings[elementIndex];
         RStructuralThermoMonolithic1DMember member;
         member.node0 = node0;
@@ -456,9 +592,11 @@ RStructuralThermoMonolithic1DResult RStructuralThermoMonolithic1DFEAdapter::adva
     for (uint node=0;node<candidate.getNNodes();node++)
     {
         temperature.setValue(0,node,result.nextState.temperatureKelvin[node]);
-        displacement.setValue(0,node,result.nextState.axialDisplacementMetres[node]);
-        displacement.setValue(1,node,0.0);
-        displacement.setValue(2,node,0.0);
+        for (uint component=0;component<3U;component++)
+        {
+            displacement.setValue(component,node,
+                projection.direction[component]*result.nextState.axialDisplacementMetres[node]);
+        }
     }
     candidate.addVariable(temperature);
     candidate.addVariable(displacement);
@@ -534,10 +672,17 @@ RStructuralThermoMonolithic1DResult RStructuralThermoMonolithic1DFEAdapter::adva
     for (uint node=0;node<candidate.getNNodes();node++)
     {
         require(candidate.getVariable(candidateTemperaturePosition).getValue(0,node) ==
-                    result.nextState.temperatureKelvin[node] &&
-                    candidate.getVariable(candidateDisplacementPosition).getValue(0,node) ==
-                    result.nextState.axialDisplacementMetres[node],
-                "Candidate nodal output differs from the certified monolithic result.");
+                    result.nextState.temperatureKelvin[node],
+                "Candidate temperature differs from the certified monolithic result.");
+        for (uint component=0;component<3U;component++)
+        {
+            const double expectedDisplacement =
+                projection.direction[component]*result.nextState.axialDisplacementMetres[node];
+            require(std::isfinite(expectedDisplacement) &&
+                        candidate.getVariable(candidateDisplacementPosition).getValue(component,node) ==
+                            expectedDisplacement,
+                    "Candidate global displacement differs from the certified monolithic result.");
+        }
     }
     for (uint element=0;element<candidate.getNElements();element++)
     {
