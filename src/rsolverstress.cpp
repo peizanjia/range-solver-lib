@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <map>
 
@@ -639,6 +640,38 @@ bool sameControlSetup(const RStructuralControlSetup &left,
         if (a.actuatorId!=b.actuatorId || a.delaySteps!=b.delaySteps ||
             a.holdSteps!=b.holdSteps || a.noiseAmplitude!=b.noiseAmplitude)
             return false;
+    }
+    return true;
+}
+
+// A callback may capture a mutable model even though the observation is const.
+// Preserve result metadata and every value, including unrelated field outputs.
+bool sameControlResults(const RResults &left,const RResults &right)
+{
+    const auto sameBits = [](double a,double b)
+    {
+        return std::memcmp(&a,&b,sizeof(double))==0;
+    };
+    if (left.getNNodes()!=right.getNNodes() ||
+        left.getNElements()!=right.getNElements() ||
+        left.getNVariables()!=right.getNVariables()) return false;
+    for (uint i=0;i<left.getNVariables();i++)
+    {
+        const RVariable &a = left.getVariable(i);
+        const RVariable &b = right.getVariable(i);
+        if (a.getType()!=b.getType() || a.getApplyType()!=b.getApplyType() ||
+            a.getName()!=b.getName() || a.getUnits()!=b.getUnits() ||
+            a.getNVectors()!=b.getNVectors() || a.getNValues()!=b.getNValues()) return false;
+        const RVariableData &ad = a.getVariableData();
+        const RVariableData &bd = b.getVariableData();
+        if (!sameBits(ad.getMinDisplayValue(),bd.getMinDisplayValue()) ||
+            !sameBits(ad.getMaxDisplayValue(),bd.getMaxDisplayValue()) ||
+            ad.getDisplayValueRange()!=bd.getDisplayValueRange() ||
+            ad.getValueRangeName()!=bd.getValueRangeName() ||
+            !sameBits(ad.getScale(),bd.getScale())) return false;
+        for (uint component=0;component<a.getNVectors();component++)
+            for (uint value=0;value<a.getNValues();value++)
+                if (!sameBits(a.getValue(component,value),b.getValue(component,value))) return false;
     }
     return true;
 }
@@ -2546,7 +2579,11 @@ void RSolverStress::solveStructuralCableDynamics()
 
         const RTimeSolver frozenTimeSolver = this->pModel->getTimeSolver();
         const RStructuralControlSetup frozenControlSetup = controlSetup;
+        const RResults frozenResults = *this->pModel;
         const RStructuralControlDecision decision = this->controlCallback(observation);
+        if (!sameControlResults(frozenResults,*this->pModel))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable control callback changed the frozen result fields.");
         if (!sameControlTimeSolver(frozenTimeSolver,this->pModel->getTimeSolver()) ||
             !sameControlSetup(frozenControlSetup,
                 this->pModel->getProblemSetup().getStructuralControlSetup()))
@@ -4315,7 +4352,11 @@ void RSolverStress::solveStructuralDynamics()
         observation.priorControllerState = this->acceptedControllerState;
         const RTimeSolver frozenTimeSolver = this->pModel->getTimeSolver();
         const RStructuralControlSetup frozenControlSetup = controlSetup;
+        const RResults frozenResults = *this->pModel;
         const RStructuralControlDecision decision = this->controlCallback(observation);
+        if (!sameControlResults(frozenResults,*this->pModel))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Structural control callback changed the frozen result fields.");
         if (!sameControlTimeSolver(frozenTimeSolver,this->pModel->getTimeSolver()) ||
             !sameControlSetup(frozenControlSetup,
                 this->pModel->getProblemSetup().getStructuralControlSetup()))

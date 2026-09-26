@@ -223,6 +223,7 @@ private slots:
     void controlRateLimitAndRestartFailClosed();
     void controlCallbackCannotMutateCatalog();
     void controlCallbackCannotMutateClockOrConditioning();
+    void controlCallbackCannotMutateUnrelatedResults();
     void conditionedDelayHoldNoiseRestartsAfterRejectedTrial();
     void rawLegacyControlStateFailsClosed();
     void twoChannelMappingIsLinearAndRestartsDeterministically();
@@ -546,6 +547,42 @@ void TestStructuralDynamicsFE::controlCallbackCannotMutateClockOrConditioning()
         QCOMPARE(model.getProblemSetup().getStructuralControlSetup()
                      .channelConditioning.front().delaySteps,0u);
     }
+}
+
+void TestStructuralDynamicsFE::controlCallbackCannotMutateUnrelatedResults()
+{
+    RModel model = makeTruss(1);
+    configureControl(model);
+    RSolver solver(model,QString(),QString());
+    bool first = true;
+    std::vector<QByteArray> priorStates;
+    solver.setStructuralControlCallback("constant-force","mutating-results-v1",
+        [&model,&first,&priorStates](const RStructuralControlObservation &observation)
+        {
+            priorStates.push_back(observation.priorControllerState);
+            if (first)
+            {
+                first = false;
+                RVariable pressure(R_VARIABLE_PRESSURE);
+                pressure.setApplyType(R_VARIABLE_APPLY_NODE);
+                pressure.resize(1,model.getNNodes());
+                pressure.setValue(0,1,321.0);
+                model.addVariable(pressure);
+            }
+            return RStructuralControlDecision{{{"tip-x",1.0e4}},QByteArrayLiteral("accepted-guard")};
+        });
+    QString error;
+    try { solver.run(); }
+    catch (const RError &failure) { error = failure.getMessage(); }
+    QVERIFY2(error.contains("frozen result fields",Qt::CaseInsensitive),qPrintable(error));
+    QVERIFY(!model.getProblemSetup().getStructuralDynamicsRestartData().available);
+    QCOMPARE(model.findVariable(R_VARIABLE_PRESSURE),RConstants::eod);
+    try { solver.run(); }
+    catch (const RError &failure) { QFAIL(qPrintable(failure.getMessage())); }
+    QVERIFY(priorStates.size()>=2);
+    QCOMPARE(priorStates[0],priorStates[1]);
+    QVERIFY(model.getProblemSetup().getStructuralDynamicsRestartData().controlAvailable);
+    QCOMPARE(model.findVariable(R_VARIABLE_PRESSURE),RConstants::eod);
 }
 
 void TestStructuralDynamicsFE::conditionedDelayHoldNoiseRestartsAfterRejectedTrial()

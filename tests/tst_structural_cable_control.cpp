@@ -380,6 +380,7 @@ private slots:
     void controlDefinitionChangeRejectsRestart();
     void callbackCannotChangeAcceptedClock();
     void callbackCannotChangeConditioningSetup();
+    void callbackCannotChangeUnrelatedResults();
     void unsupportedActuatorFailsClosed();
 };
 
@@ -670,6 +671,50 @@ void TestStructuralCableControl::callbackCannotChangeConditioningSetup()
     QVERIFY(!model.getProblemSetup().getStructuralDynamicsRestartData().available);
     QCOMPARE(model.getProblemSetup().getStructuralControlSetup()
                  .channelConditioning.front().delaySteps,originalDelay);
+}
+
+void TestStructuralCableControl::callbackCannotChangeUnrelatedResults()
+{
+    for (uint change=0;change<3;change++)
+    {
+        RModel model = makeCable(1);
+        RSolver solver(model,QString(),QString());
+        bool first = true;
+        std::vector<QByteArray> priorStates;
+        solver.setStructuralControlCallback(
+            QString::fromLatin1(controllerId),QStringLiteral("tamper-results-v1"),
+            [&model,&first,&priorStates,change](const RStructuralControlObservation &observation)
+            {
+                priorStates.push_back(observation.priorControllerState);
+                if (first)
+                {
+                    first = false;
+                    RVariable field(change==2 ? R_VARIABLE_PATCH_SIZE : R_VARIABLE_PRESSURE);
+                    field.setApplyType(R_VARIABLE_APPLY_NODE);
+                    field.resize(1,model.getNNodes());
+                    field.setValue(0,1,321.0);
+                    if (change==1) field.setUnits("invalid-unit");
+                    model.addVariable(field);
+                }
+                RStructuralControlDecision decision;
+                decision.requestedCommands.push_back({QString::fromLatin1(actuatorId),0.2});
+                decision.nextControllerState = QByteArrayLiteral("accepted-results-guard");
+                return decision;
+            });
+        QString error;
+        try { solver.run(); }
+        catch (const RError &failure) { error = failure.getMessage(); }
+        QVERIFY2(error.contains("frozen result fields",Qt::CaseInsensitive),qPrintable(error));
+        QVERIFY(!model.getProblemSetup().getStructuralDynamicsRestartData().available);
+        QCOMPARE(model.findVariable(R_VARIABLE_PRESSURE),RConstants::eod);
+        QCOMPARE(model.findVariable(R_VARIABLE_PATCH_SIZE),RConstants::eod);
+        try { solver.run(); }
+        catch (const RError &failure) { QFAIL(qPrintable(failure.getMessage())); }
+        QCOMPARE(priorStates.size(),std::size_t(2));
+        QCOMPARE(priorStates[0],priorStates[1]);
+        QVERIFY(model.getProblemSetup().getStructuralDynamicsRestartData().controlAvailable);
+        QCOMPARE(model.findVariable(R_VARIABLE_PRESSURE),RConstants::eod);
+    }
 }
 
 void TestStructuralCableControl::unsupportedActuatorFailsClosed()
