@@ -286,7 +286,7 @@ private slots:
     void changedAcceptedStepOrTimeRejectsRestart();
     void alteredSmallComponentBesideLargeValueRejectsRestore();
     void rejectedCandidateDoesNotAdvanceAcceptedCableCheckpoint();
-    void enabledStructuralControlIsRejectedByCableAdapter();
+    void structuralControlWithoutActuatorIsRejectedByCableAdapter();
 };
 
 void TestStructuralCableRestart::persistedSplitRunMatchesFullVibration_data()
@@ -515,10 +515,11 @@ void TestStructuralCableRestart::rejectedCandidateDoesNotAdvanceAcceptedCableChe
     compareCheckpoints(accepted,afterFailure);
 }
 
-void TestStructuralCableRestart::enabledStructuralControlIsRejectedByCableAdapter()
+void TestStructuralCableRestart::structuralControlWithoutActuatorIsRejectedByCableAdapter()
 {
     RModel model = makeVibratingCable(1);
     model.getProblemSetup().getStructuralControlSetup().enabled = true;
+    model.getProblemSetup().getStructuralControlSetup().controllerId = "cable-force-controller";
     bool rejected = false;
     try
     {
@@ -526,7 +527,8 @@ void TestStructuralCableRestart::enabledStructuralControlIsRejectedByCableAdapte
     }
     catch (const RError &failure)
     {
-        rejected = failure.getMessage().contains("Stage-6 structural control",Qt::CaseInsensitive);
+        rejected = failure.getMessage().contains("requires at least one",Qt::CaseInsensitive) &&
+                   failure.getMessage().contains("NodalForce actuator",Qt::CaseInsensitive);
     }
     QVERIFY(rejected);
 }
