@@ -32,6 +32,7 @@ set(range_solver_lib_tests
     tst_structural_piezo_fe
     tst_structural_control_force_map
     tst_structural_control_conditioner
+    tst_structural_typed_control
     tst_structural_dynamics_fe
     tst_structural_dynamics_beam
     tst_structural_dynamics_loads

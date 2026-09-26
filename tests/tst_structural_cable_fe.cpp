@@ -1,6 +1,7 @@
 #include <QtTest>
 
 #include <QByteArray>
+#include <QTemporaryDir>
 
 #include <algorithm>
 #include <array>
@@ -22,6 +23,7 @@
 
 #include "rsolver.h"
 #include "rsolverstress.h"
+#include "rstructural_typed_fe_control.h"
 
 namespace
 {
@@ -449,6 +451,7 @@ private slots:
     void failedSecondCableStepRollsBackToLastAcceptedState();
     void acceptedSlackCableRetensionsOnFollowingControlledStep();
     void cableAndPiezoModesCannotBeEnabledTogether();
+    void typedLengthPrestressAndAnchorDriveActualCable();
 };
 
 void TestStructuralCableFE::axialExtensionAndStressMatchAnalyticSolution()
@@ -947,6 +950,100 @@ void TestStructuralCableFE::cableAndPiezoModesCannotBeEnabledTogether()
     }
     QVERIFY(rejected);
     QVERIFY(model.findVariable(R_VARIABLE_DISPLACEMENT) == RConstants::eod);
+}
+
+void TestStructuralCableFE::typedLengthPrestressAndAnchorDriveActualCable()
+{
+    using Quantity=RStructuralTypedControlQuantity;
+    RModel model=makeAxialCable();
+    std::vector<RStructuralTypedControlChannel> catalog;
+    const Quantity quantities[]={Quantity::CableReferenceLength,Quantity::CableInitialTension,
+                                 Quantity::CableAnchorDisplacement};
+    const char *ids[]={"length","prestress","anchor"};
+    const double initial[]={2.0,5.0,0.0};
+    const double requested[]={1.98,8.0,0.05};
+    for (uint i=0;i<3;i++)
+    {
+        RStructuralTypedControlChannel channel;
+        channel.channelId=ids[i];
+        channel.quantity=quantities[i];
+        channel.initialCommand=initial[i];
+        catalog.push_back(channel);
+    }
+    RStructuralTypedControlSession session(321,0.1,catalog);
+    std::vector<RStructuralTypedFEControlBinding> bindings={
+        {"length",0,0,0},{"prestress",0,0,0},{"anchor",0,0,0}};
+    auto driver=RStructuralTypedFEControlDriver::cable(model,session,bindings);
+    const auto before=session.serialize(driver->state());
+    QVERIFY_EXCEPTION_THROWN(driver->advance([&](const RStructuralControlObservation &)
+    {
+        driver->advance([](const RStructuralControlObservation &) { return RStructuralTypedControlDecision(); });
+        return RStructuralTypedControlDecision();
+    }),std::invalid_argument);
+    QCOMPARE(session.serialize(driver->state()),before);
+    bool rejected=false;
+    try
+    {
+        driver->advance([&](const RStructuralControlObservation &)
+        {
+            RStructuralTypedControlDecision decision;
+            for (uint i=0;i<3;i++) decision.requestedCommands.push_back(
+                {ids[i],quantities[i],i==0 ? -1.0 : requested[i]});
+            decision.nextControllerState="rejected";
+            return decision;
+        });
+    }
+    catch (const std::invalid_argument &) { rejected=true; }
+    QVERIFY(rejected);
+    QCOMPARE(session.serialize(driver->state()),before);
+    RStructuralControlObservation seen;
+    driver->advance([&](const RStructuralControlObservation &observation)
+    {
+        seen=observation;
+        RStructuralTypedControlDecision decision;
+        for (uint i=0;i<3;i++) decision.requestedCommands.push_back({ids[i],quantities[i],requested[i]});
+        decision.nextControllerState="accepted";
+        return decision;
+    });
+    QVERIFY(seen.priorControllerState.isEmpty());
+    const RModel &accepted=driver->model();
+    const RVariable &u=accepted.getVariable(accepted.findVariable(R_VARIABLE_DISPLACEMENT));
+    const double expectedTip=0.05+1.98*(1.0+(10.0-8.0)/500.0)-2.0;
+    QVERIFY(std::fabs(u.getValue(0,1)-expectedTip)<1.0e-10);
+    QCOMPARE(u.getValue(0,0),0.05);
+    const double expectedWork[]={0.2,0.1188,-0.5};
+    for (uint i=0;i<3;i++)
+    {
+        QVERIFY(std::fabs(driver->lastChannels()[i].cumulativeWorkJ-expectedWork[i])<1.0e-10);
+        QVERIFY(std::fabs(driver->lastChannels()[i].averagePowerW-expectedWork[i]/0.1)<1.0e-9);
+    }
+    QCOMPARE(driver->state().completedSteps,quint64(1));
+    QCOMPARE(driver->state().controllerState,QByteArray("accepted"));
+    QCOMPARE(model.getProblemSetup().getStructuralCableSetup().members[0].referenceLength,2.0);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString checkpoint=directory.filePath("cable.sfec");
+    driver->writeCheckpoint(checkpoint);
+    auto resumed=RStructuralTypedFEControlDriver::readCheckpoint(checkpoint,"cpp-typed-v1");
+    QCOMPARE(session.serialize(resumed->state()),session.serialize(driver->state()));
+    const auto second=[&](const RStructuralControlObservation &observation)
+    {
+        if (observation.priorControllerState!=QByteArray("accepted"))
+            throw std::runtime_error("Missing cable accepted state after restart.");
+        RStructuralTypedControlDecision decision;
+        decision.requestedCommands={{"length",Quantity::CableReferenceLength,1.97},
+            {"prestress",Quantity::CableInitialTension,7.0},{"anchor",Quantity::CableAnchorDisplacement,0.02}};
+        decision.nextControllerState="second";
+        return decision;
+    };
+    driver->advance(second);
+    resumed->advance(second);
+    QCOMPARE(resumed->state().completedSteps,quint64(2));
+    QCOMPARE(resumed->state().controllerState,driver->state().controllerState);
+    for (uint i=0;i<3;i++)
+        QVERIFY(std::fabs(resumed->state().cumulativeWorkJ[i]-driver->state().cumulativeWorkJ[i])<1.0e-10);
+    const auto &resumedU=resumed->model().getVariable(resumed->model().findVariable(R_VARIABLE_DISPLACEMENT));
+    QVERIFY(std::fabs(resumedU.getValue(0,1)-(0.02+1.97*(1.0+3.0/500.0)-2.0))<1.0e-10);
 }
 
 QTEST_APPLESS_MAIN(TestStructuralCableFE)

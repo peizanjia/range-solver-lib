@@ -1,4 +1,6 @@
 #include <QtTest>
+#include <QFile>
+#include <QTemporaryDir>
 
 #include <algorithm>
 #include <array>
@@ -20,6 +22,7 @@
 #include <rml_variable.h>
 
 #include "rstructural_piezo_beam_fe_adapter.h"
+#include "rstructural_typed_fe_control.h"
 
 namespace
 {
@@ -232,6 +235,9 @@ private slots:
     void candidatePublicationAndRollback();
     void rejectsUnsupportedGeometry();
     void rejectsUnsupportedPatchGravity();
+    void typedVoltageAndChargeDriveActualBeamAndWork();
+    void rejectsIgnoredTemperatureAndCompetingSetup();
+    void typedDriverRejectsTimeVaryingNonControlLoad();
 };
 
 void TestStructuralPiezoBeamFE::beamMesh_data()
@@ -438,6 +444,161 @@ void TestStructuralPiezoBeamFE::rejectsUnsupportedPatchGravity()
     component.add(0.0,1.0);
     const RStructuralPiezoBeamFEInput input = makeInput(model);
     QVERIFY(rejects([&]() { RStructuralPiezoBeamFEAdapter::validate(model,input); }));
+}
+
+void TestStructuralPiezoBeamFE::rejectsIgnoredTemperatureAndCompetingSetup()
+{
+    for (uint variant=0;variant<6;variant++)
+    {
+        RModel model=makeCantilever(2);
+        const auto input=makeInput(model);
+        if (variant==0)
+        {
+            auto &temperature=model.getLine(0).getEnvironmentCondition(R_ENVIRONMENT_CONDITION_TEMPERATURE);
+            auto &component=temperature.getComponent(temperature.findComponentPosition(R_VARIABLE_TEMPERATURE));
+            component.setEnabled(true);
+            component.clear();
+            component.add(0.0,350.0);
+        }
+        else if (variant==1)
+        {
+            RVariable temperature(R_VARIABLE_TEMPERATURE);
+            temperature.setApplyType(R_VARIABLE_APPLY_NODE);
+            temperature.resize(1,model.getNNodes());
+            temperature.setValue(0,1,350.0);
+            model.addVariable(temperature);
+        }
+        else if (variant==2) model.getProblemSetup().getStructuralCableSetup().enabled=true;
+        else if (variant==3) model.getProblemSetup().getStructuralPiezoSetup().enabled=true;
+        else if (variant==4) model.getProblemSetup().getStructuralInteractionSetup().getLinearConstraints().push_back(RLinearConstraint());
+        else model.setProblemTaskTree(RProblemTaskItem(R_PROBLEM_STRESS_MODAL));
+        QVERIFY(rejects([&]{RStructuralPiezoBeamFEAdapter::solve(model,input);}));
+        QCOMPARE(model.findVariable(R_VARIABLE_DISPLACEMENT),RConstants::eod);
+    }
+}
+
+void TestStructuralPiezoBeamFE::typedDriverRejectsTimeVaryingNonControlLoad()
+{
+    RModel model=makeCantilever(1,1.0);
+    auto input=makeInput(model,0.0);
+    RBoundaryCondition *load=nullptr;
+    for (uint i=0;i<model.getPoint(1).getNBoundaryConditions();i++)
+        if (model.getPoint(1).getBoundaryCondition(i).getType()==R_BOUNDARY_CONDITION_FORCE)
+            load=&model.getPoint(1).getBoundaryCondition(i);
+    QVERIFY(load!=nullptr);
+    const uint position=load->findComponentPosition(R_VARIABLE_FORCE_Y);
+    QVERIFY(position!=RConstants::eod);
+    load->getComponent(position).add(1.0,2.0);
+    RStructuralTypedControlChannel channel;
+    channel.channelId="electrode";
+    channel.quantity=RStructuralTypedControlQuantity::Voltage;
+    RStructuralTypedControlSession session(1,0.1,{channel});
+    QVERIFY(rejects([&]{RStructuralTypedFEControlDriver::piezoBeam(model,input,session,{{"electrode",0,0,0}});}));
+}
+
+void TestStructuralPiezoBeamFE::typedVoltageAndChargeDriveActualBeamAndWork()
+{
+    using Quantity=RStructuralTypedControlQuantity;
+    const double curvature=expectedCurvature(drivenVoltage);
+    const double strain=(patchYoungModulus*patchArea*patchOffsetY*curvature-
+        piezoCoupling*patchArea*drivenVoltage/patchThickness)/
+        (youngModulus*hostArea+patchYoungModulus*patchArea);
+    const double patchStrain=strain-patchOffsetY*curvature;
+    const double charge=(permittivity*patchArea*drivenVoltage/(patchThickness*patchThickness)-
+                         piezoCoupling*patchArea*patchStrain/patchThickness)*beamLength/2.0;
+    for (const bool chargeMode : {false,true})
+    {
+        RModel model=makeCantilever(2);
+        auto input=makeInput(model,0.0);
+        if (chargeMode) input.electricalMode=RStructuralPiezoBeamElectricalMode::PrescribedCharge;
+        const Quantity quantity=chargeMode ? Quantity::Charge : Quantity::Voltage;
+        std::vector<RStructuralTypedControlChannel> catalog;
+        std::vector<RStructuralTypedFEControlBinding> bindings;
+        for (const auto &patch : input.patches)
+        {
+            const QString id=QString("electrode-%1").arg(patch.elementId);
+            RStructuralTypedControlChannel channel;
+            channel.channelId=id;
+            channel.quantity=quantity;
+            catalog.push_back(channel);
+            bindings.push_back({id,patch.elementId,0,0});
+        }
+        RStructuralTypedControlSession session(123,0.1,catalog);
+        auto driver=RStructuralTypedFEControlDriver::piezoBeam(model,input,session,bindings);
+        const auto before=session.serialize(driver->state());
+        QVERIFY(rejects([&]
+        {
+            driver->advance([&](const RStructuralControlObservation &)
+            {
+                RStructuralTypedControlDecision decision;
+                for (const auto &channel : catalog)
+                    decision.requestedCommands.push_back({channel.channelId,Quantity::Force,drivenVoltage});
+                decision.nextControllerState="rejected";
+                return decision;
+            });
+        }));
+        QCOMPARE(session.serialize(driver->state()),before);
+        RStructuralControlObservation seen;
+        driver->advance([&](const RStructuralControlObservation &observation)
+        {
+            seen=observation;
+            RStructuralTypedControlDecision decision;
+            for (const auto &channel : catalog)
+                decision.requestedCommands.push_back({channel.channelId,quantity,chargeMode ? charge : drivenVoltage});
+            decision.nextControllerState="accepted";
+            return decision;
+        });
+        QCOMPARE(seen.acceptedTime,0.0);
+        QVERIFY(seen.priorControllerState.isEmpty());
+        QCOMPARE(driver->state().completedSteps,quint64(1));
+        QCOMPARE(driver->state().controllerState,QByteArray("accepted"));
+        const RModel &accepted=driver->model();
+        const RVariable &u=accepted.getVariable(accepted.findVariable(R_VARIABLE_DISPLACEMENT));
+        QVERIFY(std::fabs(u.getValue(1,2)-0.5*curvature*beamLength*beamLength)<1.0e-10);
+        double work=0.0;
+        for (const auto &sample : driver->lastChannels())
+        {
+            QCOMPARE(sample.quantity,quantity);
+            QVERIFY(std::fabs(sample.cumulativeWorkJ-0.5*drivenVoltage*charge)<1.0e-12);
+            QVERIFY(std::fabs(sample.averagePowerW-sample.cumulativeWorkJ/0.1)<1.0e-12);
+            work+=sample.cumulativeWorkJ;
+        }
+        QVERIFY(std::fabs(work-drivenVoltage*charge)<1.0e-12);
+        QCOMPARE(model.findVariable(R_VARIABLE_DISPLACEMENT),RConstants::eod);
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString checkpoint=directory.filePath("piezo.sfec");
+        driver->writeCheckpoint(checkpoint);
+        auto resumed=RStructuralTypedFEControlDriver::readCheckpoint(checkpoint,"cpp-typed-v1");
+        QCOMPARE(session.serialize(resumed->state()),session.serialize(driver->state()));
+        QVERIFY(rejects([&]{RStructuralTypedFEControlDriver::readCheckpoint(checkpoint,"other-controller");}));
+        const auto second=[&](const RStructuralControlObservation &observation)
+        {
+            if (observation.priorControllerState!=QByteArray("accepted"))
+                throw std::runtime_error("Missing accepted opaque state after restart.");
+            RStructuralTypedControlDecision decision;
+            for (const auto &channel : catalog)
+                decision.requestedCommands.push_back({channel.channelId,quantity,
+                    0.5*(chargeMode ? charge : drivenVoltage)});
+            decision.nextControllerState="second";
+            return decision;
+        };
+        driver->advance(second);
+        resumed->advance(second);
+        QCOMPARE(resumed->state().completedSteps,driver->state().completedSteps);
+        QCOMPARE(resumed->state().controllerState,driver->state().controllerState);
+        for (uint i=0;i<catalog.size();i++)
+            QVERIFY(std::fabs(resumed->state().cumulativeWorkJ[i]-driver->state().cumulativeWorkJ[i])<1.0e-12);
+        const auto preserved=session.serialize(resumed->state());
+        QFile damaged(checkpoint);
+        QVERIFY(damaged.open(QIODevice::ReadWrite));
+        QVERIFY(damaged.seek(50));
+        const char corrupt='X';
+        QCOMPARE(damaged.write(&corrupt,1),qint64(1));
+        damaged.close();
+        QVERIFY(rejects([&]{RStructuralTypedFEControlDriver::readCheckpoint(checkpoint,"cpp-typed-v1");}));
+        QCOMPARE(session.serialize(resumed->state()),preserved);
+    }
 }
 
 QTEST_APPLESS_MAIN(TestStructuralPiezoBeamFE)

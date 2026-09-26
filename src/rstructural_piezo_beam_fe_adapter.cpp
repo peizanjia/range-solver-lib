@@ -294,6 +294,50 @@ double componentValue(const Condition &condition,RVariableType type,double time)
 ValidatedModel inspectModel(const RModel &model,
                             const RStructuralPiezoBeamFEInput &input)
 {
+    if (model.getProblemTaskTree().getProblemTypeMask()!=R_PROBLEM_STRESS)
+        fail(QStringLiteral("Direct BEAM1 piezo requires a stress-only task."));
+    const auto &interaction=model.getProblemSetup().getStructuralInteractionSetup();
+    if (!interaction.getLinearConstraints().empty() || !interaction.getCouplings().empty() ||
+        !interaction.getPrescribedMotions().empty() || !interaction.getSensors().empty() ||
+        !interaction.getActuators().empty())
+        fail(QStringLiteral("Direct BEAM1 piezo rejects unsupported native interactions."));
+    if (model.getTimeSolver().getEnabled() ||
+        model.getProblemSetup().getStructuralDynamicsSetup().getEnabled() ||
+        model.getProblemSetup().getStructuralControlSetup().enabled ||
+        !model.getProblemSetup().getStructuralControlSetup().controllerId.isEmpty() ||
+        !model.getProblemSetup().getStructuralControlSetup().channelConditioning.empty() ||
+        model.getProblemSetup().getRestart() ||
+        model.getProblemSetup().getStructuralDynamicsRestartData().available ||
+        model.getProblemSetup().getStructuralThermalControlSetup().enabled ||
+        model.getProblemSetup().getStructuralCableSetup().enabled ||
+        model.getProblemSetup().getStructuralPiezoSetup().enabled)
+        fail(QStringLiteral("Direct BEAM1 piezo rejects active scheduling, restart or competing native cable/piezo/control setup."));
+    if (model.findVariable(R_VARIABLE_TEMPERATURE)!=RConstants::eod)
+        fail(QStringLiteral("Direct BEAM1 piezo is isothermal at 293.15 K and rejects a temperature field."));
+    for (uint groupId=0;groupId<model.getNElementGroups();groupId++)
+    {
+        const RElementGroup *group=model.getElementGroupPtr(groupId);
+        if (!group) continue;
+        for (uint position=0;position<group->getNEnvironmentConditions();position++)
+        {
+            const auto &condition=group->getEnvironmentCondition(position);
+            for (uint componentId=0;componentId<condition.size();componentId++)
+            {
+                const auto &component=condition.getComponent(componentId);
+                if (!component.getEnabled()) continue;
+                if (component.size()!=1 || !std::isfinite(component.getValue(0)))
+                    fail(QStringLiteral("Direct BEAM1 piezo requires constant finite environment components."));
+                if (condition.getType()==R_ENVIRONMENT_CONDITION_TEMPERATURE)
+                {
+                    if (component.getType()!=R_VARIABLE_TEMPERATURE ||
+                        std::fabs(component.getValue(0)-referenceTemperatureKelvin)>1.0e-12*referenceTemperatureKelvin)
+                        fail(QStringLiteral("Direct BEAM1 piezo is isothermal at 293.15 K."));
+                }
+                else if (condition.getType()!=R_ENVIRONMENT_CONDITION_G_ACCELERATION)
+                    fail(QStringLiteral("Direct BEAM1 piezo has an unsupported active environment condition."));
+            }
+        }
+    }
     if (model.getNNodes()<2 || model.getNNodes()>std::numeric_limits<uint>::max()/3)
         fail(QStringLiteral("BEAM1 piezo adapter requires a representable model with at least two nodes."));
     if (input.electricalMode != RStructuralPiezoBeamElectricalMode::PrescribedVoltage &&

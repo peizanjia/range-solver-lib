@@ -374,6 +374,7 @@ class TestStructuralCableControl : public QObject
 
 private slots:
     void acceptedControlMatchesNewmarkWorkAndPower();
+    void velocityFeedbackReducesActualCableVibration();
     void persistedSplitControlMatchesFullRun_data();
     void persistedSplitControlMatchesFullRun();
     void failedStepDoesNotCommitControllerCandidate();
@@ -432,6 +433,76 @@ void TestStructuralCableControl::acceptedControlMatchesNewmarkWorkAndPower()
     QVERIFY(close(record.appliedChannels[0].cumulativeWork,expectedControllerWork,2.0e-7));
     QVERIFY(std::isfinite(acceleration));
     QVERIFY(!checkpoint.controlControllerState.isEmpty());
+}
+
+void TestStructuralCableControl::velocityFeedbackReducesActualCableVibration()
+{
+    constexpr uint steps=200;
+    constexpr double initialVelocity=0.01;
+    constexpr double gain=1.0;
+    const double mass=density*cableArea*cableLength/2.0;
+    const double stiffness=youngModulus*cableArea/cableLength;
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    double passiveEnergy=0.0;
+    for (bool controlled : {false,true})
+    {
+        RModel model=makeCable(steps,controlled);
+        auto &initial=model.getVariable(model.addVariable(R_VARIABLE_VELOCITY));
+        initial.setApplyType(R_VARIABLE_APPLY_NODE);
+        initial.resize(3,model.getNNodes());
+        initial.setValue(0,1,initialVelocity);
+        if (controlled)
+        {
+            model.getProblemSetup().getStructuralControlSetup().channelConditioning.clear();
+            model.getProblemSetup().getStructuralInteractionSetup().getActuators().front().rateLimit=1000.0;
+        }
+        RSolver solver(model,directory.filePath(controlled ? "feedback.rbm" : "passive.rbm"),{});
+        if (controlled) solver.setStructuralControlCallback(controllerId,"velocity-feedback-v1",
+            [](const RStructuralControlObservation &observation)
+            {
+                double velocity=0.0;
+                for (const auto &sensor : observation.sensors)
+                    if (sensor.sensorId=="tip-velocity") velocity=sensor.value;
+                RStructuralControlDecision decision;
+                decision.requestedCommands.push_back({actuatorId,-gain*velocity});
+                return decision;
+            });
+        QString failure;
+        try { solver.run(); }
+        catch (const RError &error) { failure=error.getMessage(); }
+        catch (const std::exception &error) { failure=QString::fromUtf8(error.what()); }
+        QVERIFY2(failure.isEmpty(),qPrintable(failure));
+        const auto &checkpoint=model.getProblemSetup().getStructuralDynamicsRestartData();
+        double q=0.0,v=initialVelocity,work=0.0;
+        // Independent scalar recurrence with the force held over each step
+        // and right-limit acceleration refreshed at the accepted boundary.
+        for (uint i=0;i<steps;i++)
+        {
+            const double force=controlled ? -gain*v : 0.0;
+            const double effective=4.0*mass/(timeStep*timeStep);
+            const double next=(2.0*force+(effective-stiffness)*q+4.0*mass/timeStep*v)/(effective+stiffness);
+            const double nextVelocity=2.0*(next-q)/timeStep-v;
+            work+=force*(next-q);
+            q=next;
+            v=nextVelocity;
+        }
+        QVERIFY2(close(checkpoint.q[3],q,2.0e-8),qPrintable(QString("controlled=%1 FE=%2 recurrence=%3")
+            .arg(controlled).arg(checkpoint.q[3],0,'g',17).arg(q,0,'g',17)));
+        QVERIFY(close(checkpoint.v[3],v,2.0e-8));
+        const double energy=0.5*stiffness*checkpoint.q[3]*checkpoint.q[3]+0.5*mass*checkpoint.v[3]*checkpoint.v[3];
+        if (!controlled)
+        {
+            passiveEnergy=energy;
+            QVERIFY(close(energy,0.5*mass*initialVelocity*initialVelocity,1.0e-10));
+        }
+        else
+        {
+            QVERIFY(energy<0.001*passiveEnergy);
+            QVERIFY(close(checkpoint.cumulativeControlWork[0],work,1.0e-10));
+            QVERIFY(close(energy-0.5*mass*initialVelocity*initialVelocity,work,1.0e-10));
+        }
+    }
 }
 
 void TestStructuralCableControl::persistedSplitControlMatchesFullRun_data()
