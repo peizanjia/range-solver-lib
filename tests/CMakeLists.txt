@@ -12,6 +12,7 @@ endif()
 set(CMAKE_AUTOMOC ON)
 
 set(range_solver_lib_tests
+    tst_native_result_frame_observer
     tst_scales
     tst_local_rotation
     tst_iteration_info_value

@@ -1065,6 +1065,14 @@ std::vector<RStructuralControlChannelSample> RSolver::getStructuralControlSample
                                      : static_cast<const RSolverStress*>(it.value())->getAcceptedControlSamples();
 }
 
+void RSolver::setResultFrameObserver(ResultFrameObserver observer)
+{
+    for (auto it=this->solvers.begin();it!=this->solvers.end();++it)
+    {
+        it.value()->setResultFrameObserver(observer);
+    }
+}
+
 void RSolver::run()
 {
     const RProblemTaskItem &taskTree = this->pModel->getProblemTaskTree();
@@ -1346,10 +1354,13 @@ void RSolver::runSingle()
         stressSolver->setResultWritesDeferred(false);
         heatSolver->setMonitoringOutputFailuresAreFatal(false);
         stressSolver->setMonitoringOutputFailuresAreFatal(false);
+        stressSolver->publishResultFrameObserver();
     }
     catch (...)
     {
         const std::exception_ptr originalFailure = std::current_exception();
+        heatSolver->discardPendingResultFrameObserver();
+        stressSolver->discardPendingResultFrameObserver();
         const QString outputRollbackFailure = outputTransaction.rollback();
         const QString monitoringRollbackFailure = monitoringOutputTransaction.rollback();
         heatSolver->setResultWritesDeferred(false);

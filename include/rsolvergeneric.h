@@ -3,6 +3,9 @@
 
 #include <QString>
 
+#include <functional>
+#include <optional>
+#include <QStringList>
 #include <vector>
 
 #include <rbl_book.h>
@@ -21,8 +24,24 @@ struct RSolverCartesianVector
 
 };
 
+//! One model frame which the native writer has completely persisted.
+//! mode is zero-based and is -1 when the analysis has no mode index.
+struct RSolverResultFrame
+{
+    QString actualRecordPath;
+    QString logicalPath;
+    uint recordNo = 0;
+    double checkpointTime = 0.0;
+    QString nativeAnalysis;
+    int mode = -1;
+};
+
 class RSolverGeneric
 {
+
+    public:
+
+        using ResultFrameObserver = std::function<void(const RSolverResultFrame &)>;
 
     protected:
 
@@ -69,6 +88,10 @@ class RSolverGeneric
         //! Propagate configured monitoring-file write failures to a parent
         //! transient task transaction instead of logging and continuing.
         bool monitoringOutputFailuresAreFatal;
+        //! Optional observer for complete native model-frame writes.
+        ResultFrameObserver resultFrameObserver;
+        //! A frame is dispatched only after any structural step transaction commits.
+        std::optional<RSolverResultFrame> pendingResultFrame;
         //! Task iteration counter.
         uint taskIteration;
         //! Computable elements array.
@@ -103,7 +126,17 @@ class RSolverGeneric
         void setMonitoringOutputFailuresAreFatal(bool fatal);
 
         //! Publish the result accumulated while deferred writes were enabled.
+        //! An enclosing RSolver task transaction dispatches its queued observer
+        //! only after the transaction commits.
         void publishDeferredResults();
+
+        //! Observe only frames written by RModel::write, after persistence.
+        void setResultFrameObserver(ResultFrameObserver observer);
+
+        //! Dispatch or discard the one frame queued by the most recent write.
+        //! RSolver calls these after its enclosing output transaction resolves.
+        void publishResultFrameObserver();
+        void discardPendingResultFrameObserver();
 
         //! Get mesh changed.
         bool getMeshChanged() const;

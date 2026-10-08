@@ -26,6 +26,7 @@ class RSolver
             std::function<RStructuralControlDecision(const RStructuralControlObservation &)>;
         using StructuralControlStepObserver =
             std::function<void(const RStructuralControlStepRecord &)>;
+        using ResultFrameObserver = std::function<void(const RSolverResultFrame &)>;
 
         enum class ExecutionPolicy
         {
@@ -110,6 +111,11 @@ class RSolver
         //! the already committed model artifact.
         void setStructuralControlStepObserver(StructuralControlStepObserver observer);
         std::vector<RStructuralControlChannelSample> getStructuralControlSamples() const;
+
+        //! Observe actual model-result frames after the native file write completes.
+        //! Callback is synchronous on the solver owner thread; observer failures
+        //! are diagnostic only and cannot change solver success.
+        void setResultFrameObserver(ResultFrameObserver observer);
 
     protected:
 

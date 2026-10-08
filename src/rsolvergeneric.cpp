@@ -4,6 +4,7 @@
 #include <exception>
 #include <memory>
 #include <omp.h>
+#include <utility>
 
 #include <rbl_application_state.h>
 
@@ -106,6 +107,7 @@ void RSolverGeneric::run(bool firstExecution, uint taskIteration)
             this->scales.upscale(*this->pModel);
 
             this->writeResults();
+            this->publishResultFrameObserver();
             this->statistics();
 
             RLogger::unindent();
@@ -156,6 +158,7 @@ void RSolverGeneric::run(bool firstExecution, uint taskIteration)
             this->scales.upscale(*this->pModel);
 
             this->writeResults();
+            this->publishResultFrameObserver();
             this->statistics();
 
             RLogger::unindent();
@@ -234,11 +237,15 @@ void RSolverGeneric::run(bool firstExecution, uint taskIteration)
             {
                 this->commitStepTransaction();
             }
+            this->publishResultFrameObserver();
         }
         catch (...)
         {
             if (structuralDynamics)
             {
+                // The native frame may have been written, but a failed step
+                // never exposes its queued notice as accepted live data.
+                this->pendingResultFrame.reset();
                 const std::exception_ptr originalFailure = std::current_exception();
                 try
                 {
@@ -636,6 +643,7 @@ void RSolverGeneric::recoverSharedData()
 
 void RSolverGeneric::writeResults()
 {
+    this->pendingResultFrame.reset();
     if (this->resultWritesDeferred || this->modelFileName.isEmpty())
     {
         return;
@@ -660,7 +668,52 @@ void RSolverGeneric::writeResults()
 
     if (canWrite)
     {
+        QStringList paths;
+        if (this->resultFrameObserver)
+        {
+            paths = this->pModel->nativeWritePaths(this->modelFileName);
+        }
         this->modelFileName = this->pModel->write(this->modelFileName);
+        if (this->resultFrameObserver && !paths.isEmpty())
+        {
+            RSolverResultFrame frame;
+            frame.actualRecordPath = QFileInfo(paths.first()).absoluteFilePath();
+            frame.logicalPath = QFileInfo(this->modelFileName).absoluteFilePath();
+            const RTimeSolver &timeSolver = this->pModel->getTimeSolver();
+            if (harmonicAcoustics)
+            {
+                frame.recordNo = this->pModel->getProblemSetup()
+                                     .getAcousticSetup().getFrequencyIndex()+1;
+                frame.nativeAnalysis = QStringLiteral("harmonic");
+            }
+            else if (timeSolver.getEnabled())
+            {
+                frame.recordNo = timeSolver.getCurrentTimeStep()+1;
+                frame.nativeAnalysis = QStringLiteral("transient");
+                frame.checkpointTime = timeSolver.getComputedTime();
+                if (this->problemType == R_PROBLEM_STRESS &&
+                    this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled())
+                {
+                    const RStructuralDynamicsRestartData &checkpoint =
+                        this->pModel->getProblemSetup().getStructuralDynamicsRestartData();
+                    if (checkpoint.available)
+                    {
+                        frame.checkpointTime = checkpoint.time;
+                    }
+                }
+            }
+            else if (this->problemType == R_PROBLEM_STRESS_MODAL)
+            {
+                frame.mode = int(this->pModel->getProblemSetup().getModalSetup().getMode());
+                frame.recordNo = uint(frame.mode+1);
+                frame.nativeAnalysis = QStringLiteral("modal");
+            }
+            else
+            {
+                frame.nativeAnalysis = QStringLiteral("static");
+            }
+            this->pendingResultFrame = std::move(frame);
+        }
     }
 }
 
@@ -688,6 +741,48 @@ void RSolverGeneric::publishDeferredResults()
         throw;
     }
     this->resultWritesDeferred = wasDeferred;
+}
+
+void RSolverGeneric::setResultFrameObserver(
+    std::function<void(const RSolverResultFrame &)> observer)
+{
+    this->resultFrameObserver = std::move(observer);
+    if (!this->resultFrameObserver)
+    {
+        this->pendingResultFrame.reset();
+    }
+}
+
+void RSolverGeneric::publishResultFrameObserver()
+{
+    if (!this->pendingResultFrame)
+    {
+        return;
+    }
+    RSolverResultFrame frame = std::move(*this->pendingResultFrame);
+    this->pendingResultFrame.reset();
+    if (!this->resultFrameObserver)
+    {
+        return;
+    }
+    try
+    {
+        this->resultFrameObserver(frame);
+    }
+    catch (const std::exception &error)
+    {
+        RLogger::warning("Native result-frame observer failed after publication: %s\n",
+                         error.what());
+    }
+    catch (...)
+    {
+        RLogger::warning("Native result-frame observer failed after publication with an unknown error.\n");
+    }
+}
+
+void RSolverGeneric::discardPendingResultFrameObserver()
+{
+    this->pendingResultFrame.reset();
 }
 
 void RSolverGeneric::applyDisplacement()
