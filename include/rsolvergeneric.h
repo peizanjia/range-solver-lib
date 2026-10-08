@@ -42,6 +42,9 @@ class RSolverGeneric
     public:
 
         using ResultFrameObserver = std::function<void(const RSolverResultFrame &)>;
+        //! Synchronous notification after a complete structural-dynamics
+        //! step transaction has committed. Exceptions stop the next step.
+        using AcceptedStructuralStepObserver = std::function<void(const RModel &)>;
 
     protected:
 
@@ -90,6 +93,8 @@ class RSolverGeneric
         bool monitoringOutputFailuresAreFatal;
         //! Optional observer for complete native model-frame writes.
         ResultFrameObserver resultFrameObserver;
+        //! Observer for each fully committed structural-dynamics step.
+        AcceptedStructuralStepObserver acceptedStructuralStepObserver;
         //! A frame is dispatched only after any structural step transaction commits.
         std::optional<RSolverResultFrame> pendingResultFrame;
         //! Task iteration counter.
@@ -132,6 +137,10 @@ class RSolverGeneric
 
         //! Observe only frames written by RModel::write, after persistence.
         void setResultFrameObserver(ResultFrameObserver observer);
+
+        //! Observe each committed structural-dynamics step, independently of
+        //! display output frequency. Exceptions propagate after acceptance.
+        void setAcceptedStructuralStepObserver(AcceptedStructuralStepObserver observer);
 
         //! Dispatch or discard the one frame queued by the most recent write.
         //! RSolver calls these after its enclosing output transaction resolves.

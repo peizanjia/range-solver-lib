@@ -295,6 +295,14 @@ void RSolverGeneric::run(bool firstExecution, uint taskIteration)
             }
             throw;
         }
+
+        // Checkpoint publication follows a complete accepted transaction. A
+        // failed publication stops before the next trial without rolling the
+        // already accepted in-memory state back.
+        if (structuralDynamics && this->acceptedStructuralStepObserver)
+        {
+            this->acceptedStructuralStepObserver(*this->pModel);
+        }
     }
 
     this->meshChanged = (this->problemType == R_PROBLEM_MESH);
@@ -751,6 +759,12 @@ void RSolverGeneric::setResultFrameObserver(
     {
         this->pendingResultFrame.reset();
     }
+}
+
+void RSolverGeneric::setAcceptedStructuralStepObserver(
+    AcceptedStructuralStepObserver observer)
+{
+    this->acceptedStructuralStepObserver = std::move(observer);
 }
 
 void RSolverGeneric::publishResultFrameObserver()

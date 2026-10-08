@@ -27,6 +27,7 @@ class RSolver
         using StructuralControlStepObserver =
             std::function<void(const RStructuralControlStepRecord &)>;
         using ResultFrameObserver = std::function<void(const RSolverResultFrame &)>;
+        using AcceptedStructuralStepObserver = std::function<void(const RModel &)>;
 
         enum class ExecutionPolicy
         {
@@ -57,6 +58,7 @@ class RSolver
         QString structuralControllerRevision;
         StructuralControlCallback structuralControlCallback;
         StructuralControlStepObserver structuralControlStepObserver;
+        AcceptedStructuralStepObserver acceptedStructuralStepObserver;
 
     private:
 
@@ -116,6 +118,10 @@ class RSolver
         //! Callback is synchronous on the solver owner thread; observer failures
         //! are diagnostic only and cannot change solver success.
         void setResultFrameObserver(ResultFrameObserver observer);
+
+        //! Observe each fully accepted structural-dynamics step, independent
+        //! of result display frequency. Observer failures stop subsequent steps.
+        void setAcceptedStructuralStepObserver(AcceptedStructuralStepObserver observer);
 
     protected:
 

@@ -1073,6 +1073,35 @@ void RSolver::setResultFrameObserver(ResultFrameObserver observer)
     }
 }
 
+void RSolver::setAcceptedStructuralStepObserver(
+    AcceptedStructuralStepObserver observer)
+{
+    if (observer)
+    {
+        const RProblemTypeMask taskMask = this->pModel->getProblemTaskTree().getProblemTypeMask();
+        if (!this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled() ||
+            taskMask != R_PROBLEM_STRESS)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Accepted structural-step observers require a stress-only structural-dynamics task.");
+        }
+        auto it = this->solvers.find(R_PROBLEM_STRESS);
+        if (it == this->solvers.end())
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Accepted structural-step observer has no structural stress solver.");
+        }
+        it.value()->setAcceptedStructuralStepObserver(observer);
+    }
+    else
+    {
+        auto it = this->solvers.find(R_PROBLEM_STRESS);
+        if (it != this->solvers.end())
+            it.value()->setAcceptedStructuralStepObserver({});
+    }
+    this->acceptedStructuralStepObserver = std::move(observer);
+}
+
 void RSolver::run()
 {
     const RProblemTaskItem &taskTree = this->pModel->getProblemTaskTree();
@@ -1092,6 +1121,13 @@ void RSolver::run()
                      "Transactional Heat->Stress task publication supports one root iteration.");
     }
     const RProblemTypeMask taskMask = taskTree.getProblemTypeMask();
+    if (this->acceptedStructuralStepObserver &&
+        (!this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled() ||
+         taskMask != R_PROBLEM_STRESS))
+    {
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Accepted structural-step observers require a stress-only structural-dynamics task.");
+    }
     if (this->pModel->getTimeSolver().getEnabled() &&
         (taskMask & R_PROBLEM_HEAT) && (taskMask & R_PROBLEM_STRESS) &&
         !transactionalHeatStress)

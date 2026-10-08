@@ -11,12 +11,34 @@ class TestStructuralControlConditioner : public QObject
     Q_OBJECT
 
 private slots:
+    void defaultPolicyPreservesRequestedPhysicalCommandExactly();
     void delayAndZeroOrderHold();
     void deterministicNoiseAndRejectedTrialReplay();
     void multipleChannelsAndStateRoundTrip();
     void rejectsChangedConfigurationAndMalformedState();
     void compositeEnvelopeRoundTripAndValidation();
 };
+
+void TestStructuralControlConditioner::defaultPolicyPreservesRequestedPhysicalCommandExactly()
+{
+    RStructuralControlConditioner conditioner(31,{{QStringLiteral("force"),0,1,0.0}});
+    auto state = conditioner.initialState();
+    const double analyticCommands[] = {0.0,0.125,-0.5,1024.0,-1.0/3.0};
+    for (size_t i=0;i<std::size(analyticCommands);++i)
+    {
+        const auto result = conditioner.advance(state,{{QStringLiteral("force"),analyticCommands[i]}});
+        QCOMPARE(result.appliedCommands.size(),size_t(1));
+        QCOMPARE(result.appliedCommands.front().value,analyticCommands[i]);
+        QCOMPARE(result.candidate.heldCommands,std::vector<double>{analyticCommands[i]});
+        QCOMPARE(result.candidate.completedSteps,quint64(i+1));
+        QCOMPARE(result.candidate.delayedCommands.size(),size_t(1));
+        QVERIFY(result.candidate.delayedCommands.front().empty());
+        const auto roundTrip=conditioner.deserialize(conditioner.serialize(result.candidate));
+        QCOMPARE(roundTrip.heldCommands,result.candidate.heldCommands);
+        QCOMPARE(roundTrip.completedSteps,result.candidate.completedSteps);
+        state=result.candidate;
+    }
+}
 
 void TestStructuralControlConditioner::delayAndZeroOrderHold()
 {

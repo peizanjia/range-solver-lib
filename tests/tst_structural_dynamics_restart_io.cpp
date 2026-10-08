@@ -7,6 +7,7 @@
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -116,7 +117,8 @@ void addMovingSupport(RModel &model)
 bool solve(RModel &model, QString &error,
            std::vector<RStructuralSupportSample> *lastSupport = nullptr,
            std::vector<std::vector<RStructuralSupportSample>> *history = nullptr,
-           const QString &outputPath = QString())
+           const QString &outputPath = QString(),
+           RSolver::AcceptedStructuralStepObserver acceptedStepObserver = {})
 {
     error.clear();
     try
@@ -130,6 +132,8 @@ bool solve(RModel &model, QString &error,
                     if (history) history->push_back(samples);
                 });
         }
+        if (acceptedStepObserver)
+            solver.setAcceptedStructuralStepObserver(std::move(acceptedStepObserver));
         solver.run();
         if (lastSupport) *lastSupport = solver.getStructuralSupportSamples();
         return true;
@@ -225,6 +229,8 @@ private slots:
     void supportResponseRejectsMissingLedger_data();
     void supportResponseRejectsMissingLedger();
     void supportResponseLateWriteFailureRollsBack();
+    void acceptedStructuralObserverIgnoresOutputFrequency();
+    void acceptedStructuralObserverFailureStopsAfterCommittedStep();
     void movingSupportDiskRestartMatchesUninterrupted_data();
     void movingSupportDiskRestartMatchesUninterrupted();
     void movingSupportRejectsChangedKnot();
@@ -542,11 +548,18 @@ void TestStructuralDynamicsRestartIO::supportResponseLateWriteFailureRollsBack()
     model.getProblemSetup().getStructuralDynamicsSetup().setNSteps(1);
     std::vector<RStructuralSupportSample> failedTrialSamples;
     std::vector<std::vector<RStructuralSupportSample>> notifications;
+    std::vector<uint> checkpointNotifications;
     QVERIFY2(!solve(model,error,&failedTrialSamples,&notifications,
-                    blockerPath+"/rejected.rbm"),
+                    blockerPath+"/rejected.rbm",
+                    [&checkpointNotifications](const RModel &acceptedModel)
+                    {
+                        checkpointNotifications.push_back(acceptedModel.getProblemSetup()
+                            .getStructuralDynamicsRestartData().completedSteps);
+                    }),
              "A failed result-file publication accepted the trial step.");
     QVERIFY2(!error.isEmpty(),"Late write failure had no diagnostic.");
     QVERIFY(notifications.empty());
+    QVERIFY(checkpointNotifications.empty());
     const RStructuralDynamicsRestartData &after = model.getProblemSetup()
         .getStructuralDynamicsRestartData();
     QCOMPARE(after.completedSteps,accepted.completedSteps);
@@ -557,6 +570,84 @@ void TestStructuralDynamicsRestartIO::supportResponseLateWriteFailureRollsBack()
     QCOMPARE(after.supportPowers,accepted.supportPowers);
     QCOMPARE(after.cumulativeSupportWork,accepted.cumulativeSupportWork);
     QCOMPARE(model.getTimeSolver().getCurrentTime(),accepted.time);
+}
+
+void TestStructuralDynamicsRestartIO::acceptedStructuralObserverIgnoresOutputFrequency()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    std::vector<RStructuralDynamicsRestartData> everyStep, sparseOutput;
+    auto run = [&](uint outputFrequency,
+                   std::vector<RStructuralDynamicsRestartData> &states,
+                   const QString &name)
+    {
+        RModel model = makeTruss(8);
+        model.getProblemSetup().getStructuralDynamicsSetup()
+             .setOutputFrequency(outputFrequency);
+        QString error;
+        return solve(model,error,nullptr,nullptr,directory.filePath(name),
+            [&states](const RModel &acceptedModel)
+            {
+                states.push_back(acceptedModel.getProblemSetup()
+                    .getStructuralDynamicsRestartData());
+            });
+    };
+    QVERIFY(run(1,everyStep,QStringLiteral("frequency-one.rbm")));
+    QVERIFY(run(3,sparseOutput,QStringLiteral("frequency-three.rbm")));
+    QCOMPARE(everyStep.size(),std::size_t(8));
+    QCOMPARE(sparseOutput.size(),everyStep.size());
+    const double omega = std::sqrt(3.0*youngModulus/(density*length*length));
+    const double qScale = initialDisplacement;
+    const double vScale = initialDisplacement*omega;
+    const double aScale = initialDisplacement*omega*omega;
+    const double energyScale = 0.5*(youngModulus*area/length)*
+                               initialDisplacement*initialDisplacement;
+    for (std::size_t step=0;step<everyStep.size();++step)
+    {
+        const auto &dense = everyStep[step];
+        const auto &sparse = sparseOutput[step];
+        QCOMPARE(dense.completedSteps,uint(step+1));
+        QCOMPARE(sparse.completedSteps,dense.completedSteps);
+        QCOMPARE(sparse.systemFingerprint,dense.systemFingerprint);
+        QCOMPARE(sparse.controlControllerState,dense.controlControllerState);
+        QCOMPARE(sparse.cumulativeControlWork,dense.cumulativeControlWork);
+        QCOMPARE(sparse.q.size(),dense.q.size());
+        QCOMPARE(sparse.v.size(),dense.v.size());
+        QCOMPARE(sparse.a.size(),dense.a.size());
+        for (std::size_t i=0;i<dense.q.size();++i)
+        {
+            QVERIFY(closeAtPhysicalScale(sparse.q[i],dense.q[i],qScale));
+            QVERIFY(closeAtPhysicalScale(sparse.v[i],dense.v[i],vScale));
+            QVERIFY(closeAtPhysicalScale(sparse.a[i],dense.a[i],aScale));
+        }
+        QVERIFY(closeAtPhysicalScale(sparse.cumulativeExternalWork,
+                                     dense.cumulativeExternalWork,energyScale));
+        QVERIFY(closeAtPhysicalScale(sparse.cumulativeDampingDissipation,
+                                     dense.cumulativeDampingDissipation,energyScale));
+    }
+}
+
+void TestStructuralDynamicsRestartIO::acceptedStructuralObserverFailureStopsAfterCommittedStep()
+{
+    RModel model = makeTruss(5);
+    uint calls = 0;
+    QString error;
+    QVERIFY2(!solve(model,error,nullptr,nullptr,QString(),
+                    [&calls](const RModel &acceptedModel)
+                    {
+                        ++calls;
+                        if (acceptedModel.getProblemSetup().getStructuralDynamicsRestartData()
+                                .completedSteps == 2)
+                            throw std::runtime_error("injected accepted-checkpoint disk failure");
+                    }),
+             "A failed accepted-checkpoint write allowed the run to continue.");
+    QVERIFY(error.contains(QStringLiteral("disk failure"),Qt::CaseInsensitive));
+    QCOMPARE(calls,uint(2));
+    const auto &accepted = model.getProblemSetup().getStructuralDynamicsRestartData();
+    QVERIFY(accepted.available);
+    QCOMPARE(accepted.completedSteps,2u);
+    QCOMPARE(model.getTimeSolver().getCurrentTimeStep()+1,2u);
+    QCOMPARE(model.getTimeSolver().getComputedTime(),accepted.time);
 }
 
 void TestStructuralDynamicsRestartIO::movingSupportDiskRestartMatchesUninterrupted_data()
