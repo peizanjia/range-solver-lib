@@ -5,8 +5,10 @@
 #include <QString>
 
 #include <vector>
+#include <optional>
 
 #include "rstructural_control_force_map.h"
+#include "rstructural_control_runtime_parameters.h"
 
 //! Physical-unit, stable-ID observations at an accepted solver boundary.
 struct RStructuralControlSensorSample
@@ -25,6 +27,8 @@ struct RStructuralControlObservation
     //! State after the previous accepted interval; callbacks must not mutate
     //! external state because the same observation may be replayed on retry.
     QByteArray priorControllerState;
+    QByteArray priorRuntimeParametersState;
+    quint64 acceptedSeq = 0;
 };
 
 struct RStructuralControlDecision
@@ -33,6 +37,10 @@ struct RStructuralControlDecision
     std::vector<RStructuralControlCommand> requestedCommands;
     //! Candidate state, published only after the result step commits.
     QByteArray nextControllerState;
+    //! Canonical revision-zero bootstrap, only while no runtime state exists.
+    QByteArray initialRuntimeParametersState;
+    std::optional<RStructuralControlRuntimeParameters::Parameters> runtimeParameterCandidate;
+    QString runtimeParameterProposalId;
 };
 
 struct RStructuralControlStepRecord
@@ -45,6 +53,9 @@ struct RStructuralControlStepRecord
     std::vector<RStructuralControlCommand> conditionedCommands;
     std::vector<RStructuralControlChannelSample> appliedChannels;
     QByteArray controllerStateSha256;
+    //! Authoritative accepted snapshot, filled only after the step commits.
+    QByteArray runtimeParametersState;
+    quint64 appliedSeq = 0;
 };
 
 #endif // RSTRUCTURAL_CONTROL_PROTOCOL_H

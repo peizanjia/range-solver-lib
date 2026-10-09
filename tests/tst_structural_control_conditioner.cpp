@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "rstructural_control_conditioner.h"
+#include "rstructural_control_runtime_parameters.h"
 
 class TestStructuralControlConditioner : public QObject
 {
@@ -17,6 +18,7 @@ private slots:
     void multipleChannelsAndStateRoundTrip();
     void rejectsChangedConfigurationAndMalformedState();
     void compositeEnvelopeRoundTripAndValidation();
+    void compositeV2RuntimeComponentPreservesLegacyBytesAndRejectsCorruption();
 };
 
 void TestStructuralControlConditioner::defaultPolicyPreservesRequestedPhysicalCommandExactly()
@@ -149,6 +151,36 @@ void TestStructuralControlConditioner::compositeEnvelopeRoundTripAndValidation()
              QByteArray());
     envelope.controllerState = QByteArray(1048576,'x');
     QVERIFY_EXCEPTION_THROWN(envelope.serialize(),std::invalid_argument);
+}
+
+void TestStructuralControlConditioner::compositeV2RuntimeComponentPreservesLegacyBytesAndRejectsCorruption()
+{
+    RStructuralControlStateEnvelope envelope{QByteArray("a"), QByteArray("bc")};
+    const QByteArray v1 = QByteArray::fromHex("52434345010000000100000061020000006263");
+    QCOMPARE(envelope.serialize(), v1);
+    QCOMPARE(RStructuralControlStateEnvelope::deserialize(v1).serialize(), v1);
+    namespace Parameters = RStructuralControlRuntimeParameters;
+    envelope.runtimeParametersState = Parameters::serialize(Parameters::fresh(
+        QString(64, QLatin1Char('a')), 125.0, {{QStringLiteral("force"), -100.0, 100.0, 0.0}}));
+    const QByteArray v2 = envelope.serialize();
+    QCOMPARE(v2.mid(4, 4), QByteArray::fromHex("02000000"));
+    const auto restored = RStructuralControlStateEnvelope::deserialize(v2);
+    QCOMPARE(restored.controllerState, envelope.controllerState);
+    QCOMPARE(restored.conditionerState, envelope.conditionerState);
+    QCOMPARE(restored.runtimeParametersState, envelope.runtimeParametersState);
+    QCOMPARE(restored.serialize(), v2);
+    QVERIFY_EXCEPTION_THROWN(RStructuralControlStateEnvelope::deserialize(v2.left(v2.size()-1)), std::invalid_argument);
+    QVERIFY_EXCEPTION_THROWN(RStructuralControlStateEnvelope::deserialize(v2 + 'x'), std::invalid_argument);
+    QByteArray unsupported = v2;
+    unsupported[4] = 3;
+    QVERIFY_EXCEPTION_THROWN(RStructuralControlStateEnvelope::deserialize(unsupported), std::invalid_argument);
+    QByteArray forged = v2;
+    forged[forged.size()-2] = 'x';
+    QVERIFY_EXCEPTION_THROWN(RStructuralControlStateEnvelope::deserialize(forged), std::invalid_argument);
+    envelope.runtimeParametersState = QByteArray("{}");
+    QVERIFY_EXCEPTION_THROWN(envelope.serialize(), std::invalid_argument);
+    envelope.runtimeParametersState.clear();
+    QCOMPARE(envelope.serialize(), v1);
 }
 
 QTEST_APPLESS_MAIN(TestStructuralControlConditioner)

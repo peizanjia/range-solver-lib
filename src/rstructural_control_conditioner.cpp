@@ -1,4 +1,5 @@
 #include "rstructural_control_conditioner.h"
+#include "rstructural_control_runtime_parameters.h"
 
 #include <QCryptographicHash>
 #include <QSet>
@@ -264,16 +265,27 @@ RStructuralControlConditioner::State RStructuralControlConditioner::deserialize(
 
 QByteArray RStructuralControlStateEnvelope::serialize() const
 {
+    const bool hasRuntimeParameters = !this->runtimeParametersState.isEmpty();
+    const qsizetype overhead = hasRuntimeParameters ? 20 : 16;
     if (this->controllerState.size() > maxStateBytes ||
         this->conditionerState.size() > maxStateBytes ||
-        this->controllerState.size() + this->conditionerState.size() > maxStateBytes-16)
+        this->runtimeParametersState.size() > RStructuralControlRuntimeParameters::maximumStateBytes ||
+        this->controllerState.size() + this->conditionerState.size()
+            + this->runtimeParametersState.size() > maxStateBytes-overhead)
         throw std::invalid_argument("Composite structural control state exceeds 1 MiB");
+    if (hasRuntimeParameters)
+        RStructuralControlRuntimeParameters::deserialize(this->runtimeParametersState);
     QByteArray result("RCCE",4);
-    appendU32(result,1);
+    appendU32(result,hasRuntimeParameters ? 2 : 1);
     appendU32(result,quint32(this->controllerState.size()));
     result.append(this->controllerState);
     appendU32(result,quint32(this->conditionerState.size()));
     result.append(this->conditionerState);
+    if (hasRuntimeParameters)
+    {
+        appendU32(result,quint32(this->runtimeParametersState.size()));
+        result.append(this->runtimeParametersState);
+    }
     return result;
 }
 
@@ -283,13 +295,24 @@ RStructuralControlStateEnvelope RStructuralControlStateEnvelope::deserialize(
     if (bytes.size() > maxStateBytes)
         throw std::invalid_argument("Composite structural control state exceeds 1 MiB");
     Reader input{bytes};
-    if (input.take(4) != QByteArray("RCCE",4) || input.u32() != 1)
+    if (input.take(4) != QByteArray("RCCE",4))
+        throw std::invalid_argument("Unsupported composite structural control state version");
+    const uint version = input.u32();
+    if (version != 1 && version != 2)
         throw std::invalid_argument("Unsupported composite structural control state version");
     RStructuralControlStateEnvelope result;
     const uint controllerSize = input.u32();
     result.controllerState = input.take(controllerSize);
     const uint conditionerSize = input.u32();
     result.conditionerState = input.take(conditionerSize);
+    if (version == 2)
+    {
+        const uint runtimeSize = input.u32();
+        if (runtimeSize == 0 || runtimeSize > RStructuralControlRuntimeParameters::maximumStateBytes)
+            throw std::invalid_argument("Invalid composite runtime parameter component size");
+        result.runtimeParametersState = input.take(runtimeSize);
+        RStructuralControlRuntimeParameters::deserialize(result.runtimeParametersState);
+    }
     input.finish();
     return result;
 }

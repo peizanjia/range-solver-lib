@@ -578,6 +578,8 @@ struct RSolverStress::DynamicsStepSnapshot
     RRVector activeControlForce;
     QByteArray acceptedControllerState;
     QByteArray candidateControllerState;
+    QByteArray acceptedRuntimeParametersState;
+    QByteArray candidateRuntimeParametersState;
     RStructuralControlStepRecord trialControlRecord;
     std::vector<ControlSensorMap> controlSensors;
     RStructuralCableDynamicsResult structuralCableDynamicsResult;
@@ -622,6 +624,17 @@ bool sameControlTimeSolver(const RTimeSolver &left,const RTimeSolver &right)
         left.getCurrentTimeStep()==right.getCurrentTimeStep() &&
         left.getComputedTime()==right.getComputedTime() &&
         left.getOutputFrequency()==right.getOutputFrequency();
+}
+
+bool sameControlDynamicsSetup(const RStructuralDynamicsSetup &left, const RStructuralDynamicsSetup &right)
+{
+    return left.getEnabled() == right.getEnabled() && left.getMethod() == right.getMethod()
+        && left.getTimeStep() == right.getTimeStep() && left.getNSteps() == right.getNSteps()
+        && left.getOutputFrequency() == right.getOutputFrequency()
+        && left.getRayleighAlpha() == right.getRayleighAlpha() && left.getRayleighBeta() == right.getRayleighBeta()
+        && left.getRhoInfinity() == right.getRhoInfinity() && left.getNewmarkGamma() == right.getNewmarkGamma()
+        && left.getNewmarkBeta() == right.getNewmarkBeta()
+        && left.getModalDampingRatios() == right.getModalDampingRatios();
 }
 
 bool sameControlSetup(const RStructuralControlSetup &left,
@@ -931,6 +944,8 @@ void RSolverStress::beginStepTransaction()
     snapshot->activeControlForce = this->activeControlForce;
     snapshot->acceptedControllerState = this->acceptedControllerState;
     snapshot->candidateControllerState = this->candidateControllerState;
+    snapshot->acceptedRuntimeParametersState = this->acceptedRuntimeParametersState;
+    snapshot->candidateRuntimeParametersState = this->candidateRuntimeParametersState;
     snapshot->trialControlRecord = this->trialControlRecord;
     snapshot->controlSensors = this->controlSensors;
     snapshot->structuralCableDynamicsResult = this->structuralCableDynamicsResult;
@@ -1009,6 +1024,8 @@ void RSolverStress::rollbackStepTransaction()
     this->activeControlForce = snapshot.activeControlForce;
     this->acceptedControllerState = snapshot.acceptedControllerState;
     this->candidateControllerState = snapshot.candidateControllerState;
+    this->acceptedRuntimeParametersState = snapshot.acceptedRuntimeParametersState;
+    this->candidateRuntimeParametersState = snapshot.candidateRuntimeParametersState;
     this->trialControlRecord = snapshot.trialControlRecord;
     this->controlSensors = snapshot.controlSensors;
     this->structuralCableDynamicsResult = snapshot.structuralCableDynamicsResult;
@@ -1029,6 +1046,9 @@ void RSolverStress::commitStepTransaction()
         this->controlLedger->accept();
         this->acceptedControllerState = std::move(this->candidateControllerState);
         this->acceptedConditionerState = std::move(this->candidateConditionerState);
+        this->acceptedRuntimeParametersState = std::move(this->candidateRuntimeParametersState);
+        this->trialControlRecord.runtimeParametersState = this->acceptedRuntimeParametersState;
+        this->trialControlRecord.appliedSeq = this->acceptedConditionerState.completedSteps;
     }
     this->acceptedSupportSamples = std::move(this->trialSupportSamples);
     this->trialSupportSamples.clear();
@@ -1435,6 +1455,18 @@ void RSolverStress::recover()
 
 void RSolverStress::prepare()
 {
+    const auto &restart = this->pModel->getProblemSetup().getStructuralDynamicsRestartData();
+    if (this->pModel->getProblemSetup().getRestart() && !restart.controlControllerState.isEmpty())
+    {
+        const auto envelope = RStructuralControlStateEnvelope::deserialize(restart.controlControllerState);
+        if (!envelope.runtimeParametersState.isEmpty() &&
+            (this->isStructuralCableDynamicsMode() || this->isSpecializedStaticTrussMode() ||
+             !this->pModel->getProblemSetup().getStructuralControlSetup().enabled ||
+             !this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled() ||
+             this->problemType != R_PROBLEM_STRESS))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Runtime parameter checkpoint requires enabled linear Newmark control.");
+    }
     if (this->isStructuralCableDynamicsMode())
     {
         RStructuralCableModelAdapter::validate(*this->pModel);
@@ -2582,12 +2614,18 @@ void RSolverStress::solveStructuralCableDynamics()
 
         const RTimeSolver frozenTimeSolver = this->pModel->getTimeSolver();
         const RStructuralControlSetup frozenControlSetup = controlSetup;
+        const RStructuralDynamicsSetup frozenDynamicsSetup = this->pModel->getProblemSetup().getStructuralDynamicsSetup();
         const RResults frozenResults = *this->pModel;
         const RStructuralControlDecision decision = this->controlCallback(observation);
+        if (!decision.initialRuntimeParametersState.isEmpty() ||
+            decision.runtimeParameterCandidate || !decision.runtimeParameterProposalId.isEmpty())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Runtime control parameters are unsupported in cable dynamics.");
         if (!sameControlResults(frozenResults,*this->pModel))
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                          "Cable control callback changed the frozen result fields.");
         if (!sameControlTimeSolver(frozenTimeSolver,this->pModel->getTimeSolver()) ||
+            !sameControlDynamicsSetup(frozenDynamicsSetup,this->pModel->getProblemSetup().getStructuralDynamicsSetup()) ||
             !sameControlSetup(frozenControlSetup,
                 this->pModel->getProblemSetup().getStructuralControlSetup()))
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
@@ -3290,6 +3328,9 @@ void RSolverStress::prepareCableControlMapping()
         this->controlLedger->restore(samples);
         const RStructuralControlStateEnvelope envelope =
             RStructuralControlStateEnvelope::deserialize(restartData.controlControllerState);
+        if (!envelope.runtimeParametersState.isEmpty())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Cable restart cannot restore runtime control parameters.");
         this->acceptedControllerState = envelope.controllerState;
         this->candidateControllerState = this->acceptedControllerState;
         this->acceptedConditionerState = this->controlConditioner->deserialize(
@@ -3302,6 +3343,95 @@ void RSolverStress::prepareCableControlMapping()
         this->controlForceMap->addForce(this->activeControlCommands,
                                         this->activeControlForce);
     }
+}
+
+std::vector<RStructuralControlRuntimeParameters::AppliedForceInterval>
+RSolverStress::validateRuntimeParameters(
+    const RStructuralControlRuntimeParameters::Parameters &parameters,double physicalDt) const
+{
+    const auto &setup = this->pModel->getProblemSetup();
+    const auto &catalog = setup.getStructuralInteractionSetup();
+    if (this->isStructuralCableDynamicsMode() ||
+        setup.getStructuralDynamicsSetup().getMethod() != RStructuralTimeIntegrationMethod::Newmark ||
+        parameters.fixedBaseControllerRevision != this->controllerRevision ||
+        catalog.getSensors().empty())
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Runtime control parameters require linear Newmark velocity control and the fixed base controller revision.");
+    for (const auto &sensor : catalog.getSensors())
+        if (sensor.quantity != RStructuralSensorQuantity::Velocity ||
+            sensor.unit != RStructuralInteractionSetup::getSensorUnit(RStructuralSensorQuantity::Velocity))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Runtime control parameters require physical velocity sensors.");
+    std::vector<RStructuralControlRuntimeParameters::ActuatorLimit> limits;
+    for (const auto &actuator : catalog.getActuators())
+    {
+        if (actuator.type != RStructuralActuatorType::NodalForce ||
+            std::isnan(actuator.minimum) || std::isnan(actuator.maximum) ||
+            actuator.minimum > actuator.maximum || actuator.rateLimit <= 0.0 ||
+            std::isnan(actuator.rateLimit))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Runtime control parameters require NodalForce bounds and a positive or unlimited model rate.");
+        const double largest = std::numeric_limits<double>::max();
+        limits.push_back({actuator.id,std::max(-largest,actuator.minimum),
+                          std::min(largest,actuator.maximum),
+                          std::isinf(actuator.rateLimit) ? 0.0 : actuator.rateLimit});
+    }
+    QMap<QString,double> previous;
+    for (const auto &sample : this->controlLedger->accepted())
+        previous.insert(sample.actuatorId,sample.command);
+    return RStructuralControlRuntimeParameters::validateCandidateAgainstBase(
+        parameters,limits,previous,physicalDt);
+}
+
+std::vector<RStructuralControlRuntimeParameters::AppliedForceInterval>
+RSolverStress::prepareRuntimeParameters(const RStructuralControlDecision &decision,
+                                       const RStructuralControlObservation &observation)
+{
+    namespace Runtime = RStructuralControlRuntimeParameters;
+    this->candidateRuntimeParametersState = this->acceptedRuntimeParametersState;
+    if (!decision.initialRuntimeParametersState.isEmpty())
+    {
+        if (!this->acceptedRuntimeParametersState.isEmpty())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Runtime parameters cannot replace an existing accepted state with a bootstrap.");
+        const Runtime::State initial = Runtime::deserialize(decision.initialRuntimeParametersState);
+        if (initial.parameters.revision != 0 || !initial.history.empty())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Runtime parameter bootstrap must be canonical fresh revision zero without history.");
+        this->candidateRuntimeParametersState = decision.initialRuntimeParametersState;
+    }
+    if (this->candidateRuntimeParametersState.isEmpty())
+    {
+        if (decision.runtimeParameterCandidate || !decision.runtimeParameterProposalId.isEmpty())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Runtime parameter update requires a revision-zero bootstrap or accepted state.");
+        return {};
+    }
+    Runtime::State state = Runtime::deserialize(this->candidateRuntimeParametersState);
+    const double physicalDt = observation.nextTime-observation.acceptedTime;
+    // Validate the accepted/bootstrap identity even when the callback proposes
+    // an update, so it cannot hide an invalid base behind a valid candidate.
+    this->validateRuntimeParameters(state.parameters,physicalDt);
+    if (!state.history.empty() &&
+        (state.history.back().appliedSeq > observation.acceptedSeq ||
+         state.history.back().acceptedTimeS > observation.acceptedTime))
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Runtime parameter history exceeds the accepted solver boundary.");
+    auto intervals = this->validateRuntimeParameters(
+        decision.runtimeParameterCandidate ? *decision.runtimeParameterCandidate : state.parameters,
+        physicalDt);
+    if (decision.runtimeParameterCandidate)
+    {
+        if (observation.acceptedSeq == std::numeric_limits<quint64>::max())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,"Runtime accepted sequence overflow.");
+        state = Runtime::acceptedChange(state,decision.runtimeParameterProposalId,
+            *decision.runtimeParameterCandidate,observation.acceptedSeq+1,observation.nextTime);
+        this->candidateRuntimeParametersState = Runtime::serialize(state);
+    }
+    else if (!decision.runtimeParameterProposalId.isEmpty())
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Runtime proposal ID requires a parameter candidate.");
+    return intervals;
 }
 
 QString RSolverStress::controlCatalogFingerprint() const
@@ -4180,11 +4310,26 @@ void RSolverStress::solveStructuralDynamics()
             const RStructuralControlStateEnvelope envelope =
                 RStructuralControlStateEnvelope::deserialize(restartData.controlControllerState);
             this->acceptedControllerState = envelope.controllerState;
+            this->candidateControllerState = this->acceptedControllerState;
+            this->acceptedRuntimeParametersState = envelope.runtimeParametersState;
+            this->candidateRuntimeParametersState = this->acceptedRuntimeParametersState;
             this->acceptedConditionerState = this->controlConditioner->deserialize(
                 envelope.conditionerState);
             if (this->acceptedConditionerState.completedSteps != restartData.completedSteps)
                 throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                              "Structural control restart conditioner step count differs from solver checkpoint.");
+            if (!this->acceptedRuntimeParametersState.isEmpty())
+            {
+                const auto runtime = RStructuralControlRuntimeParameters::deserialize(
+                    this->acceptedRuntimeParametersState);
+                this->validateRuntimeParameters(runtime.parameters,
+                    restartData.fixedTimeStep/this->scales.getSecond());
+                if (!runtime.history.empty() &&
+                    (runtime.history.back().appliedSeq > restartData.completedSteps ||
+                     runtime.history.back().acceptedTimeS > restartData.time/this->scales.getSecond()))
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Runtime restart history exceeds its accepted solver checkpoint.");
+            }
             this->activeControlForce.fill(0.0);
             this->controlForceMap->addForce(this->activeControlCommands,this->activeControlForce);
         }
@@ -4354,14 +4499,18 @@ void RSolverStress::solveStructuralDynamics()
         observation.deterministicSeed = controlSetup.deterministicSeed;
         observation.sensors = this->sampleControlSensors(accepted);
         observation.priorControllerState = this->acceptedControllerState;
+        observation.priorRuntimeParametersState = this->acceptedRuntimeParametersState;
+        observation.acceptedSeq = this->acceptedConditionerState.completedSteps;
         const RTimeSolver frozenTimeSolver = this->pModel->getTimeSolver();
         const RStructuralControlSetup frozenControlSetup = controlSetup;
+        const RStructuralDynamicsSetup frozenDynamicsSetup = this->pModel->getProblemSetup().getStructuralDynamicsSetup();
         const RResults frozenResults = *this->pModel;
         const RStructuralControlDecision decision = this->controlCallback(observation);
         if (!sameControlResults(frozenResults,*this->pModel))
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                          "Structural control callback changed the frozen result fields.");
         if (!sameControlTimeSolver(frozenTimeSolver,this->pModel->getTimeSolver()) ||
+            !sameControlDynamicsSetup(frozenDynamicsSetup,this->pModel->getProblemSetup().getStructuralDynamicsSetup()) ||
             !sameControlSetup(frozenControlSetup,
                 this->pModel->getProblemSetup().getStructuralControlSetup()))
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
@@ -4373,6 +4522,7 @@ void RSolverStress::solveStructuralDynamics()
             decision.nextControllerState.size() > 1024*1024)
             throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                          "Control provider returned wrong channel count or oversized controller state.");
+        const auto runtimeIntervals = this->prepareRuntimeParameters(decision,observation);
         const auto conditioned = this->controlConditioner->advance(
             this->acceptedConditionerState,decision.requestedCommands);
         this->candidateConditionerState = conditioned.candidate;
@@ -4393,8 +4543,17 @@ void RSolverStress::solveStructuralDynamics()
                              actuator.id.toUtf8().constData());
             const double previous = this->controlLedger->accepted()[i].command;
             const double maxDelta = actuator.rateLimit*(dt/this->scales.getSecond());
-            const double lower = std::max(actuator.minimum,previous-maxDelta);
-            const double upper = std::min(actuator.maximum,previous+maxDelta);
+            double lower = std::max(actuator.minimum,previous-maxDelta);
+            double upper = std::min(actuator.maximum,previous+maxDelta);
+            if (!runtimeIntervals.empty())
+            {
+                const auto interval = std::find_if(runtimeIntervals.begin(),runtimeIntervals.end(),
+                    [&](const auto &value){return value.actuatorId == actuator.id;});
+                if (interval == runtimeIntervals.end())
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,"Runtime actuator ID missing.");
+                lower = interval->minN;
+                upper = interval->maxN;
+            }
             if (lower > upper)
                 throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                              "Control actuator '%s' has incompatible magnitude and rate limits.",
@@ -5570,7 +5729,8 @@ void RSolverStress::store()
             restart.controlControllerState = this->controlForceMap
                 ? RStructuralControlStateEnvelope{
                       this->candidateControllerState,
-                      this->controlConditioner->serialize(this->candidateConditionerState)}.serialize()
+                      this->controlConditioner->serialize(this->candidateConditionerState),
+                      this->candidateRuntimeParametersState}.serialize()
                 : QByteArray();
             restart.controlDeterministicSeed = this->controlForceMap
                 ? this->pModel->getProblemSetup().getStructuralControlSetup().deterministicSeed : 0;

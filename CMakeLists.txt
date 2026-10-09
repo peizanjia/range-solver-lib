@@ -41,6 +41,7 @@ qt_add_library(range-solver-lib
         src/rstructural_piezo_kernel.cpp
         src/rstructural_control_force_map.cpp
         src/rstructural_control_conditioner.cpp
+        src/rstructural_control_runtime_parameters.cpp
         src/rstructural_typed_control.cpp
         src/rstructural_typed_fe_control.cpp
         src/rstructural_dynamics_support.cpp
@@ -97,6 +98,7 @@ qt_add_library(range-solver-lib
         include/rstructural_piezo_kernel.h
         include/rstructural_control_force_map.h
         include/rstructural_control_conditioner.h
+        include/rstructural_control_runtime_parameters.h
         include/rstructural_typed_control.h
         include/rstructural_typed_fe_control.h
         include/rstructural_control_protocol.h

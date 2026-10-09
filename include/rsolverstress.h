@@ -137,6 +137,8 @@ class RSolverStress : public RSolverGeneric
         RRVector activeControlForce;
         QByteArray acceptedControllerState;
         QByteArray candidateControllerState;
+        QByteArray acceptedRuntimeParametersState;
+        QByteArray candidateRuntimeParametersState;
         RStructuralControlStepRecord trialControlRecord;
         QString pendingControlObserverFailure;
         //! Last converged result from the dedicated static cable equilibrium path.
@@ -296,6 +298,12 @@ class RSolverStress : public RSolverGeneric
         void solveStructuralCableDynamics();
         QString controlMappingFingerprint() const;
         QString controlCatalogFingerprint() const;
+        std::vector<RStructuralControlRuntimeParameters::AppliedForceInterval>
+            validateRuntimeParameters(const RStructuralControlRuntimeParameters::Parameters &parameters,
+                                      double physicalDt) const;
+        std::vector<RStructuralControlRuntimeParameters::AppliedForceInterval>
+            prepareRuntimeParameters(const RStructuralControlDecision &decision,
+                                     const RStructuralControlObservation &observation);
         std::vector<RStructuralControlSensorSample> sampleControlSensors(
             const RStructuralDynamicsState &state) const;
         std::vector<RStructuralSupportSample> computeSupportSamples(

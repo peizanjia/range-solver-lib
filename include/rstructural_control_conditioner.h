@@ -54,7 +54,7 @@ class RStructuralControlConditioner
         void validate(const State &state) const;
 };
 
-//! Portable v1 checkpoint envelope. The first component is byte-exact opaque
+//! Portable checkpoint envelope. The first component is byte-exact opaque
 //! controller-private state; the second is conditioner state. JSON validation
 //! belongs to a transport that explicitly negotiates JSON, not this kernel.
 //! This is an opt-in building block, not an enabled FE capability by itself.
@@ -62,6 +62,9 @@ struct RStructuralControlStateEnvelope
 {
     QByteArray controllerState;
     QByteArray conditionerState;
+    //! Optional accepted runtime parameter state. Empty retains v1 exact bytes;
+    //! a canonical nonempty component selects v2 without changing legacy state.
+    QByteArray runtimeParametersState;
 
     QByteArray serialize() const;
     static RStructuralControlStateEnvelope deserialize(const QByteArray &bytes);
