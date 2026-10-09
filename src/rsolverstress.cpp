@@ -4349,7 +4349,8 @@ void RSolverStress::solveStructuralDynamics()
         controlStartingVelocity = accepted.v;
         RStructuralControlObservation observation;
         observation.acceptedTime = accepted.time/this->scales.getSecond();
-        observation.nextTime = (accepted.time+dt)/this->scales.getSecond();
+        observation.nextTime = this->pModel->getTimeSolver().getCurrentTime()/
+            this->scales.getSecond();
         observation.deterministicSeed = controlSetup.deterministicSeed;
         observation.sensors = this->sampleControlSensors(accepted);
         observation.priorControllerState = this->acceptedControllerState;

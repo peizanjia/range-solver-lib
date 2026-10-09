@@ -114,7 +114,7 @@ RStructuralSensor makeSensor(const QString &id,RStructuralSensorQuantity quantit
     return sensor;
 }
 
-RModel makeCable(uint steps,bool enableControl = true)
+RModel makeCable(uint steps,bool enableControl = true,double inputStartTime = 0.0)
 {
     RModel model;
     model.setNNodes(2);
@@ -178,6 +178,7 @@ RModel makeCable(uint steps,bool enableControl = true)
     dynamics.setTimeStep(timeStep);
     dynamics.setNSteps(steps);
     dynamics.setOutputFrequency(1);
+    model.getTimeSolver().setInputStartTime(inputStartTime);
 
     if (enableControl)
     {
@@ -381,6 +382,7 @@ private slots:
     void velocityFeedbackReducesActualCableVibration();
     void persistedSplitControlMatchesFullRun_data();
     void persistedSplitControlMatchesFullRun();
+    void acceptedCheckpointResumeMatchesUninterrupted_data();
     void acceptedCheckpointResumeMatchesUninterrupted();
     void failedStepDoesNotCommitControllerCandidate();
     void controlDefinitionChangeRejectsRestart();
@@ -669,20 +671,35 @@ void TestStructuralCableControl::persistedSplitControlMatchesFullRun()
     QCOMPARE(splitFinal.completedSteps,totalSteps);
 }
 
+void TestStructuralCableControl::acceptedCheckpointResumeMatchesUninterrupted_data()
+{
+    QTest::addColumn<double>("inputStartTime");
+    QTest::addColumn<uint>("checkpointAt");
+    QTest::addColumn<uint>("secondCheckpointAt");
+
+    QTest::newRow("origin-zero-checkpoint-10") << 0.0 << 10u << 15u;
+    QTest::newRow("origin-nonzero-checkpoints-7-13") << 0.13 << 7u << 13u;
+}
+
 void TestStructuralCableControl::acceptedCheckpointResumeMatchesUninterrupted()
 {
     constexpr uint total = 20;
-    constexpr uint checkpointAt = 10;
+    QFETCH(double,inputStartTime);
+    QFETCH(uint,checkpointAt);
+    QFETCH(uint,secondCheckpointAt);
+    QVERIFY(checkpointAt > 0 && checkpointAt < secondCheckpointAt &&
+            secondCheckpointAt < total);
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
     Captures uninterruptedCaptures;
     Captures resumedCaptures;
-    RModel uninterrupted = makeCable(total);
-    RModel firstSegment = makeCable(checkpointAt);
+    RModel uninterrupted = makeCable(total,true,inputStartTime);
+    RModel firstSegment = makeCable(checkpointAt,true,inputStartTime);
     QString error;
     QVERIFY2(solve(uninterrupted,uninterruptedCaptures,QString(),error),qPrintable(error));
 
-    const QString checkpointPath = directory.filePath(QStringLiteral("accepted-10.rbm"));
+    const QString checkpointPath = directory.filePath(
+        QStringLiteral("accepted-%1.rbm").arg(checkpointAt));
     bool wroteAcceptedCheckpoint = false;
     QVERIFY2(solve(firstSegment,resumedCaptures,QString(),error,
         [&](const RModel &acceptedModel)
@@ -698,8 +715,28 @@ void TestStructuralCableControl::acceptedCheckpointResumeMatchesUninterrupted()
     RModel resumed;
     QVERIFY2(load(resumed,checkpointPath,error),qPrintable(error));
     resumed.getProblemSetup().setRestart(true);
-    resumed.getProblemSetup().getStructuralDynamicsSetup().setNSteps(total-checkpointAt);
-    QVERIFY2(solve(resumed,resumedCaptures,QString(),error),qPrintable(error));
+    resumed.getProblemSetup().getStructuralDynamicsSetup().setNSteps(
+        secondCheckpointAt-checkpointAt);
+    const QString secondCheckpointPath = directory.filePath(
+        QStringLiteral("accepted-%1.rbm").arg(secondCheckpointAt));
+    bool wroteSecondAcceptedCheckpoint = false;
+    QVERIFY2(solve(resumed,resumedCaptures,QString(),error,
+        [&](const RModel &acceptedModel)
+        {
+            const auto &state = acceptedModel.getProblemSetup()
+                .getStructuralDynamicsRestartData();
+            if (state.completedSteps == secondCheckpointAt)
+                wroteSecondAcceptedCheckpoint = acceptedModel.write(
+                    secondCheckpointPath,false) == secondCheckpointPath;
+        }),qPrintable(error));
+    QVERIFY(wroteSecondAcceptedCheckpoint);
+
+    RModel resumedAgain;
+    QVERIFY2(load(resumedAgain,secondCheckpointPath,error),qPrintable(error));
+    resumedAgain.getProblemSetup().setRestart(true);
+    resumedAgain.getProblemSetup().getStructuralDynamicsSetup().setNSteps(
+        total-secondCheckpointAt);
+    QVERIFY2(solve(resumedAgain,resumedCaptures,QString(),error),qPrintable(error));
 
     QCOMPARE(uninterruptedCaptures.observations.size(),std::size_t(total));
     QCOMPARE(resumedCaptures.observations.size(),std::size_t(total));
@@ -723,7 +760,7 @@ void TestStructuralCableControl::acceptedCheckpointResumeMatchesUninterrupted()
                        resumedCaptures.acceptedSteps[step]);
     }
     const auto &expected = uninterrupted.getProblemSetup().getStructuralDynamicsRestartData();
-    const auto &actual = resumed.getProblemSetup().getStructuralDynamicsRestartData();
+    const auto &actual = resumedAgain.getProblemSetup().getStructuralDynamicsRestartData();
     compareCheckpoints(expected,actual);
     QCOMPARE(actual.completedSteps,total);
 }

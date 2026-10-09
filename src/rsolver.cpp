@@ -1235,6 +1235,80 @@ void RSolver::run()
     {
         timeSolver.harmonizeTimesWithInput(this->pModel->getProblemSetup().getRestart());
     }
+    if (dynamics.getEnabled())
+    {
+        const bool restart = this->pModel->getProblemSetup().getRestart();
+        const RStructuralDynamicsRestartData &checkpoint =
+            this->pModel->getProblemSetup().getStructuralDynamicsRestartData();
+        std::vector<double> &times = timeSolver.getTimes();
+        std::vector<double> canonicalTimes(times);
+        const double inputStartTime = timeSolver.getInputStartTime();
+        const double fixedTimeStep = timeSolver.getInputTimeStepSize();
+        if (!std::isfinite(inputStartTime) || !std::isfinite(fixedTimeStep) ||
+            fixedTimeStep <= 0.0 || times.empty())
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Structural dynamics requires a finite fixed-step time grid.");
+        }
+
+        const std::size_t acceptedStepCount = restart
+            ? static_cast<std::size_t>(checkpoint.completedSteps) : 0;
+        if (restart)
+        {
+            if (!checkpoint.available || checkpoint.completedSteps == 0 ||
+                checkpoint.completedSteps != timeSolver.getCurrentTimeStep()+1 ||
+                acceptedStepCount > times.size() || !std::isfinite(checkpoint.time))
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Structural restart checkpoint does not match its accepted time history.");
+            }
+            const double canonicalCheckpointTime = inputStartTime+
+                static_cast<double>(checkpoint.completedSteps)*fixedTimeStep;
+            const double checkpointTimeTolerance =
+                1.0e-10*std::max(1.0,std::fabs(checkpoint.time));
+            if (!std::isfinite(canonicalCheckpointTime) ||
+                std::fabs(checkpoint.time-canonicalCheckpointTime) > checkpointTimeTolerance)
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Structural restart checkpoint is not on its persisted fixed-step time grid.");
+            }
+        }
+
+        for (std::size_t index=0;index<times.size();index++)
+        {
+            const double canonicalTime = inputStartTime+
+                static_cast<double>(index+1)*fixedTimeStep;
+            if (!std::isfinite(canonicalTime))
+            {
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Structural dynamics fixed-step time grid is not finite.");
+            }
+            if (index < acceptedStepCount)
+            {
+                const double historyTimeTolerance =
+                    1.0e-10*std::max(1.0,std::fabs(canonicalTime));
+                if (!std::isfinite(times[index]) ||
+                    (index == 0 ? times[index] <= inputStartTime
+                                : times[index] <= times[index-1]) ||
+                    std::fabs(times[index]-canonicalTime) > historyTimeTolerance)
+                {
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Structural restart contains accepted times outside its persisted fixed-step grid.");
+                }
+            }
+            else
+            {
+                if (index == 0 ? canonicalTime <= inputStartTime
+                               : canonicalTime <= canonicalTimes[index-1])
+                {
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Structural dynamics fixed-step time grid is not progressive.");
+                }
+                canonicalTimes[index] = canonicalTime;
+            }
+        }
+        times.swap(canonicalTimes);
+    }
     if (transientHeatStress && !resumingFailedTransientStep)
     {
         // There is no safe point at which to delete old future records if the
