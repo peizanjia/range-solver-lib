@@ -1458,7 +1458,16 @@ void RSolverStress::prepare()
     const auto &restart = this->pModel->getProblemSetup().getStructuralDynamicsRestartData();
     if (this->pModel->getProblemSetup().getRestart() && !restart.controlControllerState.isEmpty())
     {
-        const auto envelope = RStructuralControlStateEnvelope::deserialize(restart.controlControllerState);
+        RStructuralControlStateEnvelope envelope;
+        try
+        {
+            envelope = RStructuralControlStateEnvelope::deserialize(restart.controlControllerState);
+        }
+        catch (const std::exception &error)
+        {
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Invalid structural control checkpoint: %s",error.what());
+        }
         if (!envelope.runtimeParametersState.isEmpty() &&
             (this->isStructuralCableDynamicsMode() || this->isSpecializedStaticTrussMode() ||
              !this->pModel->getProblemSetup().getStructuralControlSetup().enabled ||
@@ -3357,11 +3366,14 @@ RSolverStress::validateRuntimeParameters(
         catalog.getSensors().empty())
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
                      "Runtime control parameters require linear Newmark velocity control and the fixed base controller revision.");
+    bool hasPhysicalVelocity = false;
     for (const auto &sensor : catalog.getSensors())
-        if (sensor.quantity != RStructuralSensorQuantity::Velocity ||
-            sensor.unit != RStructuralInteractionSetup::getSensorUnit(RStructuralSensorQuantity::Velocity))
-            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                         "Runtime control parameters require physical velocity sensors.");
+        if (sensor.quantity == RStructuralSensorQuantity::Velocity &&
+            sensor.unit == RStructuralInteractionSetup::getSensorUnit(RStructuralSensorQuantity::Velocity))
+            hasPhysicalVelocity = true;
+    if (!hasPhysicalVelocity)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Runtime control parameters require a physical velocity sensor.");
     std::vector<RStructuralControlRuntimeParameters::ActuatorLimit> limits;
     for (const auto &actuator : catalog.getActuators())
     {
