@@ -78,3 +78,9 @@ foreach(test_name IN LISTS range_solver_lib_tests)
             ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
     endif()
 endforeach()
+
+# This acceptance test launches the actual native solver, never a mock process.
+# TARGET_FILE remains valid for multi-config builds and non-sibling layouts.
+add_dependencies(tst_structural_piezo_fe fea-solver)
+target_compile_definitions(tst_structural_piezo_fe PRIVATE
+    RANGE_PIEZO_FEA_SOLVER="$<TARGET_FILE:fea-solver>")

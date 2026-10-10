@@ -3,10 +3,15 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <map>
+#include <set>
 #include <vector>
+
+#include <QByteArray>
+#include <QCryptographicHash>
 
 #include <rbl_error.h>
 #include <rbl_rvector.h>
@@ -50,10 +55,80 @@ double stableNorm(const std::vector<double> &values)
     return norm;
 }
 
+// Count-delimited little-endian integers and exact binary64 values preserve
+// endpoint order and prevent concatenation ambiguities. This matches the beam
+// adapter's local provenance convention; it is not a cryptographic authority.
+void appendUInt(QByteArray &bytes,uint value)
+{
+    for (unsigned int byte=0;byte<4;byte++)
+        bytes.append(char((value>>(8*byte))&0xffu));
+}
+
+void appendSize(QByteArray &bytes,std::size_t value)
+{
+    static_assert(sizeof(std::size_t)<=sizeof(quint64),"Fingerprint size exceeds 64 bits.");
+    const quint64 encoded = quint64(value);
+    for (unsigned int byte=0;byte<8;byte++)
+        bytes.append(char((encoded>>(8*byte))&0xffu));
+}
+
+void appendDouble(QByteArray &bytes,double value)
+{
+    static_assert(sizeof(double)==sizeof(quint64) && std::numeric_limits<double>::is_iec559,
+                  "Fingerprint requires IEEE binary64 doubles.");
+    quint64 bits = 0;
+    std::memcpy(&bits,&value,sizeof(bits));
+    for (unsigned int byte=0;byte<8;byte++)
+        bytes.append(char((bits>>(8*byte))&0xffu));
+}
+
+void appendString(QByteArray &bytes,const QString &value)
+{
+    const QByteArray encoded = value.toUtf8();
+    appendSize(bytes,std::size_t(encoded.size()));
+    bytes.append(encoded);
+}
+
+void appendDoubleVector(QByteArray &bytes,const std::vector<double> &values)
+{
+    appendSize(bytes,values.size());
+    for (double value : values) appendDouble(bytes,value);
+}
+
+void appendBoolVector(QByteArray &bytes,const std::vector<bool> &values)
+{
+    appendSize(bytes,values.size());
+    for (bool value : values) appendUInt(bytes,value ? 1u : 0u);
+}
+
+QString digest(const QByteArray &bytes)
+{
+    return QString::fromLatin1(QCryptographicHash::hash(bytes,QCryptographicHash::Sha256).toHex());
+}
+
+QString resultCertificate(const RStructuralPiezoModelResult &result,
+                          const QString &inputFingerprint)
+{
+    QByteArray bytes("range-fea/piezo/truss-result/v1");
+    appendString(bytes,inputFingerprint);
+    appendDoubleVector(bytes,result.displacements);
+    appendDoubleVector(bytes,result.internalForces);
+    appendDoubleVector(bytes,result.memberAxialForces);
+    appendDoubleVector(bytes,result.memberRightCharges);
+    appendBoolVector(bytes,result.memberElectricalPortAvailable);
+    appendDouble(bytes,result.residualNorm);
+    appendDouble(bytes,result.enthalpy);
+    appendUInt(bytes,static_cast<uint>(result.electricalMode));
+    appendDoubleVector(bytes,result.nodalPotentials);
+    appendDoubleVector(bytes,result.nodalConductorCharges);
+    appendDouble(bytes,result.electricResidualNorm);
+    return digest(bytes);
+}
+
 struct PiezoModelData
 {
     RStructuralStaticTrussModelData truss;
-    //! Port pointers in the same sorted-by-element order as truss.members.
+    //! Active port pointers in sorted member order; nullptr means purely mechanical.
     std::vector<const RStructuralPiezoPort*> portsByMember;
 };
 
@@ -79,8 +154,11 @@ PiezoModelData buildPiezoModelData(const RModel &model)
     if (thermalPiezo && setup.electricalMode != RStructuralPiezoElectricalMode::NodalPotential)
         fail("Heat->Piezo supports only the nodal-potential coupled rod mode.");
     data.truss = RStructuralStaticTrussModel::build(model,false,thermalPiezo);
-    if (setup.ports.size() != data.truss.members.size())
-        fail("Piezo setup must configure exactly one terminal port for every TRUSS1 member.");
+    if (!setup.passiveElementIds.empty() &&
+        setup.electricalMode != RStructuralPiezoElectricalMode::LegacyTerminalVoltage)
+        fail("Mixed active/passive trusses require LegacyTerminalVoltage mode.");
+    if (setup.ports.size()+setup.passiveElementIds.size() != data.truss.members.size())
+        fail("Piezo setup must classify every TRUSS1 member with one terminal port or as passive.");
 
     std::map<uint,const RStructuralPiezoPort*> portByElement;
     for (const RStructuralPiezoPort &port : setup.ports)
@@ -94,15 +172,22 @@ PiezoModelData buildPiezoModelData(const RModel &model)
             fail("Piezo setup has more than one port for a TRUSS1 member.");
     }
 
+    std::set<uint> passiveElements;
+    for (uint elementId : setup.passiveElementIds)
+    {
+        if (!passiveElements.insert(elementId).second || portByElement.count(elementId))
+            fail("Piezo active/passive member classification is duplicated or overlaps.");
+        if (elementId >= model.getNElements() ||
+            model.getElement(elementId).getType() != R_ELEMENT_TRUSS1)
+            fail("Passive piezo classification requires a valid TRUSS1 element.");
+    }
     data.portsByMember.reserve(data.truss.members.size());
     for (const RStructuralStaticTrussMember &member : data.truss.members)
     {
         const auto found = portByElement.find(member.elementId);
-        if (found == portByElement.end())
-        {
-            fail(QString("TRUSS1 element %1 has no explicit piezo port.").arg(member.elementId));
-        }
-        data.portsByMember.push_back(found->second);
+        if (found == portByElement.end() && !passiveElements.count(member.elementId))
+            fail(QString("TRUSS1 element %1 has no explicit active/passive classification.").arg(member.elementId));
+        data.portsByMember.push_back(found == portByElement.end() ? nullptr : found->second);
     }
     return data;
 }
@@ -371,6 +456,102 @@ CoupledPiezoModelData buildCoupledPiezoModelData(const RModel &model,
     return coupled;
 }
 
+QString modelInputFingerprint(const RModel &model,const PiezoModelData &data)
+{
+    QByteArray bytes("range-fea/piezo/truss-input/v1");
+    appendUInt(bytes,model.getNElements());
+    appendUInt(bytes,model.getProblemTaskTree().getProblemTypeMask());
+    appendSize(bytes,data.truss.nodes.size());
+    for (const auto &node : data.truss.nodes)
+        for (double coordinate : node) appendDouble(bytes,coordinate);
+    appendSize(bytes,data.truss.members.size());
+    for (const auto &member : data.truss.members)
+    {
+        appendUInt(bytes,member.elementId);
+        appendUInt(bytes,member.node1);
+        appendUInt(bytes,member.node2);
+        appendDouble(bytes,member.youngModulus);
+        appendDouble(bytes,member.area);
+        appendDouble(bytes,member.referenceLength);
+    }
+    appendBoolVector(bytes,data.truss.prescribedMask);
+    appendDoubleVector(bytes,data.truss.prescribedDisplacements);
+    appendDoubleVector(bytes,data.truss.deadNodalLoads);
+    const auto &setup = model.getProblemSetup().getStructuralPiezoSetup();
+    appendString(bytes,setup.meshFingerprint);
+    appendUInt(bytes,static_cast<uint>(setup.electricalMode));
+    appendSize(bytes,setup.ports.size());
+    for (const auto &port : setup.ports)
+    {
+        appendString(bytes,port.id);
+        appendUInt(bytes,port.elementId);
+        appendDouble(bytes,port.coupling);
+        appendDouble(bytes,port.permittivity);
+        appendDouble(bytes,port.voltage);
+    }
+    appendSize(bytes,setup.passiveElementIds.size());
+    for (uint elementId : setup.passiveElementIds) appendUInt(bytes,elementId);
+    appendSize(bytes,setup.nodalBoundaryConditions.size());
+    for (const auto &boundary : setup.nodalBoundaryConditions)
+    {
+        appendUInt(bytes,boundary.nodeId);
+        appendUInt(bytes,static_cast<uint>(boundary.type));
+        appendDouble(bytes,boundary.value);
+    }
+    if (setup.electricalMode == RStructuralPiezoElectricalMode::NodalPotential)
+    {
+        // Rebuild the same actual coupled inputs, including temperature-evaluated
+        // E and integrated thermal strain, rather than hashing only a profile.
+        const auto coupled = buildCoupledPiezoModelData(model,data,true);
+        const auto &input = coupled.input;
+        for (double component : coupled.axis) appendDouble(bytes,component);
+        appendDoubleVector(bytes,input.coordinates);
+        appendSize(bytes,input.members.size());
+        for (const auto &member : input.members)
+        {
+            appendUInt(bytes,member.node0);
+            appendUInt(bytes,member.node1);
+            appendDouble(bytes,member.area);
+            appendDouble(bytes,member.youngModulus);
+            appendDouble(bytes,member.coupling);
+            appendDouble(bytes,member.permittivity);
+            appendDouble(bytes,member.thermalStrain);
+        }
+        appendDoubleVector(bytes,input.mechanicalLoads);
+        appendDoubleVector(bytes,input.prescribedConductorCharges);
+        appendBoolVector(bytes,input.displacementPrescribed);
+        appendDoubleVector(bytes,input.prescribedDisplacements);
+        appendBoolVector(bytes,input.potentialPrescribed);
+        appendDoubleVector(bytes,input.prescribedPotentials);
+        appendUInt(bytes,input.gmresRestart);
+        appendUInt(bytes,input.gmresCycles);
+        appendDouble(bytes,input.gmresRelativeTolerance);
+        appendDouble(bytes,input.mechanicalAbsoluteTolerance);
+        appendDouble(bytes,input.mechanicalRelativeTolerance);
+        appendDouble(bytes,input.electricAbsoluteTolerance);
+        appendDouble(bytes,input.electricRelativeTolerance);
+        if (model.getProblemTaskTree().getProblemTypeMask() == (R_PROBLEM_HEAT | R_PROBLEM_STRESS))
+        {
+            // Temperature is a consumed input here, even though it was produced
+            // by a preceding heat solve. Hash each raw node value as well as the
+            // effective member strain so distinct fields with equal averages
+            // cannot reuse one another's response certificate.
+            const auto &temperature = model.getVariable(model.findVariable(R_VARIABLE_TEMPERATURE));
+            appendUInt(bytes,temperature.getNValues());
+            for (uint node=0;node<temperature.getNValues();node++)
+                appendDouble(bytes,temperature.getValue(0,node));
+        }
+    }
+    else
+    {
+        const auto &cg = model.getMatrixSolverConf(RMatrixSolverConf::CG);
+        appendUInt(bytes,cg.getNInnerIterations());
+        appendUInt(bytes,cg.getNOuterIterations());
+        appendDouble(bytes,cg.getSolverCvgValue());
+    }
+    return digest(bytes);
+}
+
 struct FreeSystem
 {
     RSparseMatrix tangent;
@@ -415,7 +596,7 @@ FreeSystem assembleFreeSystem(const PiezoModelData &data)
     for (std::size_t memberPosition=0;memberPosition<data.truss.members.size();memberPosition++)
     {
         const RStructuralStaticTrussMember &member = data.truss.members[memberPosition];
-        const RStructuralPiezoPort &port = *data.portsByMember[memberPosition];
+        const RStructuralPiezoPort *port = data.portsByMember[memberPosition];
         const auto &x1 = data.truss.nodes[member.node1];
         const auto &x2 = data.truss.nodes[member.node2];
         const double inverseLength = 1.0/member.referenceLength;
@@ -433,9 +614,9 @@ FreeSystem assembleFreeSystem(const PiezoModelData &data)
             std::size_t(member.node2)*3,std::size_t(member.node2)*3+1,std::size_t(member.node2)*3+2
         }};
         const double axialStiffness = member.youngModulus*member.area*inverseLength;
-        const double couplingScale = port.coupling*member.area*inverseLength;
+        const double voltageForce = port ? port->coupling*member.area*inverseLength*port->voltage : 0.0;
         if (!std::isfinite(axialStiffness) || axialStiffness <= 0.0 ||
-            !std::isfinite(couplingScale))
+            !std::isfinite(voltageForce))
         {
             fail(QString("Piezo element %1 has non-finite axial or coupling stiffness.").arg(member.elementId));
         }
@@ -448,7 +629,7 @@ FreeSystem assembleFreeSystem(const PiezoModelData &data)
 
             // Internal force is K*u + b*(e*A/L)*V, so move the prescribed-
             // voltage term to the external side with a negative sign.
-            system.rhs[freeRow] -= b[row]*couplingScale*port.voltage;
+            system.rhs[freeRow] -= b[row]*voltageForce;
             if (!std::isfinite(system.rhs[freeRow]))
                 fail("Piezo equivalent voltage load is non-finite.");
 
@@ -487,11 +668,12 @@ RStructuralPiezoModelResult recoverResult(const PiezoModelData &data,
     result.internalForces.assign(displacements.size(),0.0);
     result.memberAxialForces.resize(data.truss.members.size(),0.0);
     result.memberRightCharges.resize(data.truss.members.size(),0.0);
+    result.memberElectricalPortAvailable.resize(data.truss.members.size(),false);
 
     for (std::size_t memberPosition=0;memberPosition<data.truss.members.size();memberPosition++)
     {
         const RStructuralStaticTrussMember &member = data.truss.members[memberPosition];
-        const RStructuralPiezoPort &port = *data.portsByMember[memberPosition];
+        const RStructuralPiezoPort *port = data.portsByMember[memberPosition];
         const auto &x1 = data.truss.nodes[member.node1];
         const auto &x2 = data.truss.nodes[member.node2];
         const double inverseLength = 1.0/member.referenceLength;
@@ -514,19 +696,35 @@ RStructuralPiezoModelResult recoverResult(const PiezoModelData &data,
         if (!std::isfinite(elongation))
             fail(QString("Piezo element %1 has non-finite axial elongation.").arg(member.elementId));
 
-        const RStructuralPiezoKernelResult response = RStructuralPiezoKernel::evaluate(
-            elongation,port.voltage,member.youngModulus,port.coupling,
-            port.permittivity,member.area,member.referenceLength);
-        result.memberAxialForces[memberPosition] = response.mechanicalForce;
-        result.memberRightCharges[memberPosition] = -response.dielectricDisplacementFlux;
-        result.enthalpy += response.enthalpy;
+        double mechanicalForce = 0.0;
+        double memberEnthalpy = 0.0;
+        if (port)
+        {
+            const RStructuralPiezoKernelResult response = RStructuralPiezoKernel::evaluate(
+                elongation,port->voltage,member.youngModulus,port->coupling,
+                port->permittivity,member.area,member.referenceLength);
+            mechanicalForce = response.mechanicalForce;
+            memberEnthalpy = response.enthalpy;
+            result.memberRightCharges[memberPosition] = -response.dielectricDisplacementFlux;
+            result.memberElectricalPortAvailable[memberPosition] = true;
+        }
+        else
+        {
+            // Passive bars have no electrical kernel, material or branch.
+            mechanicalForce = member.youngModulus*member.area*inverseLength*elongation;
+            memberEnthalpy = 0.5*mechanicalForce*elongation;
+        }
+        if (!std::isfinite(mechanicalForce) || !std::isfinite(memberEnthalpy))
+            fail("Piezo mechanical member recovery is non-finite.");
+        result.memberAxialForces[memberPosition] = mechanicalForce;
+        result.enthalpy += memberEnthalpy;
         if (!std::isfinite(result.enthalpy))
             fail("Total piezo electric enthalpy is non-finite.");
 
         for (std::size_t local=0;local<6;local++)
         {
             const std::size_t dof = globalDofs[local];
-            result.internalForces[dof] += b[local]*response.mechanicalForce;
+            result.internalForces[dof] += b[local]*mechanicalForce;
             if (!std::isfinite(result.internalForces[dof]))
                 fail("Piezo internal nodal force is non-finite.");
         }
@@ -608,6 +806,7 @@ RStructuralPiezoModelResult solveNodalPotential(const RModel &model,
     result.internalForces.assign(3*nNodes,0.0);
     result.memberAxialForces = solved.memberAxialForces;
     result.memberRightCharges = solved.memberRightCharges;
+    result.memberElectricalPortAvailable.assign(data.truss.members.size(),true);
     result.nodalPotentials = solved.potentials;
     result.nodalConductorCharges = solved.conductorCharges;
     result.electricalMode = RStructuralPiezoElectricalMode::NodalPotential;
@@ -647,7 +846,10 @@ RStructuralPiezoModelResult RStructuralPiezoModelAdapter::solve(const RModel &mo
     if (model.getProblemSetup().getStructuralPiezoSetup().electricalMode ==
         RStructuralPiezoElectricalMode::NodalPotential)
     {
-        return solveNodalPotential(model,data);
+        auto result = solveNodalPotential(model,data);
+        result.inputFingerprint = modelInputFingerprint(model,data);
+        result.resultSeal = resultCertificate(result,result.inputFingerprint);
+        return result;
     }
     FreeSystem system = assembleFreeSystem(data);
     const RMatrixSolverConf &solverConf = model.getMatrixSolverConf(RMatrixSolverConf::CG);
@@ -709,6 +911,8 @@ RStructuralPiezoModelResult RStructuralPiezoModelAdapter::solve(const RModel &mo
         std::max(effectiveRhsNorm,system.freeExternalLoadNorm)+1.0e-12;
     if (!std::isfinite(physicalTolerance) || result.residualNorm > physicalTolerance)
         fail("Piezo recovered physical free-force residual failed certification.");
+    result.inputFingerprint = modelInputFingerprint(model,data);
+    result.resultSeal = resultCertificate(result,result.inputFingerprint);
     return result;
 }
 
@@ -734,6 +938,7 @@ void RStructuralPiezoModelAdapter::publish(
     if (result.displacements.size() != dofCount || result.internalForces.size() != dofCount ||
         result.memberAxialForces.size() != data.truss.members.size() ||
         result.memberRightCharges.size() != data.truss.members.size() ||
+        result.memberElectricalPortAvailable.size() != data.truss.members.size() ||
         (nodalPotentialMode &&
          (result.nodalPotentials.size() != model.getNNodes() ||
           result.nodalConductorCharges.size() != model.getNNodes() ||
@@ -759,6 +964,22 @@ void RStructuralPiezoModelAdapter::publish(
             if (!std::isfinite(value)) fail("Piezo nodal conductor charge contains a non-finite value.");
     }
 
+    for (std::size_t member=0;member<data.truss.members.size();member++)
+    {
+        const bool active = data.portsByMember[member] != nullptr;
+        if (result.memberElectricalPortAvailable[member] != active)
+            fail("Piezo result active/passive electrical port identity does not match the current setup.");
+        if (!active && result.memberRightCharges[member] != 0.0)
+            fail("Passive member charge must remain a zero placeholder, not an electrical output.");
+    }
+
+    if (result.inputFingerprint.isEmpty() ||
+        result.inputFingerprint != modelInputFingerprint(model,data))
+        fail("Piezo result input provenance does not match the current model physical inputs.");
+    if (result.resultSeal.isEmpty() ||
+        result.resultSeal != resultCertificate(result,result.inputFingerprint))
+        fail("Piezo result seal is invalid: public solved result fields were modified or not adapter-owned.");
+
     std::vector<double> elementCharges(model.getNElements(),0.0);
     for (std::size_t member=0;member<data.truss.members.size();member++)
     {
@@ -768,7 +989,7 @@ void RStructuralPiezoModelAdapter::publish(
         const double stress = result.memberAxialForces[member]/trussMember.area;
         if (!std::isfinite(stress))
             fail(QString("Piezo stress recovery is non-finite for element %1.").arg(trussMember.elementId));
-        if (!nodalPotentialMode)
+        if (!nodalPotentialMode && data.portsByMember[member])
             elementCharges[trussMember.elementId] = result.memberRightCharges[member];
     }
     for (double value : elementCharges)
