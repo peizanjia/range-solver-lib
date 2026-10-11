@@ -89,6 +89,8 @@ public:
         const RStructuralTrussInput &input);
 
     static RStructuralTrussAssemblyResult evaluate(
+        // Reference chord and displacement difference remain separate so tiny
+        // extensions are independent of an arbitrary global coordinate origin.
         const std::vector<RStructuralTrussVector3> &referenceNodes,
         const std::vector<double> &displacements,
         const std::vector<RStructuralTrussMember> &members,

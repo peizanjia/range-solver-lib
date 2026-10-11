@@ -99,22 +99,28 @@ template<class T> const T &require(const RStructuralTrussInput &input)
     if (!value) throw std::invalid_argument("Structural truss law/input type mismatch");
     return *value;
 }
-}
-
-RStructuralTrussElementResult RStructuralTrussAssembly::evaluateElement(
-    const RStructuralTrussVector3 &x1, const RStructuralTrussVector3 &x2,
-    const RStructuralTrussLaw &law, const RStructuralTrussInput &input)
+RStructuralTrussElementResult evaluateChord(
+    RStructuralTrussVector3 n, const RStructuralTrussLaw &law,
+    const RStructuralTrussInput &input,
+    std::optional<std::pair<double,double>> referenceExtension = std::nullopt)
 {
-    RStructuralTrussVector3 n{};
-    for (std::size_t i=0;i<3;++i) n[i] = checked(checked(x2[i])-checked(x1[i]));
     RStructuralTrussElementResult result;
     result.length = positive(std::hypot(n[0],n[1],n[2]));
     for (double &value : n) value /= result.length;
+    const auto extension = [&](double referenceLength) {
+        positive(referenceLength);
+        if (!referenceExtension) return checked(result.length-referenceLength);
+        // Preserve the small displacement-derived length increment separately
+        // from both the rounded current length and any initial pre-extension.
+        return value(sum({product({referenceExtension->first}),
+                          product({-referenceLength}),
+                          product({referenceExtension->second})}));
+    };
 
     if (const auto *passive = std::get_if<RStructuralTrussPassiveLaw>(&law))
     {
         require<RStructuralTrussNoInput>(input);
-        const double delta = checked(result.length-positive(passive->referenceLength));
+        const double delta = extension(passive->referenceLength);
         result.axialTangent = positive(positive(passive->axialRigidity)/passive->referenceLength);
         result.axialForce = value(product({result.axialTangent,delta}));
         result.storedEnergy = value(product({0.5,result.axialTangent,delta,delta}));
@@ -122,7 +128,7 @@ RStructuralTrussElementResult RStructuralTrussAssembly::evaluateElement(
     }
     else if (const auto *piezo = std::get_if<RStructuralTrussPiezoLaw>(&law))
     {
-        const double delta = checked(result.length-positive(piezo->referenceLength));
+        const double delta = extension(piezo->referenceLength);
         const double k = positive(piezo->axialStiffness);
         const double g = checked(piezo->coupling);
         const double ce = positive(piezo->capacitance);
@@ -159,7 +165,7 @@ RStructuralTrussElementResult RStructuralTrussAssembly::evaluateElement(
         // Preserve the established tension-only law while avoiding temporary
         // N*N overflow (MSVC long double has double precision/range).
         const double k = positive(ea/l0);
-        const double delta = checked(result.length-l0);
+        const double delta = extension(l0);
         const double trialTension = value(sum({product({cable.initialTension}),product({k,delta})}));
         const bool taut = trialTension > 0.0;
         result.axialForce = taut ? trialTension : 0.0;
@@ -187,6 +193,16 @@ RStructuralTrussElementResult RStructuralTrussAssembly::evaluateElement(
     }
     return result;
 }
+}
+
+RStructuralTrussElementResult RStructuralTrussAssembly::evaluateElement(
+    const RStructuralTrussVector3 &x1, const RStructuralTrussVector3 &x2,
+    const RStructuralTrussLaw &law, const RStructuralTrussInput &input)
+{
+    RStructuralTrussVector3 chord{};
+    for (std::size_t i=0;i<3;++i) chord[i] = checked(checked(x2[i])-checked(x1[i]));
+    return evaluateChord(chord,law,input);
+}
 
 RStructuralTrussAssemblyResult RStructuralTrussAssembly::evaluate(
     const std::vector<RStructuralTrussVector3> &referenceNodes,
@@ -198,14 +214,16 @@ RStructuralTrussAssemblyResult RStructuralTrussAssembly::evaluate(
         referenceNodes.size() > std::numeric_limits<std::size_t>::max()/3 ||
         displacements.size() != referenceNodes.size()*3 || inputs.size() != members.size())
         throw std::invalid_argument("Structural truss assembly dimensions are invalid");
-    std::vector<RStructuralTrussVector3> positions(referenceNodes.size());
     for (std::size_t node=0;node<referenceNodes.size();++node)
         for (std::size_t i=0;i<3;++i)
-            positions[node][i] = checked(checked(referenceNodes[node][i])+checked(displacements[3*node+i]));
+        {
+            checked(referenceNodes[node][i]);
+            checked(displacements[3*node+i]);
+        }
     std::unordered_set<std::uint64_t> ids;
     for (const auto &member : members)
         if (member.physicalElementId == 0 || !ids.insert(member.physicalElementId).second ||
-            member.node1 >= positions.size() || member.node2 >= positions.size() || member.node1 == member.node2)
+            member.node1 >= referenceNodes.size() || member.node2 >= referenceNodes.size() || member.node1 == member.node2)
             throw std::invalid_argument("Structural truss member identity or connectivity is invalid");
 
     RStructuralTrussAssemblyResult result;
@@ -215,7 +233,30 @@ RStructuralTrussAssemblyResult RStructuralTrussAssembly::evaluate(
     for (std::size_t e=0;e<members.size();++e)
     {
         const auto &member = members[e];
-        const auto element = evaluateElement(positions[member.node1],positions[member.node2],member.law,inputs[e]);
+        RStructuralTrussVector3 referenceChord{},increment{},currentChord{};
+        for (std::size_t i=0;i<3;++i)
+        {
+            referenceChord[i] = checked(referenceNodes[member.node2][i]-referenceNodes[member.node1][i]);
+            increment[i] = checked(displacements[3*member.node2+i]-displacements[3*member.node1+i]);
+            currentChord[i] = checked(referenceChord[i]+increment[i]);
+        }
+        const double initialLength = positive(std::hypot(referenceChord[0],referenceChord[1],referenceChord[2]));
+        const double currentLength = positive(std::hypot(currentChord[0],currentChord[1],currentChord[2]));
+        // |c+du|-|c| = (c.du + .5 du.du)/(.5 |c+du|+.5 |c|).
+        // Scaled products preserve cancellation without overflowing a square;
+        // using half-lengths also avoids overflow in the denominator.
+        const double lengthChange = value(sum({
+            product({referenceChord[0],increment[0]}), product({.5,increment[0],increment[0]}),
+            product({referenceChord[1],increment[1]}), product({.5,increment[1],increment[1]}),
+            product({referenceChord[2],increment[2]}), product({.5,increment[2],increment[2]})}),
+            value(sum({product({.5,currentLength}),product({.5,initialLength})})));
+        // Near chord collapse the O(initialLength) length change cannot keep
+        // the tiny remaining current length when materialized as binary64.
+        // Use the direct current length there (and for large extension), and
+        // reserve rationalization for displacement increments near reference.
+        const auto stableExtension = std::fabs(lengthChange) <= .25*initialLength
+            ? std::make_optional(std::make_pair(initialLength,lengthChange)) : std::nullopt;
+        const auto element = evaluateChord(currentChord,member.law,inputs[e],stableExtension);
         result.storedEnergy = checked(result.storedEnergy+element.storedEnergy);
         result.mechanicalPotential = checked(result.mechanicalPotential+element.mechanicalPotential);
         for (std::size_t i=0;i<6;++i)

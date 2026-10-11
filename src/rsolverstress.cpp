@@ -6,6 +6,7 @@
 #include <map>
 
 #include <QCryptographicHash>
+#include <QFileInfo>
 #include <omp.h>
 
 #include "rsolverstress.h"
@@ -22,6 +23,59 @@
 
 namespace
 {
+
+RValueVector nativeMixedMonitoringValue(const RModel &model,const RMonitoringPoint &point)
+{
+    const uint variableId = model.findVariable(point.getVariableType());
+    if (variableId == RConstants::eod)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed monitoring variable '%s' is unavailable; independent electrical ports are not nodal fields.",
+                     RVariable::getName(point.getVariableType()).toUtf8().constData());
+    for (uint axis=0;axis<3;++axis)
+        if (!std::isfinite(point.getPosition()[axis]))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Native mixed monitoring requires a finite position in the reference mesh.");
+    const RNode location(point.getPosition());
+    const auto &variable = model.getVariable(variableId);
+    const bool elemental = variable.getApplyType() == R_VARIABLE_APPLY_ELEMENT;
+    uint elementId = RConstants::eod;
+    for (uint i=0;i<model.getNElements();++i)
+        if ((!elemental || model.getElement(i).getType() == R_ELEMENT_TRUSS1) &&
+            model.getElement(i).isInside(model.getNodes(),location))
+        {
+            if (elemental && elementId != RConstants::eod)
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Native element monitoring is ambiguous at this position; member-specific sensor binding is required.");
+            elementId = i;
+            if (!elemental) break;
+        }
+    if (elementId == RConstants::eod)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed monitoring point is outside the reference mesh.");
+    const bool nodal = variable.getApplyType() == R_VARIABLE_APPLY_NODE;
+    if ((!nodal && !elemental) || variable.getNVectors() == 0 ||
+        variable.getNValues() != (nodal ? model.getNNodes() : model.getNElements()))
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed monitoring requires a complete nodal or element result field.");
+    const auto &element = model.getElement(elementId);
+    RValueVector values;
+    values.resize(variable.getNVectors());
+    for (uint component=0;component<variable.getNVectors();++component)
+    {
+        if (elemental) values[component] = variable.getValue(component,elementId);
+        else
+        {
+            RRVector nodeValues(element.size());
+            for (uint node=0;node<element.size();++node)
+                nodeValues[node] = variable.getValue(component,element.getNodeId(node));
+            values[component] = element.interpolate(model.getNodes(),location,nodeValues);
+        }
+        if (!std::isfinite(values[component]))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Native mixed monitoring interpolation produced a nonfinite value.");
+    }
+    return values;
+}
 
 constexpr double axisymmetricFullAngle = 2.0*3.14159265358979323846;
 
@@ -1091,6 +1145,9 @@ void RSolverStress::setControlCallback(
     const QString &id, const QString &revision,
     std::function<RStructuralControlDecision(const RStructuralControlObservation &)> callback)
 {
+    if (this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled && callback)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed held-input dynamics does not support legacy control callbacks; v3 integration is pending.");
     if (this->isSpecializedStaticTrussMode() && callback)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
@@ -1104,6 +1161,9 @@ void RSolverStress::setControlCallback(
 void RSolverStress::setControlStepObserver(
     std::function<void(const RStructuralControlStepRecord &)> observer)
 {
+    if (this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled && observer)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed held-input dynamics does not support legacy control-step observers; v3 integration is pending.");
     if (this->isSpecializedStaticTrussMode() && observer)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
@@ -1126,6 +1186,9 @@ QString RSolverStress::getPendingControlObserverFailure() const
 void RSolverStress::setSupportResponseObserver(
     std::function<void(const std::vector<RStructuralSupportSample> &)> observer)
 {
+    if (this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled && observer)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed dynamics does not support legacy support-response observers; full semantic mapping is pending.");
     if (this->isSpecializedStaticTrussMode() && observer)
     {
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
@@ -1137,6 +1200,37 @@ void RSolverStress::setSupportResponseObserver(
 std::vector<RStructuralSupportSample> RSolverStress::getAcceptedSupportSamples() const
 {
     return this->acceptedSupportSamples;
+}
+
+void RSolverStress::validateNativeMixedMonitoringPoints(const RModel &model)
+{
+    for (const auto &point : model.getMonitoringPointManager())
+        if (!point.getOutputFileName().isEmpty())
+            nativeMixedMonitoringValue(model,point);
+}
+
+void RSolverStress::processNativeMixedMonitoringPoints()
+{
+    if (!this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed monitoring forwarding requires the dedicated mixed dynamics mode.");
+    // Values and point availability are certified before publishing any files.
+    // The host redirects these appends to its monitoring transaction's stages.
+    for (const auto &point : this->pModel->getMonitoringPointManager())
+    {
+        const QString &path = point.getOutputFileName();
+        if (path.isEmpty()) continue;
+        const auto values = nativeMixedMonitoringValue(*this->pModel,point);
+        const QFileInfo before(path);
+        const qint64 previousSize = before.exists() ? before.size() : 0;
+        // RMonitoringPoint adds one to its supplied zero-based index.
+        point.writeValueVectorToFile(this->pModel->getTimeSolver().getCurrentTimeStep(),values);
+        const QFileInfo after(path);
+        if (!after.isFile() || after.size() <= previousSize)
+            throw RError(RError::Type::WriteFile,R_ERROR_REF,
+                         "Native mixed monitoring failed to append a complete record to '%s'.",
+                         path.toUtf8().constData());
+    }
 }
 
 bool RSolverStress::hasConverged() const
@@ -1158,6 +1252,9 @@ bool RSolverStress::hasConverged() const
 
 void RSolverStress::validateRunConfiguration() const
 {
+    if (this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed dynamics must run through the dedicated RSolver accepted-state transaction, not RSolverStress::run.");
     const bool cableEnabled = this->pModel->getProblemSetup().getStructuralCableSetup().enabled;
     const bool piezoEnabled = this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled;
     const bool cableDynamicsEnabled = cableEnabled &&

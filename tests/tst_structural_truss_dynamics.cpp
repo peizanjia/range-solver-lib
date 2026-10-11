@@ -112,6 +112,7 @@ class TestStructuralTrussDynamics : public QObject
 {
     Q_OBJECT
 private slots:
+    void smallStepAtFiniteDisplacement();
     void axialOscillators_data();
     void axialOscillators();
     void analyticPrescribedMotionAndSupportPower();
@@ -468,6 +469,26 @@ void TestStructuralTrussDynamics::freeMassWithMovingSupport()
     const double wf=std::abs(f.cumulativeSupportWork-exactWork);
     // Quadrature plus Newmark error are O(dt^2) for this analytic smooth path.
     QVERIFY(wc>1e-8); QVERIFY(wf<.3*wc); QVERIFY(wf<1e-5);
+}
+
+void TestStructuralTrussDynamics::smallStepAtFiniteDisplacement()
+{
+    const auto system=axial();RStructuralTrussDynamics driver(system);
+    const auto inputs=held(RStructuralTrussNoInput{});
+    std::vector<double> q(6,0.0),v(6,0.0);q[3]=.05;v[3]=.07;
+    auto state=driver.initialize(0,q,v,inputs);
+    constexpr double dt=1e-6;
+    for (int step=0;step<100;++step)
+    {
+        const auto trial=driver.trialStep(state,inputs,dt,tight());
+        QVERIFY(trial.residualNorm<=tight().absForceTol+tight().relForceTol*2.1);
+        state=trial.candidate;
+    }
+    const double omega=std::sqrt(20.0),time=100*dt;
+    const double expectedQ=.05*std::cos(omega*time)+.07/omega*std::sin(omega*time);
+    const double expectedV=-.05*omega*std::sin(omega*time)+.07*std::cos(omega*time);
+    QVERIFY(std::abs(state.displacements[3]-expectedQ)<1e-13);
+    QVERIFY(std::abs(state.velocities[3]-expectedV)<1e-12);
 }
 
 QTEST_APPLESS_MAIN(TestStructuralTrussDynamics)

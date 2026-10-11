@@ -39,6 +39,9 @@ qt_add_library(range-solver-lib
         src/rstructural_static_truss_model.cpp
         src/rstructural_truss_assembly.cpp
         src/rstructural_truss_dynamics.cpp
+        src/rstructural_truss_dynamics_model_adapter.cpp
+        src/rstructural_truss_dynamics_restart_adapter.cpp
+        src/rstructural_truss_native_run.cpp
         src/rstructural_piezo_model_adapter.cpp
         src/rstructural_piezo_kernel.cpp
         src/rstructural_control_force_map.cpp
@@ -83,6 +86,7 @@ qt_add_library(range-solver-lib
         include/rsolverfluidheat.h
         include/rsolverfluidparticle.h
         include/rsolvergeneric.h
+        include/raccepted_step_publication.h
         include/rsolverheat.h
         include/rsolvermagnetostatics.h
         include/rsolvermesh.h
@@ -98,6 +102,9 @@ qt_add_library(range-solver-lib
         include/rstructural_static_truss_model.h
         include/rstructural_truss_assembly.h
         include/rstructural_truss_dynamics.h
+        include/rstructural_truss_dynamics_model_adapter.h
+        include/rstructural_truss_dynamics_restart_adapter.h
+        include/rstructural_truss_native_run.h
         include/rstructural_piezo_model_adapter.h
         include/rstructural_piezo_kernel.h
         include/rstructural_control_force_map.h

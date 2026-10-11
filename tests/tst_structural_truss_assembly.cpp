@@ -56,6 +56,7 @@ private slots:
     void representableEnergyAndLengthDerivative();
     void independentPotentialGradientsAndTangents();
     void endpointReversalAndRigidMotion();
+    void smallExtensionIndependentOfOrigin();
     void commonMixedAssembly();
     void rejectMalformedInputsWithoutMutation();
 };
@@ -390,6 +391,50 @@ void TestStructuralTrussAssembly::commonMixedAssembly()
     QVERIFY(near(skew.memberResponses[2].electrical->conductorCharge,0.1));
     for (uint axis=0;axis<3;++axis)
         QVERIFY(near(skew.internalForces[axis]+skew.internalForces[axis+3]+skew.internalForces[axis+6],0));
+}
+
+void TestStructuralTrussAssembly::smallExtensionIndependentOfOrigin()
+{
+    const double tiny=std::numeric_limits<double>::denorm_min();
+    const auto subnormal=RStructuralTrussAssembly::evaluate({V3{0,0,0},V3{tiny,0,0}},
+        std::vector<double>(6,0.0),{{1,0,1,RStructuralTrussPassiveLaw{tiny,tiny}}},
+        {RStructuralTrussNoInput{}});
+    QCOMPARE(subnormal.memberResponses[0].length,tiny);
+    QCOMPARE(subnormal.memberResponses[0].axialForce,0.0);
+    QCOMPARE(subnormal.memberResponses[0].storedEnergy,0.0);
+    QCOMPARE(subnormal.tangent.findValue(0,0),1.0);
+    const double compressedChord=std::ldexp(1.0,-53);
+    const double compressedRest=std::nextafter(compressedChord,0.0);
+    const auto compressed=RStructuralTrussAssembly::evaluate({V3{0,0,0},V3{1,0,0}},
+        {0,0,0,-1+compressedChord,0,0},
+        {{2,0,1,RStructuralTrussPassiveLaw{compressedRest,compressedRest}}},
+        {RStructuralTrussNoInput{}});
+    QCOMPARE(compressed.memberResponses[0].length,compressedChord);
+    QCOMPARE(compressed.memberResponses[0].axialForce,compressedChord-compressedRest);
+    QVERIFY(compressed.memberResponses[0].axialForce>0);
+    // Measured in N/C/J, with a 1 m member and sub-ULP material extension.
+    // The oracle uses displacement directly, not rounded absolute positions.
+    const std::vector<RStructuralTrussMember> members{
+        {91,0,1,RStructuralTrussPiezoLaw{1,1e9,-.1,1e-9}},
+        {92,0,1,RStructuralTrussPassiveLaw{1,1e9}},
+        {93,0,1,RStructuralTrussCableLaw{0,1e9}}};
+    const std::vector<Input> inputs{RStructuralTrussVoltage{10},RStructuralTrussNoInput{},RStructuralTrussCableLength{1}};
+    for (double extension : {1e-9,1e-20,-1e-20})
+    {
+        const std::vector<double> q{0,0,0,extension,0,0};
+        const auto baseline = RStructuralTrussAssembly::evaluate({V3{0,0,0},V3{1,0,0}},q,members,inputs);
+        for (double origin : {3.0,1000.0,1e12})
+        {
+            const auto shifted = RStructuralTrussAssembly::evaluate({V3{origin,0,0},V3{origin+1,0,0}},q,members,inputs);
+            QCOMPARE(shifted.internalForces,baseline.internalForces);
+            const auto &piezo=shifted.memberResponses[0];
+            QVERIFY(std::abs(piezo.axialForce-(1e9*extension-1))<=2e-16);
+            QVERIFY(std::abs(piezo.electrical->conductorCharge-(1e-8+.1*extension))<=2e-24);
+            QVERIFY(std::abs(shifted.memberResponses[1].axialForce-1e9*extension)<=2e-16*std::abs(1e9*extension));
+            QVERIFY(std::abs(shifted.memberResponses[1].storedEnergy-.5e9*extension*extension)<=3e-16*.5e9*extension*extension);
+            QVERIFY(std::abs(shifted.memberResponses[2].axialForce-std::max(0.0,1e9*extension))<=2e-16*std::abs(1e9*extension));
+        }
+    }
 }
 
 void TestStructuralTrussAssembly::rejectMalformedInputsWithoutMutation()

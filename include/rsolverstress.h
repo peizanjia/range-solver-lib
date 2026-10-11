@@ -21,6 +21,8 @@ struct RStructuralDynamicsState;
 
 class RSolverStress : public RSolverGeneric
 {
+    //! Parent owns the native output transaction, including writer-path rollback.
+    friend class RSolver;
 
     protected:
 
@@ -195,6 +197,12 @@ class RSolverStress : public RSolverGeneric
         void setControlStepObserver(std::function<void(const RStructuralControlStepRecord &)> observer);
         std::vector<RStructuralControlChannelSample> getAcceptedControlSamples() const;
         QString getPendingControlObserverFailure() const;
+
+        //! Native mixed output forwarding only; does not initialize, rescale
+        //! or execute the legacy structural solver. Configured monitoring
+        //! outputs must address available nodal/element results inside mesh.
+        static void validateNativeMixedMonitoringPoints(const RModel &model);
+        void processNativeMixedMonitoringPoints();
 
     protected:
 

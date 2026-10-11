@@ -32,11 +32,20 @@
 #include "rsolverstress.h"
 #include "rstructural_cable_model_adapter.h"
 #include "rstructural_piezo_model_adapter.h"
+#include "rstructural_truss_native_run.h"
 #include "rparallel_execution_context.h"
 #include "rsolverwave.h"
 
 namespace
 {
+
+bool isNativeMixedStressTask(const RProblemTaskItem &task)
+{
+    if (task.getProblemType() == R_PROBLEM_STRESS)
+        return task.getNChildren() == 0;
+    return task.getProblemType() == R_PROBLEM_NONE && task.getNIterations() == 1 &&
+        task.getNChildren() == 1 && isNativeMixedStressTask(task.getChild(0));
+}
 
 bool isHeatStressSequence(const RProblemTaskItem &task)
 {
@@ -798,6 +807,34 @@ void RSolver::_init()
                      "No solver problem task is configured.");
     }
 
+    if (this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled)
+    {
+        // Freeze and certify the complete native source BEFORE generic result
+        // cleanup, persisted-result initial conditions, temperature conversion
+        // or any legacy stress initialization can change its meaning.
+        auto native = std::make_unique<RStructuralTrussNativeRun>(*this->pModel);
+        if (!isNativeMixedStressTask(this->pModel->getProblemTaskTree()))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Native mixed dynamics requires one stress leaf with no repeated task iterations.");
+        if (this->executionPolicy == ExecutionPolicy::StructuralProduct)
+        {
+            const auto profile = RStructuralProductProfile::validate(*this->pModel);
+            if (!profile.isAccepted())
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,profile.getDiagnostic());
+        }
+        const QString stressConvergence = RFileUtils::getFileNameWithSuffix(
+            this->convergenceFileName,RProblem::getId(R_PROBLEM_STRESS));
+        auto stress = std::make_unique<RSolverStress>(this->pModel,this->modelFileName,
+                                                     stressConvergence,this->sharedData,false);
+        // This child is used only for the real native writer/frame and bounded
+        // monitoring forwarding. Its legacy run entry explicitly rejects mixed.
+        this->solversExecutionCount.insert(R_PROBLEM_STRESS,native->completedSteps());
+        this->solvers.insert(R_PROBLEM_STRESS,stress.get());
+        stress.release();
+        this->nativeMixedRun = std::move(native);
+        return;
+    }
+
     if (this->pModel->getProblemSetup().getStructuralCableSetup().enabled ||
         this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled)
     {
@@ -983,6 +1020,10 @@ void RSolver::setParallelExecutionReportObserver(ParallelExecutionReportObserver
 
 void RSolver::setStructuralSupportResponseObserver(StructuralSupportResponseObserver observer)
 {
+    if ((this->nativeMixedRun ||
+         this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled) && observer)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed dynamics does not support legacy support-response observers; full semantic mapping is pending.");
     if ((this->pModel->getProblemSetup().getStructuralCableSetup().enabled ||
          this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled) && observer)
     {
@@ -1014,6 +1055,11 @@ void RSolver::setStructuralControlCallback(const QString &controllerId,
                                            const QString &controllerRevision,
                                           StructuralControlCallback callback)
 {
+    if ((this->nativeMixedRun ||
+         this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled) &&
+        (callback || !controllerId.isEmpty() || !controllerRevision.isEmpty()))
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed held-input dynamics does not support legacy controller callbacks or identities; v3 integration is pending.");
     const bool cableDynamics =
         this->pModel->getProblemSetup().getStructuralCableSetup().enabled &&
         this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
@@ -1037,6 +1083,10 @@ void RSolver::setStructuralControlCallback(const QString &controllerId,
 
 void RSolver::setStructuralControlStepObserver(StructuralControlStepObserver observer)
 {
+    if ((this->nativeMixedRun ||
+         this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled) && observer)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed held-input dynamics does not support legacy control-step observers; v3 integration is pending.");
     const bool cableDynamics =
         this->pModel->getProblemSetup().getStructuralCableSetup().enabled &&
         this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
@@ -1102,8 +1152,183 @@ void RSolver::setAcceptedStructuralStepObserver(
     this->acceptedStructuralStepObserver = std::move(observer);
 }
 
+void RSolver::setAcceptedStepParticipant(std::shared_ptr<RAcceptedStepParticipant> participant)
+{
+    if (!this->nativeMixedRun ||
+        !this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Accepted-step publication participants currently require native mixed dynamics.");
+    this->acceptedStepParticipant = std::move(participant);
+}
+
+void RSolver::setNativeMixedStepBudget(uint stepBudget)
+{
+    if (!this->nativeMixedRun ||
+        !this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed step budgets require the dedicated mixed dynamics mode.");
+    this->nativeMixedStepBudget = stepBudget;
+}
+
+bool RSolver::isNativeMixedRetryable() const noexcept
+{
+    return this->nativeMixedRun && this->nativeMixedRun->isRetryable();
+}
+
+void RSolver::runNativeMixed()
+{
+    if (!this->nativeMixedRun->isRetryable())
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed run cannot retry after incomplete rollback; the accepted model backup is retained.");
+    if (this->structuralSupportResponseObserver || this->structuralControlCallback ||
+        this->structuralControlStepObserver || !this->structuralControllerId.isEmpty() ||
+        !this->structuralControllerRevision.isEmpty())
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed dynamics does not support legacy control or support observer semantics; v3 integration is pending.");
+    if (!isNativeMixedStressTask(this->pModel->getProblemTaskTree()))
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native mixed dynamics requires one stress leaf with no repeated task iterations.");
+    this->nativeMixedRun->validateCurrentSource(*this->pModel);
+
+    RParallelExecutionContext parallelContext(this->pModel->getProblemSetup().getParallelExecutionConfig());
+    const auto &parallel = parallelContext.getReport();
+    if (this->parallelExecutionReportObserver)
+        this->parallelExecutionReportObserver(parallel);
+    RLogger::info("Parallel execution: requested=%u applied=%u actual=%u backend=%s deterministic=%s\n",
+                  parallel.requestedThreads,parallel.appliedThreads,parallel.actualThreads,
+                  parallel.backend.toUtf8().constData(),parallel.deterministicReduction ? "yes" : "no");
+    if (!parallel.diagnostic.isEmpty())
+        RLogger::warning("Parallel execution: %s\n",parallel.diagnostic.toUtf8().constData());
+    // A reporting callback can capture mutable source; recheck it before any
+    // trial or output transaction, even when the original target is exhausted.
+    this->nativeMixedRun->validateCurrentSource(*this->pModel);
+    const RModel baseline = this->nativeMixedRun->acceptedModel(*this->pModel);
+    RSolverStress::validateNativeMixedMonitoringPoints(baseline);
+    auto *stress = static_cast<RSolverStress*>(this->solvers.value(R_PROBLEM_STRESS,nullptr));
+    if (!stress)
+        throw RError(RError::Type::Application,R_ERROR_REF,
+                     "Native mixed run has no registered native output forwarder.");
+    TransientOutputLock outputRunLock(this->modelFileName);
+    TransientMonitoringOutputRunLock monitoringRunLock(baseline.getMonitoringPointManager(),
+                                                      this->modelFileName,baseline.getTimeSolver());
+    rejectUnpublishedOutputRecords(this->modelFileName,baseline.getTimeSolver(),
+                                   this->nativeMixedRun->completedSteps() != 0);
+    // Freeze per-invocation policy. Notifications may configure a later run,
+    // but cannot alter this invocation's prepared checkpoint boundary.
+    const uint budget = this->nativeMixedStepBudget;
+    const auto participant = this->acceptedStepParticipant;
+    uint invocationAcceptedSteps = 0;
+    // QMap lookup/detach/allocation is before the decision interval. No map
+    // operation occurs between final publication and the noexcept promotions.
+    uint &executionCount = this->solversExecutionCount[R_PROBLEM_STRESS];
+    while (this->nativeMixedRun->hasRemainingSteps())
+    {
+        if (RApplicationState::getInstance().getStateType() == R_APPLICATION_STATE_STOP)
+            break;
+        const bool invocationBoundary = budget != 0 && invocationAcceptedSteps+1 == budget;
+        auto prepared = this->nativeMixedRun->prepare(*this->pModel,invocationBoundary);
+        this->nativeMixedRun->validatePrepared(*prepared);
+        RSolverStress::validateNativeMixedMonitoringPoints(prepared->candidateModel());
+        auto acceptedModel = std::make_unique<RModel>(*this->pModel);
+        const QString acceptedWriterPath = stress->modelFileName;
+        DeferredOutputTransaction outputTransaction;
+        TransientMonitoringOutputTransaction monitoringTransaction;
+        std::unique_ptr<RAcceptedStepPublication> publication;
+        bool modelAssignmentAttempted = false;
+        try
+        {
+            // Prepare result snapshots from the canonical candidate, before
+            // assigning caller-owned model storage or publishing any bytes.
+            outputTransaction.prepare(this->modelFileName,prepared->candidateModel().getTimeSolver());
+            modelAssignmentAttempted = true;
+            *this->pModel = prepared->candidateModel();
+            monitoringTransaction.prepare(this->pModel->getMonitoringPointManager(),
+                                          this->modelFileName,this->pModel->getTimeSolver());
+            stress->processNativeMixedMonitoringPoints();
+            monitoringTransaction.restoreOutputFileNames();
+            // No staging paths may appear in the result or recovery model.
+            this->nativeMixedRun->validatePrepared(*prepared);
+            this->nativeMixedRun->validatePrepared(*prepared,*this->pModel);
+            if (participant)
+            {
+                publication = participant->stage(*this->pModel,prepared->identity());
+                if (!publication)
+                    throw RError(RError::Type::Application,R_ERROR_REF,
+                                 "Native accepted-step participant returned no prepared publication.");
+                this->nativeMixedRun->validatePrepared(*prepared,*this->pModel);
+            }
+            monitoringTransaction.publish();
+            stress->publishDeferredResults();
+            // LAST recovery-authority publication is the decision boundary.
+            // Between its return and these promotions: no allocation, model
+            // copy/setter, I/O, cancellation, observer or application hook.
+            if (publication) publication->publish();
+            this->nativeMixedRun->commit(*prepared);
+            executionCount = prepared->completedSteps();
+            ++invocationAcceptedSteps;
+            if (publication) publication->commit();
+            outputTransaction.commit();
+            monitoringTransaction.commit();
+        }
+        catch (...)
+        {
+            const auto originalFailure = std::current_exception();
+            // Reverse publication order: checkpoint, result/link, monitoring,
+            // caller model and writer-private path. Physics/cursor never moved.
+            const bool checkpointRestored = !publication || publication->rollback();
+            stress->discardPendingResultFrameObserver();
+            const QString outputFailure = outputTransaction.rollback();
+            const QString monitoringFailure = monitoringTransaction.rollback();
+            bool modelRestored = true;
+            try
+            {
+                if (modelAssignmentAttempted) *this->pModel = *acceptedModel;
+                stress->modelFileName = acceptedWriterPath;
+            }
+            catch (...)
+            {
+                modelRestored = false;
+            }
+            if (!checkpointRestored || !outputFailure.isEmpty() ||
+                !monitoringFailure.isEmpty() || !modelRestored)
+            {
+                this->nativeMixedRun->markNonRetryable();
+                this->nativeMixedRollbackModel = std::move(acceptedModel);
+                throw RError(RError::Type::Application,R_ERROR_REF,
+                             "Native mixed transaction failed with incomplete rollback; retries are disabled and the accepted model backup is retained. Checkpoint restored=%s; model/writer restored=%s. %s %s",
+                             checkpointRestored ? "yes" : "no",modelRestored ? "yes" : "no",
+                             outputFailure.toUtf8().constData(),monitoringFailure.toUtf8().constData());
+            }
+            std::rethrow_exception(originalFailure);
+        }
+        // All notifications are outside the abortable transaction. A result
+        // observer is diagnostic; an accepted observer may stop future trials
+        // by throwing, but a subsequent run resumes after this committed step.
+        RLogger::info("Native mixed accepted step: %u of %u | time=%g [sec] | residual=%g | iterations=%llu\n",
+                      prepared->completedSteps(),this->nativeMixedRun->targetSteps(),
+                      prepared->identity().timeS,prepared->result().residualNorm,
+                      static_cast<unsigned long long>(prepared->result().iterations));
+        stress->publishResultFrameObserver();
+        if (this->acceptedStructuralStepObserver)
+            this->acceptedStructuralStepObserver(*this->pModel);
+        if (invocationBoundary ||
+            RApplicationState::getInstance().getStateType() == R_APPLICATION_STATE_STOP)
+            break;
+    }
+}
+
 void RSolver::run()
 {
+    if (this->nativeMixedRun ||
+        this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled)
+    {
+        if (!this->nativeMixedRun ||
+            !this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Native mixed mode cannot be enabled or disabled after constructing RSolver.");
+        this->runNativeMixed();
+        return;
+    }
     const RProblemTaskItem &taskTree = this->pModel->getProblemTaskTree();
     const bool transactionalHeatStress = isHeatStressSequence(taskTree);
     const bool transientHeatStress = transactionalHeatStress &&

@@ -151,7 +151,8 @@ std::vector<uint> uniqueGroupNodes(const RModel &model,
 void prescribe(RStructuralStaticTrussModelData &data,
                uint node,
                uint component,
-               double value)
+               double value,
+               bool exactDeclarations)
 {
     const std::size_t dof = std::size_t(3)*node+component;
     if (dof >= data.prescribedMask.size())
@@ -162,7 +163,7 @@ void prescribe(RStructuralStaticTrussModelData &data,
     {
         const double previous = data.prescribedDisplacements[dof];
         const double tolerance = 1.0e-12*std::max(1.0,std::max(std::fabs(previous),std::fabs(value)));
-        if (std::fabs(previous-value) > tolerance)
+        if (exactDeclarations ? previous != value : std::fabs(previous-value) > tolerance)
         {
             fail(QString("Contradictory static TRUSS1 displacement prescriptions at node %1, component %2.")
                      .arg(node).arg(component));
@@ -194,7 +195,8 @@ void applyBoundaryCondition(REntityGroupType groupType,
                             const RBoundaryCondition &condition,
                             const std::vector<uint> &nodes,
                             RStructuralStaticTrussModelData &data,
-                            uint groupId)
+                            uint groupId,
+                            bool exactDeclarations)
 {
     const RBoundaryConditionType type = condition.getType();
     const bool displacement = type == R_BOUNDARY_CONDITION_DISPLACEMENT;
@@ -258,7 +260,7 @@ void applyBoundaryCondition(REntityGroupType groupType,
         {
             for (uint node : nodes)
             {
-                prescribe(data,node,axis,value);
+                prescribe(data,node,axis,value,exactDeclarations);
             }
         }
         else
@@ -341,6 +343,18 @@ void storeVector(RModel &model,
 RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(
     const RModel &model,bool allowStructuralDynamics,bool allowThermalPiezo)
 {
+    return buildWithPolicy(model,allowStructuralDynamics,allowThermalPiezo,ExtractionPolicy::Legacy);
+}
+
+RStructuralStaticTrussModelData RStructuralStaticTrussModel::buildMixedDynamics(const RModel &model)
+{
+    return buildWithPolicy(model,true,false,ExtractionPolicy::NativeMixedDynamics);
+}
+
+RStructuralStaticTrussModelData RStructuralStaticTrussModel::buildWithPolicy(
+    const RModel &model,bool allowStructuralDynamics,bool allowThermalPiezo,ExtractionPolicy policy)
+{
+    const bool mixed = policy == ExtractionPolicy::NativeMixedDynamics;
     const RProblemTypeMask taskMask = model.getProblemTaskTree().getProblemTypeMask();
     if (taskMask != R_PROBLEM_STRESS &&
         !(allowThermalPiezo && taskMask == (R_PROBLEM_HEAT | R_PROBLEM_STRESS)))
@@ -352,7 +366,26 @@ RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(
         fail("Static TRUSS1 mode does not support the legacy time solver.");
     }
     const RProblemSetup &problemSetup = model.getProblemSetup();
-    if (problemSetup.getRestart())
+    const auto &mixedSetup = problemSetup.getStructuralTrussDynamicsSetup();
+    if (!mixed && (mixedSetup.enabled || problemSetup.getStructuralTrussDynamicsRestartData().available))
+        fail("Legacy TRUSS1 extraction cannot consume enabled native mixed setup or native restart data.");
+    if (mixed)
+    {
+        if (!mixedSetup.enabled) fail("Native mixed TRUSS1 extraction requires enabled native setup.");
+        mixedSetup.validate(model);
+        if (!problemSetup.getStructuralDynamicsSetup().getModalDampingRatios().empty())
+            fail("Native mixed TRUSS1 extraction does not accept modal damping records.");
+        if (problemSetup.getStructuralCableSetup().enabled || problemSetup.getStructuralPiezoSetup().enabled)
+            fail("Native mixed TRUSS1 extraction rejects enabled legacy cable/piezo modes.");
+        if (problemSetup.getRestart() && !problemSetup.getStructuralTrussDynamicsRestartData().available)
+            fail("Native mixed TRUSS1 restart requires its dedicated accepted-state record.");
+        const auto &thermal = problemSetup.getStructuralThermalControlSetup();
+        if (thermal.enabled || !thermal.channels.empty() || !thermal.sparseObservationNodeIds.empty() ||
+            thermal.thermalSubstepSeconds != 0.0 || thermal.thermalSubstepsPerMechanicalMacrostep != 1 ||
+            thermal.mechanicalMacrostepsPerControllerSample != 1)
+            fail("Native mixed TRUSS1 extraction rejects thermal scheduling.");
+    }
+    if (problemSetup.getRestart() && !mixed)
     {
         fail("Static TRUSS1 mode does not support restart.");
     }
@@ -365,17 +398,25 @@ RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(
         fail("Static TRUSS1 mode does not support structural restart data.");
     }
     const RStructuralControlSetup &control = problemSetup.getStructuralControlSetup();
-    if (control.enabled || !control.controllerId.isEmpty() || !control.channelConditioning.empty())
+    if (control.enabled || !control.controllerId.isEmpty() || !control.channelConditioning.empty() ||
+        (mixed && (control.deterministicSeed != 0 || control.controlProtocolVersion != 1)))
     {
         fail("Static TRUSS1 mode does not support structural control setup.");
     }
     const RStructuralInteractionSetup &interaction = problemSetup.getStructuralInteractionSetup();
     if (!interaction.getLinearConstraints().empty() || !interaction.getCouplings().empty() ||
         !interaction.getSensors().empty() || !interaction.getActuators().empty() ||
-        !interaction.getPrescribedMotions().empty())
+        (!mixed && !interaction.getPrescribedMotions().empty()))
     {
         fail("Static TRUSS1 mode does not support MPCs, couplings, sensors, actuators or prescribed motion.");
     }
+    if (mixed)
+        for (const auto &motion : interaction.getPrescribedMotions())
+        {
+            motion.validate();
+            if (uint(motion.target.dof) > 2 || motion.target.nodeId >= model.getNNodes())
+                fail(QString("Native mixed motion '%1' requires a valid translational node target.").arg(motion.id));
+        }
     if (model.findVariable(R_VARIABLE_TEMPERATURE) != RConstants::eod && !allowThermalPiezo)
     {
         fail("Static TRUSS1 mode is isothermal at 293.15 K and does not accept a temperature field.");
@@ -404,6 +445,9 @@ RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(
     std::vector<uint> lineOwnerCount(nElements,0);
     std::vector<double> areaByElement(nElements,0.0);
     std::vector<double> modulusByElement(nElements,0.0);
+    std::set<uint> effectiveActiveIds;
+    if (mixed)
+        for (const auto &member : mixedSetup.activeMembers) effectiveActiveIds.insert(member.physicalElementId);
     for (uint lineId=0;lineId<model.getNLines();lineId++)
     {
         const RLine &line = model.getLine(lineId);
@@ -416,25 +460,29 @@ RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(
         {
             fail(QString("Static TRUSS1 line group %1 requires a finite positive cross-sectional area.").arg(lineId));
         }
-        const RMaterial &material = line.getMaterial();
-        const uint modulusPosition = material.findPosition(RMaterialProperty::ModulusOfElasiticity);
-        if (modulusPosition >= material.size())
+        bool requiresModulus = !mixed;
+        for (uint member=0;member<line.size() && !requiresModulus;++member)
         {
-            fail(QString("Static TRUSS1 line group %1 has no Young's modulus.").arg(lineId));
+            const uint elementId = line.get(member);
+            if (elementId >= nElements)
+                fail(QString("Native mixed line group %1 references invalid element %2.").arg(lineId).arg(elementId));
+            requiresModulus = effectiveActiveIds.count(model.getElementPhysicalId(elementId)) == 0;
         }
-        const RMaterialProperty &modulusProperty = material.get(modulusPosition);
-        if (modulusProperty.size() == 0)
+        double youngModulus = 0.0;
+        if (requiresModulus)
         {
-            fail(QString("Static TRUSS1 line group %1 has an empty Young's modulus table.").arg(lineId));
-        }
-        const double youngModulus = modulusProperty.get(referenceTemperature);
-        if (!finitePositive(youngModulus))
-        {
-            fail(QString("Static TRUSS1 line group %1 requires a finite positive Young's modulus at 293.15 K.").arg(lineId));
-        }
-        if (!finitePositive(area*youngModulus))
-        {
-            fail(QString("Static TRUSS1 line group %1 has invalid axial rigidity EA.").arg(lineId));
+            const RMaterial &material = line.getMaterial();
+            const uint modulusPosition = material.findPosition(RMaterialProperty::ModulusOfElasiticity);
+            if (modulusPosition >= material.size())
+                fail(QString("Static TRUSS1 line group %1 has no Young's modulus.").arg(lineId));
+            const RMaterialProperty &modulusProperty = material.get(modulusPosition);
+            if (modulusProperty.size() == 0)
+                fail(QString("Static TRUSS1 line group %1 has an empty Young's modulus table.").arg(lineId));
+            youngModulus = modulusProperty.get(referenceTemperature);
+            if (!finitePositive(youngModulus))
+                fail(QString("Static TRUSS1 line group %1 requires a finite positive Young's modulus at 293.15 K.").arg(lineId));
+            if (!finitePositive(area*youngModulus))
+                fail(QString("Static TRUSS1 line group %1 has invalid axial rigidity EA.").arg(lineId));
         }
         for (uint member=0;member<line.size();member++)
         {
@@ -451,7 +499,8 @@ RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(
             }
             lineOwnerCount[elementId]++;
             areaByElement[elementId] = area;
-            modulusByElement[elementId] = youngModulus;
+            modulusByElement[elementId] = mixed && effectiveActiveIds.count(model.getElementPhysicalId(elementId))
+                ? 0.0 : youngModulus;
         }
     }
 
@@ -487,7 +536,8 @@ RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(
         {
             fail(QString("Static TRUSS1 element %1 must be uniquely owned by one line group.").arg(elementId));
         }
-        if (!finitePositive(areaByElement[elementId]) || !finitePositive(modulusByElement[elementId]))
+        const bool effectiveActive = mixed && effectiveActiveIds.count(model.getElementPhysicalId(elementId));
+        if (!finitePositive(areaByElement[elementId]) || (!effectiveActive && !finitePositive(modulusByElement[elementId])))
         {
             fail(QString("Static TRUSS1 element %1 has no usable area/material assignment.").arg(elementId));
         }
@@ -529,10 +579,17 @@ RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(
             continue;
         }
         validateEnvironmentConditions(*group,groupId,allowThermalPiezo);
-        if (group->getNInitialConditions() != 0)
+        if (group->getNInitialConditions() != 0 && !mixed)
         {
             fail(QString("Static TRUSS1 mode does not support initial conditions on group %1.").arg(groupId));
         }
+        if (mixed)
+            for (uint ci=0;ci<group->getNInitialConditions();++ci)
+            {
+                const auto type = group->getInitialCondition(ci).getType();
+                if (type != R_INITIAL_CONDITION_DISPLACEMENT && type != R_INITIAL_CONDITION_VELOCITY)
+                    fail(QString("Native mixed TRUSS1 extraction only accepts displacement/velocity initial conditions on physical group %1.").arg(group->getPhysicalId()));
+            }
         if (group->getNBoundaryConditions() == 0)
         {
             continue;
@@ -549,7 +606,7 @@ RStructuralStaticTrussModelData RStructuralStaticTrussModel::build(
                  condition.getType() == R_BOUNDARY_CONDITION_HEAT_RATE_VOLUME))
                 continue;
             applyBoundaryCondition(groupType,condition,
-                                   nodes,data,groupId);
+                                   nodes,data,groupId,mixed);
         }
     }
 
@@ -592,11 +649,33 @@ void RStructuralStaticTrussModel::publishMechanical(
     const std::vector<double> &memberAxialForces,
     bool allowStructuralDynamics)
 {
-    const bool thermalPiezo = model.getProblemSetup().getStructuralPiezoSetup().enabled &&
+    publishWithPolicy(model,displacements,internalForces,memberAxialForces,
+                      allowStructuralDynamics,ExtractionPolicy::Legacy);
+}
+
+void RStructuralStaticTrussModel::publishMechanicalMixed(
+    RModel &model,const std::vector<double> &displacements,
+    const std::vector<double> &internalForces,const std::vector<double> &memberAxialForces)
+{
+    publishWithPolicy(model,displacements,internalForces,memberAxialForces,
+                      true,ExtractionPolicy::NativeMixedDynamics);
+}
+
+void RStructuralStaticTrussModel::publishWithPolicy(
+    RModel &model,const std::vector<double> &displacements,
+    const std::vector<double> &internalForces,const std::vector<double> &memberAxialForces,
+    bool allowStructuralDynamics,ExtractionPolicy policy)
+{
+    const bool mixed = policy == ExtractionPolicy::NativeMixedDynamics;
+    const bool thermalPiezo = !mixed && model.getProblemSetup().getStructuralPiezoSetup().enabled &&
         model.getProblemTaskTree().getProblemTypeMask() ==
             (R_PROBLEM_HEAT | R_PROBLEM_STRESS);
-    const RStructuralStaticTrussModelData data = RStructuralStaticTrussModel::build(
-        model,allowStructuralDynamics,thermalPiezo);
+    const RStructuralStaticTrussModelData data = buildWithPolicy(
+        model,allowStructuralDynamics,thermalPiezo,policy);
+    // Native q/v/a and prescribed kinematics are certified by the adapter's
+    // driver before this output-only helper runs. A motion owns absolute q;
+    // data.prescribedDisplacements is only the source held-DOF declaration,
+    // not a baseline to add to, or compare with, a moving accepted q.
     const std::size_t expectedDofs = std::size_t(3)*model.getNNodes();
     if (displacements.size() != expectedDofs || internalForces.size() != expectedDofs ||
         memberAxialForces.size() != data.members.size())
@@ -642,6 +721,13 @@ void RStructuralStaticTrussModel::publishMechanical(
         localStressX[member.elementId] = stress;
     }
 
+    // All response dimensions, finite values, magnitudes and recovered stresses
+    // have passed validation before the first candidate-model mutation.
+    if (mixed)
+    {
+        const uint potential = model.findVariable(R_VARIABLE_ELECTRIC_POTENTIAL);
+        if (potential != RConstants::eod) model.removeVariable(potential);
+    }
     storeVector(model,R_VARIABLE_DISPLACEMENT,model.getNNodes(),displacements,true);
     storeVector(model,R_VARIABLE_FORCE,model.getNNodes(),internalForces,false);
     storeScalar(model,R_VARIABLE_STRESS_NORMAL,normalStress);

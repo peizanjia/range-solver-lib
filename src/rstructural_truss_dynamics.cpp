@@ -393,12 +393,16 @@ RStructuralTrussDynamicsResult RStructuralTrussDynamics::trialStep(const RStruct
                               finite((0.25*dt2)*start.accelerations[d]));
         velocityPredictor[d] = finite(start.velocities[d]+finite((0.5*dt)*start.accelerations[d]));
         s.displacements[d] = predictor[d];
+        s.accelerations[d] = 0.0;
     }
     prescribed(endTime,s.displacements,s.velocities,s.accelerations);
     auto kinematics = [&](RStructuralTrussDynamicsState &trial) {
         for (std::size_t d : freeDofs)
         {
-            trial.accelerations[d] = finite(coefficient*finite(trial.displacements[d]-predictor[d]));
+            // Acceleration is the Newmark correction variable. Recovering it
+            // by subtracting rounded O(q) displacements loses the small O(dt²)
+            // correction and can make a valid force tolerance unattainable.
+            trial.displacements[d] = finite(predictor[d]+finite((0.25*dt2)*trial.accelerations[d]));
             trial.velocities[d] = finite(velocityPredictor[d]+finite((0.5*dt)*trial.accelerations[d]));
         }
     };
@@ -432,7 +436,8 @@ RStructuralTrussDynamicsResult RStructuralTrussDynamics::trialStep(const RStruct
         {
             auto trial = s;
             for (std::size_t i=0;i<freeDofs.size();++i)
-                trial.displacements[freeDofs[i]] = finite(s.displacements[freeDofs[i]]+finite(alpha*increment[i]));
+                trial.accelerations[freeDofs[i]] = finite(s.accelerations[freeDofs[i]]+
+                    finite(coefficient*finite(alpha*increment[i])));
             kinematics(trial);
             // Malformed/overflowing candidates propagate; they are never turned
             // into convergence or silently hidden by a catch-all line search.

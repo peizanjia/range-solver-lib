@@ -2,6 +2,7 @@
 #define RSOLVER_H
 
 #include <functional>
+#include <memory>
 #include <vector>
 
 #include <rml_model.h>
@@ -10,8 +11,10 @@
 #include "rstructural_support_response.h"
 #include "rstructural_control_protocol.h"
 #include "rsolvershareddata.h"
+#include "raccepted_step_publication.h"
 
 struct RParallelExecutionReport;
+class RStructuralTrussNativeRun;
 
 class RSolver
 {
@@ -66,6 +69,12 @@ class RSolver
         void _init();
         //! Preserve a failed transient Heat->Stress trial index for same-solver retry.
         bool transientHeatStressRetryPending;
+        //! Dedicated accepted state survives failed trials and repeated run().
+        std::unique_ptr<RStructuralTrussNativeRun> nativeMixedRun;
+        std::shared_ptr<RAcceptedStepParticipant> acceptedStepParticipant;
+        uint nativeMixedStepBudget = 0;
+        //! Keep the exact model backup if restoring caller-owned storage fails.
+        std::unique_ptr<RModel> nativeMixedRollbackModel;
 
     public:
 
@@ -123,7 +132,23 @@ class RSolver
         //! of result display frequency. Observer failures stop subsequent steps.
         void setAcceptedStructuralStepObserver(AcceptedStructuralStepObserver observer);
 
+        //! Native mixed mode only. Stage before output publication; its
+        //! recovery-authority publish is last, followed by noexcept commits.
+        void setAcceptedStepParticipant(std::shared_ptr<RAcceptedStepParticipant> participant);
+
+        //! Maximum accepted FE steps per run() invocation; zero is unlimited.
+        //! The original physical target and source identity remain unchanged.
+        //! The last budget step requests a final checkpoint publication.
+        void setNativeMixedStepBudget(uint stepBudget);
+
+        //! False after incomplete external/model rollback; further native
+        //! trials are rejected and the last accepted state is preserved.
+        bool isNativeMixedRetryable() const noexcept;
+
     protected:
+
+        //! Dedicated native dispatch; never enters the generic stress driver.
+        void runNativeMixed();
 
         //! Run single solver.
         void runSingle();

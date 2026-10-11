@@ -15,6 +15,8 @@ struct RStructuralStaticTrussMember
     uint node1 = 0;
     uint node2 = 0;
     double area = 0.0;
+    //! Positive for legacy/passive/cable members. Zero for native effective
+    //! active members, whose independent k/g/Ce law has no required material E.
     double youngModulus = 0.0;
     //! Geometric length between reference mesh coordinates (not cable setup L0).
     double referenceLength = 0.0;
@@ -35,6 +37,17 @@ struct RStructuralStaticTrussModelData
 //! Shared static TRUSS1 model validation, boundary translation and mechanics output.
 class RStructuralStaticTrussModel
 {
+    private:
+        enum class ExtractionPolicy { Legacy, NativeMixedDynamics };
+        static RStructuralStaticTrussModelData buildWithPolicy(
+            const RModel &model,bool allowStructuralDynamics,
+            bool allowThermalPiezo,ExtractionPolicy policy);
+        static void publishWithPolicy(
+            RModel &model,const std::vector<double> &displacements,
+            const std::vector<double> &internalForces,
+            const std::vector<double> &memberAxialForces,
+            bool allowStructuralDynamics,ExtractionPolicy policy);
+
     public:
         //! Validate common static restrictions and extract model data.
         //! Optional modes preserve all shared mesh/BC checks while allowing
@@ -42,6 +55,11 @@ class RStructuralStaticTrussModel
         static RStructuralStaticTrussModelData build(
             const RModel &model,bool allowStructuralDynamics = false,
             bool allowThermalPiezo = false);
+
+        //! Explicit native extraction policy: dedicated restart, source q/v IC
+        //! and analytic translational motion are owned by the mixed adapter.
+        //! Every geometry/area/global BC/environment restriction still applies.
+        static RStructuralStaticTrussModelData buildMixedDynamics(const RModel &model);
 
         //! Clear stale structural and electric-charge output fields.
         static void clearResults(RModel &model);
@@ -55,6 +73,16 @@ class RStructuralStaticTrussModel
             const std::vector<double> &internalForces,
             const std::vector<double> &memberAxialForces,
             bool allowStructuralDynamics = false);
+
+        //! Native output policy uses effective active laws and clears stale
+        //! nodal electric potential; independent ports live in native records.
+        //! The mixed adapter must certify the complete accepted state first.
+        //! Analytic motion owns absolute q at the accepted physical time;
+        //! this publisher never compares moving q with the static BC baseline.
+        static void publishMechanicalMixed(
+            RModel &model,const std::vector<double> &displacements,
+            const std::vector<double> &internalForces,
+            const std::vector<double> &memberAxialForces);
 };
 
 #endif // RSTRUCTURAL_STATIC_TRUSS_MODEL_H
