@@ -37,6 +37,8 @@ qt_add_library(range-solver-lib
         src/rstructural_cable_dynamics_restart_adapter.cpp
         src/rstructural_cable_model_adapter.cpp
         src/rstructural_static_truss_model.cpp
+        src/rstructural_truss_assembly.cpp
+        src/rstructural_truss_dynamics.cpp
         src/rstructural_piezo_model_adapter.cpp
         src/rstructural_piezo_kernel.cpp
         src/rstructural_control_force_map.cpp
@@ -94,6 +96,8 @@ qt_add_library(range-solver-lib
         include/rstructural_cable_dynamics_restart_adapter.h
         include/rstructural_cable_model_adapter.h
         include/rstructural_static_truss_model.h
+        include/rstructural_truss_assembly.h
+        include/rstructural_truss_dynamics.h
         include/rstructural_piezo_model_adapter.h
         include/rstructural_piezo_kernel.h
         include/rstructural_control_force_map.h
