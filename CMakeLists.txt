@@ -48,6 +48,7 @@ qt_add_library(range-solver-lib
         src/rstructural_control_conditioner.cpp
         src/rstructural_control_runtime_parameters.cpp
         src/rstructural_typed_control.cpp
+        src/rstructural_native_control.cpp
         src/rstructural_typed_fe_control.cpp
         src/rstructural_dynamics_support.cpp
         src/rstructural_temperature_field.cpp
@@ -111,6 +112,7 @@ qt_add_library(range-solver-lib
         include/rstructural_control_conditioner.h
         include/rstructural_control_runtime_parameters.h
         include/rstructural_typed_control.h
+        include/rstructural_native_control.h
         include/rstructural_typed_fe_control.h
         include/rstructural_control_protocol.h
         include/rstructural_dynamics_support.h
@@ -139,6 +141,24 @@ target_link_libraries(range-solver-lib
         range-model-lib
         common_defines
 )
+
+# The persisted built-in provider identity describes the actual compiled source.
+# Reconfigure when an input changes so an old identity cannot survive a rebuild.
+set(range_native_control_hash_inputs
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/rstructural_native_control.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/rstructural_native_control.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../range-model-lib/include/rml_structural_native_control.h")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${range_native_control_hash_inputs})
+set(range_native_control_identity_material "range.native.pi.implementation/v1\n")
+foreach(range_native_control_hash_input IN LISTS range_native_control_hash_inputs)
+    file(SHA256 "${range_native_control_hash_input}" range_native_control_input_sha256)
+    get_filename_component(range_native_control_input_name "${range_native_control_hash_input}" NAME)
+    string(APPEND range_native_control_identity_material
+        "${range_native_control_input_name}\n${range_native_control_input_sha256}\n")
+endforeach()
+string(SHA256 range_native_control_implementation_sha256 "${range_native_control_identity_material}")
+target_compile_definitions(range-solver-lib PRIVATE
+    RANGE_NATIVE_CONTROL_IMPLEMENTATION_SHA256="${range_native_control_implementation_sha256}")
 
 # Unit tests (opt-in via -DRANGE_BUILD_TESTS=ON)
 if(RANGE_BUILD_TESTS)

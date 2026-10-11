@@ -8,6 +8,7 @@
 
 class RModel;
 class RResults;
+class RStructuralNativeControl;
 
 //! Accepted physical state for the dedicated RSolver native mixed run.
 //! File transactions and notifications belong to RSolver, not this facade.
@@ -56,6 +57,7 @@ public:
 
     const RStructuralTrussDynamicsModelAdapter &adapter() const noexcept;
     const RStructuralTrussDynamicsState &acceptedState() const noexcept;
+    const RStructuralNativeControlState &acceptedControlState() const noexcept;
     uint completedSteps() const noexcept;
     uint nextCommandIndex() const noexcept;
     uint targetSteps() const noexcept;
@@ -91,6 +93,7 @@ public:
 
 private:
     RStructuralTrussDynamicsModelAdapter frozenAdapter;
+    std::unique_ptr<RStructuralNativeControl> controlProvider;
     std::unique_ptr<AcceptedState> accepted;
     bool retryable = true;
 };

@@ -1,6 +1,7 @@
 #include "rstructural_truss_dynamics_model_adapter.h"
 #include "rstructural_truss_dynamics_restart_adapter.h"
 #include "rstructural_static_truss_model.h"
+#include "rstructural_native_control.h"
 
 #include <algorithm>
 #include <cmath>
@@ -57,6 +58,10 @@ void preflight(const RModel &model)
     const auto &dynamics = problem.getStructuralDynamicsSetup();
     const auto &mixed = problem.getStructuralTrussDynamicsSetup();
     mixed.validate(model); dynamics.validate();
+    const auto &nativeControl = problem.getStructuralNativeControlSpec();
+    nativeControl.validate(model);
+    if (nativeControl.source == RStructuralNativeControlSource::LocalV3 && !mixed.heldCommands.empty())
+        fail("Native LocalV3 cannot share action ownership with frozen held commands.");
     if (!mixed.enabled || model.getProblemTaskTree().getProblemTypeMask() != R_PROBLEM_STRESS)
         fail("Native mixed dynamics requires enabled native setup and a STRESS-only task.");
     if (problem.getMassMatrixType() != RMassMatrixType::Lumped)
@@ -214,6 +219,7 @@ RStructuralTrussDynamicsModelAdapter::RStructuralTrussDynamicsModelAdapter(const
 {
     preflight(model);
     frozenSetup = model.getProblemSetup().getStructuralTrussDynamicsSetup();
+    frozenControlSpec = model.getProblemSetup().getStructuralNativeControlSpec();
     frozenFingerprint = frozenSetup.computeSourceFingerprint(model);
     if (frozenSetup.sourceFingerprint != frozenFingerprint)
         fail("Native mixed model must be bound to its exact current source before freezing.");
@@ -318,6 +324,10 @@ RStructuralTrussDynamicsModelAdapter::RStructuralTrussDynamicsModelAdapter(const
             fail(QString("Native mixed free DOF at physical node %1, axis %2 has no positive frozen mass.")
                  .arg(frozenMaps.orderedPhysicalNodeIds[d/3]).arg(uint(d%3)));
     frozenDriver = std::make_unique<RStructuralTrussDynamics>(frozenSystem);
+    if (frozenControlSpec.source == RStructuralNativeControlSource::LocalV3)
+    {
+        const RStructuralNativeControl provider(*this); // Resolve the actual compiled factory during preflight.
+    }
 }
 
 double RStructuralTrussDynamicsModelAdapter::targetTime(uint steps) const
@@ -338,6 +348,12 @@ uint RStructuralTrussDynamicsModelAdapter::commandCursor(uint completedSteps) co
 
 RStructuralTrussDynamicsState RStructuralTrussDynamicsModelAdapter::initialize() const
 {
+    if (frozenControlSpec.source == RStructuralNativeControlSource::LocalV3)
+    {
+        const RStructuralNativeControl control(*this);
+        const auto inputs = control.completeInputs(control.initialize().lastAppliedValues);
+        return driver().initialize(frozenInitialTime,initialQ,initialV,inputs);
+    }
     return driver().initialize(frozenInitialTime,initialQ,initialV,initialInputs);
 }
 
@@ -352,6 +368,8 @@ void RStructuralTrussDynamicsModelAdapter::validateCurrentSource(const RModel &m
 RStructuralTrussDynamicsAction RStructuralTrussDynamicsModelAdapter::actionForStep(
     const RStructuralTrussDynamicsInputs &accepted,uint cursor,uint step) const
 {
+    if (frozenControlSpec.source != RStructuralNativeControlSource::FrozenTable)
+        fail("Native LocalV3 requires a complete provider proposal, not frozen command replay.");
     if (step == 0 || step > frozenTargetSteps || cursor != commandCursor(step-1))
         fail("Native mixed command cursor does not match the next one-based FE step.");
     if (!sameInputs(accepted,replayInputs(step-1).completeInputs))
@@ -380,6 +398,8 @@ RStructuralTrussDynamicsAction RStructuralTrussDynamicsModelAdapter::actionForSt
 
 RStructuralTrussDynamicsAction RStructuralTrussDynamicsModelAdapter::replayInputs(uint steps) const
 {
+    if (frozenControlSpec.source != RStructuralNativeControlSource::FrozenTable)
+        fail("Native LocalV3 requires complete control state and cannot replay a frozen command table.");
     const uint cursor = commandCursor(steps);
     RStructuralTrussDynamicsAction replay{initialInputs,cursor};
     for (uint i=0;i<cursor;++i)
@@ -426,8 +446,37 @@ RStructuralTrussDynamicsModelTrial RStructuralTrussDynamicsModelAdapter::trial(
 RModel RStructuralTrussDynamicsModelAdapter::candidateModel(const RModel &source,
     const RStructuralTrussDynamicsState &state,uint completed,uint cursor) const
 {
+    if (frozenControlSpec.source != RStructuralNativeControlSource::FrozenTable)
+        fail("Native LocalV3 candidate requires its complete accepted control state.");
+    return candidateModel(source,state,completed,cursor,RStructuralNativeControlState{});
+}
+
+RStructuralTrussDynamicsModelTrial RStructuralTrussDynamicsModelAdapter::trialWithCompleteInputs(
+    const RStructuralTrussDynamicsState &state,uint completed,const RStructuralTrussDynamicsInputs &inputs) const
+{
+    if (frozenControlSpec.source != RStructuralNativeControlSource::LocalV3 || completed >= frozenTargetSteps ||
+        state.time != targetTime(completed))
+        fail("Native complete-input trial requires LocalV3 at the canonical accepted clock before its target.");
+    const double target = targetTime(completed+1);
+    const double dt = positive(target-state.time,"Native canonical physical interval is not positive and representable.");
+    if (!close(dt,frozenDt)) fail("Native physical interval differs from the frozen nominal time step.");
+    RStructuralTrussDynamicsModelTrial candidate;
+    candidate.result = driver().trialStep(state,inputs,dt,frozenOptions);
+    if (!close(candidate.result.candidate.time,target)) fail("Native LocalV3 trial returned a different target clock.");
+    candidate.result.candidate.time = target;
+    driver().refresh(candidate.result.candidate,inputs);
+    candidate.state = candidate.result.candidate;
+    candidate.completeInputs = inputs;
+    candidate.nextCommandIndex = 0;
+    return candidate;
+}
+
+RModel RStructuralTrussDynamicsModelAdapter::candidateModel(const RModel &source,
+    const RStructuralTrussDynamicsState &state,uint completed,uint cursor,
+    const RStructuralNativeControlState &controlState) const
+{
     validateCurrentSource(source);
-    const auto checkpoint = RStructuralTrussDynamicsRestartAdapter::build(*this,state,completed,cursor);
+    const auto checkpoint = RStructuralTrussDynamicsRestartAdapter::build(*this,state,completed,cursor,controlState);
     const auto assembly = RStructuralTrussAssembly::evaluate(frozenSystem.referenceNodes,state.displacements,
         frozenSystem.members,state.appliedInputs.memberInputs);
     std::vector<double> axial;
@@ -438,6 +487,7 @@ RModel RStructuralTrussDynamicsModelAdapter::candidateModel(const RModel &source
     // the full accepted state and observations. Install its authoritative
     // native clock/state before publishing into this independent candidate.
     candidate.getProblemSetup().setStructuralTrussDynamicsRestartData(checkpoint);
+    candidate.getProblemSetup().setStructuralNativeControlState(controlState);
     auto &time = candidate.getTimeSolver();
     // Use the const getter: the mutable getTimes() resets the accepted index.
     const auto &existingTimes = static_cast<const RTimeSolver&>(time).getTimes();

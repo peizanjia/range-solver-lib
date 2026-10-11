@@ -7,6 +7,7 @@
 #include <rml_model.h>
 
 #include "rstructural_truss_dynamics_restart_adapter.h"
+#include "rstructural_native_control.h"
 
 namespace
 {
@@ -46,6 +47,7 @@ bool samePreparedResults(const RResults &left,const RResults &right)
 struct RStructuralTrussNativeRun::AcceptedState
 {
     RStructuralTrussDynamicsState physical;
+    RStructuralNativeControlState modelControlState;
     uint completed = 0;
     uint cursor = 0;
 };
@@ -86,18 +88,23 @@ uint RStructuralTrussNativeRun::PreparedStep::nextCommandIndex() const noexcept
 RStructuralTrussNativeRun::RStructuralTrussNativeRun(const RModel &source)
     : frozenAdapter(source)
 {
+    if (frozenAdapter.nativeControlSpec().source == RStructuralNativeControlSource::LocalV3)
+        controlProvider = std::make_unique<RStructuralNativeControl>(frozenAdapter);
     auto initial = std::make_unique<AcceptedState>();
     if (source.getProblemSetup().getRestart())
     {
         auto restored = RStructuralTrussDynamicsRestartAdapter::restore(
-            frozenAdapter,source.getProblemSetup().getStructuralTrussDynamicsRestartData());
+            frozenAdapter,source.getProblemSetup().getStructuralTrussDynamicsRestartData(),
+            source.getProblemSetup().getStructuralNativeControlState());
         initial->physical = std::move(restored.state);
+        initial->modelControlState = std::move(restored.controlState);
         initial->completed = restored.completedSteps;
         initial->cursor = restored.nextCommandIndex;
     }
     else
     {
         initial->physical = frozenAdapter.initialize();
+        if (controlProvider) initial->modelControlState = controlProvider->initialize();
         initial->cursor = frozenAdapter.commandCursor(0);
     }
     accepted = std::move(initial);
@@ -113,6 +120,11 @@ const RStructuralTrussDynamicsModelAdapter &RStructuralTrussNativeRun::adapter()
 const RStructuralTrussDynamicsState &RStructuralTrussNativeRun::acceptedState() const noexcept
 {
     return accepted->physical;
+}
+
+const RStructuralNativeControlState &RStructuralTrussNativeRun::acceptedControlState() const noexcept
+{
+    return accepted->modelControlState;
 }
 
 uint RStructuralTrussNativeRun::completedSteps() const noexcept
@@ -153,7 +165,7 @@ void RStructuralTrussNativeRun::validateCurrentSource(const RModel &source) cons
 RModel RStructuralTrussNativeRun::acceptedModel(const RModel &source) const
 {
     return frozenAdapter.candidateModel(source,accepted->physical,
-                                        accepted->completed,accepted->cursor);
+                                        accepted->completed,accepted->cursor,accepted->modelControlState);
 }
 
 std::unique_ptr<RStructuralTrussNativeRun::PreparedStep>
@@ -167,7 +179,16 @@ RStructuralTrussNativeRun::prepare(const RModel &source,bool invocationBoundary)
     if (!hasRemainingSteps())
         fail("Native mixed run has already reached its original frozen target.");
 
-    auto trial = frozenAdapter.trial(accepted->physical,accepted->completed,accepted->cursor);
+    RStructuralTrussDynamicsModelTrial trial;
+    RStructuralNativeControlState nextControlState;
+    if (controlProvider)
+    {
+        const auto proposal = controlProvider->propose(accepted->modelControlState,accepted->physical,accepted->completed);
+        validateCurrentSource(source); // Provider cannot alter the frozen source across a callback boundary.
+        nextControlState = proposal.state;
+        trial = frozenAdapter.trialWithCompleteInputs(accepted->physical,accepted->completed,proposal.completeInputs);
+    }
+    else trial = frozenAdapter.trial(accepted->physical,accepted->completed,accepted->cursor);
     std::unique_ptr<PreparedStep> prepared(new PreparedStep);
     prepared->owner = this;
     prepared->baseState = accepted.get();
@@ -175,11 +196,12 @@ RStructuralTrussNativeRun::prepare(const RModel &source,bool invocationBoundary)
     prepared->cursor = trial.nextCommandIndex;
     prepared->nextState = std::make_unique<AcceptedState>();
     prepared->nextState->physical = std::move(trial.state);
+    prepared->nextState->modelControlState = std::move(nextControlState);
     prepared->nextState->completed = prepared->completed;
     prepared->nextState->cursor = prepared->cursor;
     prepared->stepResult = std::move(trial.result);
     prepared->model = std::make_unique<RModel>(frozenAdapter.candidateModel(
-        source,prepared->nextState->physical,prepared->completed,prepared->cursor));
+        source,prepared->nextState->physical,prepared->completed,prepared->cursor,prepared->nextState->modelControlState));
     prepared->sealedResults = std::make_unique<RResults>(*prepared->model);
     prepared->stepIdentity.sequence = prepared->completed;
     prepared->stepIdentity.timeS = prepared->nextState->physical.time;
@@ -213,10 +235,10 @@ void RStructuralTrussNativeRun::validatePrepared(const PreparedStep &step,const 
     // Certify its full physical recovery record again before publication so
     // such preparation cannot accidentally replace the candidate authority.
     const auto expected = RStructuralTrussDynamicsRestartAdapter::build(
-        frozenAdapter,step.nextState->physical,step.completed,step.cursor);
+        frozenAdapter,step.nextState->physical,step.completed,step.cursor,step.nextState->modelControlState);
     const auto &record = model.getProblemSetup().getStructuralTrussDynamicsRestartData();
-    if (RStructuralTrussDynamicsRestartAdapter::stateFingerprint(record) !=
-        RStructuralTrussDynamicsRestartAdapter::stateFingerprint(expected))
+    if (RStructuralTrussDynamicsRestartAdapter::stateFingerprint(record,model.getProblemSetup().getStructuralNativeControlState()) !=
+        RStructuralTrussDynamicsRestartAdapter::stateFingerprint(expected,step.nextState->modelControlState))
         fail("Native mixed prepared model recovery record differs from its complete physical candidate.");
     const auto &time = model.getTimeSolver();
     const auto &times = time.getTimes();

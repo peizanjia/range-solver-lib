@@ -9,6 +9,7 @@ struct RStructuralTrussDynamicsRestoredState
     RStructuralTrussDynamicsState state;
     uint completedSteps = 0;
     uint nextCommandIndex = 0;
+    RStructuralNativeControlState controlState;
 };
 
 class RStructuralTrussDynamicsRestartAdapter
@@ -18,11 +19,22 @@ public:
         const RStructuralTrussDynamicsModelAdapter &adapter,
         const RStructuralTrussDynamicsState &state,
         uint completedSteps,uint nextCommandIndex);
+    static RStructuralTrussDynamicsRestartData build(
+        const RStructuralTrussDynamicsModelAdapter &adapter,
+        const RStructuralTrussDynamicsState &state,
+        uint completedSteps,uint nextCommandIndex,
+        const RStructuralNativeControlState &controlState);
     static RStructuralTrussDynamicsRestoredState restore(
         const RStructuralTrussDynamicsModelAdapter &adapter,
         const RStructuralTrussDynamicsRestartData &record);
+    static RStructuralTrussDynamicsRestoredState restore(
+        const RStructuralTrussDynamicsModelAdapter &adapter,
+        const RStructuralTrussDynamicsRestartData &record,
+        const RStructuralNativeControlState &controlState);
     //! Exact binary64 complete-record SHA256 compatibility seal, not authentication.
     static QString stateFingerprint(const RStructuralTrussDynamicsRestartData &record);
+    static QString stateFingerprint(const RStructuralTrussDynamicsRestartData &record,
+                                    const RStructuralNativeControlState &controlState);
 };
 
 #endif

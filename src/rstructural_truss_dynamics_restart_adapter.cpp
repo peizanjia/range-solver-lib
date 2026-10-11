@@ -1,4 +1,5 @@
 #include "rstructural_truss_dynamics_restart_adapter.h"
+#include "rstructural_native_control.h"
 
 #include <algorithm>
 #include <cmath>
@@ -32,13 +33,26 @@ double inputValue(const RStructuralTrussInput &input)
 }
 
 void verifyPhase(const RStructuralTrussDynamicsModelAdapter &adapter,
-    const RStructuralTrussDynamicsState &state,uint completed,uint cursor)
+    const RStructuralTrussDynamicsState &state,uint completed,uint cursor,
+    const RStructuralNativeControlState &controlState)
 {
     if (completed > adapter.targetSteps() || cursor != adapter.commandCursor(completed) ||
         state.time != adapter.targetTime(completed) || state.systemIdentity != adapter.driver().systemIdentity())
         fail("Native mixed accepted state has a different system, canonical physical clock or command phase.");
-    const auto replay = adapter.replayInputs(completed);
-    const auto &expected = replay.completeInputs;
+    const bool local = adapter.nativeControlSpec().source == RStructuralNativeControlSource::LocalV3;
+    RStructuralTrussDynamicsInputs expected;
+    if (local)
+    {
+        const RStructuralNativeControl control(adapter);
+        control.validateAccepted(controlState,completed);
+        expected = control.completeInputs(controlState.lastAppliedValues);
+    }
+    else
+    {
+        controlState.validate();
+        if (controlState.hasNonDefaultData()) fail("Native frozen-table state cannot carry LocalV3 controller data.");
+        expected = adapter.replayInputs(completed).completeInputs;
+    }
     const auto &actual = state.appliedInputs;
     if (actual.externalForces != expected.externalForces || actual.memberInputs.size() != expected.memberInputs.size())
         fail("Native mixed accepted applied inputs differ from complete frozen command replay.");
@@ -46,6 +60,18 @@ void verifyPhase(const RStructuralTrussDynamicsModelAdapter &adapter,
         if (actual.memberInputs[i].index() != expected.memberInputs[i].index() ||
             inputValue(actual.memberInputs[i]) != inputValue(expected.memberInputs[i]))
             fail("Native mixed accepted member input kind/value differs from complete frozen command replay.");
+    if (local)
+    {
+        for (std::size_t i=0;i<actual.externalForces.size();++i)
+            if (std::memcmp(&actual.externalForces[i],&expected.externalForces[i],sizeof(double))!=0)
+                fail("Native LocalV3 applied force bits differ from complete action mapping.");
+        for (std::size_t i=0;i<actual.memberInputs.size();++i)
+        {
+            const double a=inputValue(actual.memberInputs[i]),b=inputValue(expected.memberInputs[i]);
+            if (std::memcmp(&a,&b,sizeof(double))!=0)
+                fail("Native LocalV3 applied member bits differ from complete action mapping.");
+        }
+    }
     const auto &system=adapter.system();
     const auto n=system.prescribedMask.size();
     if (state.displacements.size()!=n || state.velocities.size()!=n || state.accelerations.size()!=n)
@@ -169,7 +195,16 @@ RStructuralTrussDynamicsRestartData RStructuralTrussDynamicsRestartAdapter::buil
     const RStructuralTrussDynamicsModelAdapter &adapter,const RStructuralTrussDynamicsState &state,
     uint completed,uint cursor)
 {
-    verifyPhase(adapter,state,completed,cursor);
+    if (adapter.nativeControlSpec().source != RStructuralNativeControlSource::FrozenTable)
+        fail("Native LocalV3 checkpoint requires complete controller state.");
+    return build(adapter,state,completed,cursor,RStructuralNativeControlState{});
+}
+
+RStructuralTrussDynamicsRestartData RStructuralTrussDynamicsRestartAdapter::build(
+    const RStructuralTrussDynamicsModelAdapter &adapter,const RStructuralTrussDynamicsState &state,
+    uint completed,uint cursor,const RStructuralNativeControlState &controlState)
+{
+    verifyPhase(adapter,state,completed,cursor,controlState);
     const auto assembly = observe(adapter,state);
     RStructuralTrussDynamicsRestartData record;
     record.available = true;
@@ -199,6 +234,15 @@ RStructuralTrussDynamicsRestartData RStructuralTrussDynamicsRestartAdapter::buil
 
 RStructuralTrussDynamicsRestoredState RStructuralTrussDynamicsRestartAdapter::restore(
     const RStructuralTrussDynamicsModelAdapter &adapter,const RStructuralTrussDynamicsRestartData &record)
+{
+    if (adapter.nativeControlSpec().source != RStructuralNativeControlSource::FrozenTable)
+        fail("Native LocalV3 restart requires complete controller state.");
+    return restore(adapter,record,RStructuralNativeControlState{});
+}
+
+RStructuralTrussDynamicsRestoredState RStructuralTrussDynamicsRestartAdapter::restore(
+    const RStructuralTrussDynamicsModelAdapter &adapter,const RStructuralTrussDynamicsRestartData &record,
+    const RStructuralNativeControlState &controlState)
 {
     record.validate();
     if (!record.available || record.sourceFingerprint != adapter.sourceFingerprint() ||
@@ -232,7 +276,7 @@ RStructuralTrussDynamicsRestoredState RStructuralTrussDynamicsRestartAdapter::re
     state.cumulativeSupportWork = record.cumulativeSupportWork;
     state.cumulativeElectricalWork = record.cumulativeElectricalWork;
     state.cumulativeLengthWork = record.cumulativeRestLengthWork;
-    verifyPhase(adapter,state,record.completedSteps,record.nextCommandIndex);
+    verifyPhase(adapter,state,record.completedSteps,record.nextCommandIndex,controlState);
     const auto assembly = observe(adapter,state);
     std::vector<double> voltages,charges,enthalpies;
     portObservations(adapter,assembly,voltages,charges,enthalpies);
@@ -240,6 +284,7 @@ RStructuralTrussDynamicsRestoredState RStructuralTrussDynamicsRestartAdapter::re
     verifyDerivedVector(record.portCharges,charges);
     verifyDerivedVector(record.portEnthalpies,enthalpies);
     restored.completedSteps = record.completedSteps; restored.nextCommandIndex = record.nextCommandIndex;
+    restored.controlState = controlState;
     return restored;
 }
 
@@ -260,5 +305,17 @@ QString RStructuralTrussDynamicsRestartAdapter::stateFingerprint(const RStructur
     writer.real(record.storedEnergy); writer.real(record.kineticEnergy); writer.real(record.initialTotalEnergy);
     writer.real(record.cumulativeExternalWork); writer.real(record.cumulativeSupportWork);
     writer.real(record.cumulativeElectricalWork); writer.real(record.cumulativeRestLengthWork);
+    return writer.digest();
+}
+
+QString RStructuralTrussDynamicsRestartAdapter::stateFingerprint(
+    const RStructuralTrussDynamicsRestartData &record,const RStructuralNativeControlState &controlState)
+{
+    controlState.validate();
+    if (!controlState.hasNonDefaultData()) return stateFingerprint(record);
+    StateWriter writer;
+    writer.text(QStringLiteral("range-fea/native-mixed-truss/accepted-state/local-v3/v1/binary64"));
+    writer.text(stateFingerprint(record));
+    writer.bytes(controlState.fingerprintBytes());
     return writer.digest();
 }

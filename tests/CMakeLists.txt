@@ -40,6 +40,7 @@ set(range_solver_lib_tests
     tst_structural_control_runtime_parameters
     tst_structural_runtime_parameters_fe
     tst_structural_typed_control
+    tst_structural_native_control
     tst_structural_dynamics_fe
     tst_structural_dynamics_beam
     tst_structural_dynamics_loads
@@ -75,7 +76,12 @@ foreach(test_name IN LISTS range_solver_lib_tests)
             range-solver-lib
             Qt6::Test
     )
-    add_test(NAME ${test_name} COMMAND ${test_name})
+    if(test_name STREQUAL "tst_structural_native_control")
+        add_test(NAME ${test_name} COMMAND ${test_name}
+            -o "${CMAKE_CURRENT_BINARY_DIR}/native-control-core-detail.txt,txt" -o -,txt)
+    else()
+        add_test(NAME ${test_name} COMMAND ${test_name})
+    endif()
     if(WIN32)
         set_tests_properties(${test_name} PROPERTIES
             ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")

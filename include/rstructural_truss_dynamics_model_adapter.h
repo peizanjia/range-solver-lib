@@ -5,6 +5,7 @@
 #include <memory>
 #include <QString>
 #include <rml_structural_truss_dynamics_setup.h>
+#include <rml_structural_native_control.h>
 #include "rstructural_truss_dynamics.h"
 
 class RModel;
@@ -48,6 +49,8 @@ public:
     double nominalTimeStep() const { return frozenDt; }
     uint targetSteps() const { return frozenTargetSteps; }
     const RStructuralTrussDynamicsOptions &options() const { return frozenOptions; }
+    const RStructuralNativeControlSpec &nativeControlSpec() const { return frozenControlSpec; }
+    const RStructuralTrussDynamicsInputs &initialCompleteInputs() const { return initialInputs; }
     double targetTime(uint completedSteps) const;
     uint commandCursor(uint completedSteps) const;
     RStructuralTrussDynamicsState initialize() const;
@@ -59,13 +62,22 @@ public:
     RStructuralTrussDynamicsModelTrial trial(
         const RStructuralTrussDynamicsState &state,
         uint completedSteps,uint nextCommandIndex) const;
+    //! LocalV3 only: caller supplies every physical input; no table replay.
+    RStructuralTrussDynamicsModelTrial trialWithCompleteInputs(
+        const RStructuralTrussDynamicsState &state,uint completedSteps,
+        const RStructuralTrussDynamicsInputs &inputs) const;
     //! Validate and publish into an independent copy of source.
     RModel candidateModel(const RModel &source,
         const RStructuralTrussDynamicsState &state,
         uint completedSteps,uint nextCommandIndex) const;
+    RModel candidateModel(const RModel &source,
+        const RStructuralTrussDynamicsState &state,
+        uint completedSteps,uint nextCommandIndex,
+        const RStructuralNativeControlState &controlState) const;
 
 private:
     RStructuralTrussDynamicsSetup frozenSetup;
+    RStructuralNativeControlSpec frozenControlSpec;
     RStructuralTrussDynamicsSystem frozenSystem;
     RStructuralTrussDynamicsModelMaps frozenMaps;
     RStructuralTrussDynamicsInputs initialInputs;
