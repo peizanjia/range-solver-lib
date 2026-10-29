@@ -127,6 +127,7 @@ private slots:
     void singularLinearCertificateIsTransactional();
     void freeCableTautToSlack();
     void freeMassWithMovingSupport();
+    void acceptedStateCertificationReturnsValidatedAssembly();
 };
 
 void TestStructuralTrussDynamics::axialOscillators_data()
@@ -489,6 +490,27 @@ void TestStructuralTrussDynamics::smallStepAtFiniteDisplacement()
     const double expectedV=-.05*omega*std::sin(omega*time)+.07*std::cos(omega*time);
     QVERIFY(std::abs(state.displacements[3]-expectedQ)<1e-13);
     QVERIFY(std::abs(state.velocities[3]-expectedV)<1e-12);
+}
+
+void TestStructuralTrussDynamics::acceptedStateCertificationReturnsValidatedAssembly()
+{
+    const auto system=axial();RStructuralTrussDynamics driver(system);
+    std::vector<double> q(6,0.0),v(6,0.0);q[3]=.05;v[3]=.07;
+    auto state=driver.initialize(0,q,v,held());
+    state=advance(driver,state,held(),.001,20);
+    const auto before=snapshot(state);
+    const auto certified=driver.certifyAcceptedState(state);
+    const auto expected=RStructuralTrussAssembly::evaluate(system.referenceNodes,state.displacements,
+                                                           system.members,state.appliedInputs.memberInputs);
+    QCOMPARE(certified.storedEnergy,expected.storedEnergy);
+    QCOMPARE(certified.internalForces.size(),expected.internalForces.size());
+    for(std::size_t i=0;i<expected.internalForces.size();++i)
+        QCOMPARE(certified.internalForces[i],expected.internalForces[i]);
+    QCOMPARE(snapshot(state),before);
+    auto corrupt=state;corrupt.reactions[3]+=1.0;
+    const auto corruptBefore=snapshot(corrupt);
+    QVERIFY(throws([&]{driver.certifyAcceptedState(corrupt);}));
+    QCOMPARE(snapshot(corrupt),corruptBefore);
 }
 
 QTEST_APPLESS_MAIN(TestStructuralTrussDynamics)

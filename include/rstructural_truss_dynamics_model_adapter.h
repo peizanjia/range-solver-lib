@@ -6,9 +6,11 @@
 #include <QString>
 #include <rml_structural_truss_dynamics_setup.h>
 #include <rml_structural_native_control.h>
+#include <rml_structural_piezo_readout_setup.h>
 #include "rstructural_truss_dynamics.h"
 
 class RModel;
+class RStructuralPiezoNativeReadout;
 
 struct RStructuralTrussDynamicsModelMaps
 {
@@ -40,6 +42,7 @@ class RStructuralTrussDynamicsModelAdapter
 {
 public:
     explicit RStructuralTrussDynamicsModelAdapter(const RModel &model);
+    ~RStructuralTrussDynamicsModelAdapter();
     const RStructuralTrussDynamics &driver() const { return *frozenDriver; }
     const RStructuralTrussDynamicsSystem &system() const { return frozenSystem; }
     const RStructuralTrussDynamicsModelMaps &maps() const { return frozenMaps; }
@@ -50,10 +53,14 @@ public:
     uint targetSteps() const { return frozenTargetSteps; }
     const RStructuralTrussDynamicsOptions &options() const { return frozenOptions; }
     const RStructuralNativeControlSpec &nativeControlSpec() const { return frozenControlSpec; }
+    const RStructuralPiezoReadoutSetup &piezoReadoutSetup() const { return frozenReadoutSetup; }
+    const RStructuralPiezoNativeReadout &piezoReadout() const;
     const RStructuralTrussDynamicsInputs &initialCompleteInputs() const { return initialInputs; }
     double targetTime(uint completedSteps) const;
     uint commandCursor(uint completedSteps) const;
     RStructuralTrussDynamicsState initialize() const;
+    //! Source initial state without constructing a controller or readout recursively.
+    RStructuralTrussDynamicsState sourceInitialState() const;
     void validateCurrentSource(const RModel &model) const;
     RStructuralTrussDynamicsAction actionForStep(
         const RStructuralTrussDynamicsInputs &acceptedInputs,
@@ -78,6 +85,7 @@ public:
 private:
     RStructuralTrussDynamicsSetup frozenSetup;
     RStructuralNativeControlSpec frozenControlSpec;
+    RStructuralPiezoReadoutSetup frozenReadoutSetup;
     RStructuralTrussDynamicsSystem frozenSystem;
     RStructuralTrussDynamicsModelMaps frozenMaps;
     RStructuralTrussDynamicsInputs initialInputs;
@@ -87,6 +95,7 @@ private:
     uint frozenTargetSteps = 0;
     RStructuralTrussDynamicsOptions frozenOptions;
     std::unique_ptr<RStructuralTrussDynamics> frozenDriver;
+    std::unique_ptr<RStructuralPiezoNativeReadout> frozenReadout;
 };
 
 #endif

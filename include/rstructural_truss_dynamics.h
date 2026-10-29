@@ -14,12 +14,18 @@ struct RStructuralTrussDynamicsSystem
     //! Required full-size array. Free and curve-owned entries must be zero.
     std::vector<double> fixedPrescribedDisplacements;
     std::vector<RStructuralPrescribedMotion> prescribedMotions;
+    //! Optional full node-order xyz row-major C [N s/m]. Empty means zero.
+    //! Constructor certifies a finite symmetric positive semidefinite matrix.
+    std::vector<double> physicalDamping;
 };
 
 struct RStructuralTrussDynamicsInputs
 {
     std::vector<RStructuralTrussInput> memberInputs;
     std::vector<double> externalForces;
+    //! Trial-only endpoint f(t_n+1). Empty holds externalForces over the interval.
+    //! Accepted appliedInputs always contain only the actual endpoint force.
+    std::vector<double> rightExternalForces;
 };
 
 struct RStructuralTrussDynamicsOptions
@@ -36,7 +42,7 @@ struct RStructuralTrussDynamicsState
     double time = 0.0;
     std::vector<double> displacements, velocities, accelerations;
     RStructuralTrussDynamicsInputs appliedInputs;
-    std::vector<double> reactions; //!< Full M*a+fint-fexternal, including free residual.
+    std::vector<double> reactions; //!< Full M*a+C*v+fint-fexternal, including free residual.
     double storedEnergy = 0.0;
     double kineticEnergy = 0.0;
     double cumulativeExternalWork = 0.0;
@@ -45,12 +51,14 @@ struct RStructuralTrussDynamicsState
     double cumulativeLengthWork = 0.0;
     double initialTotalEnergy = 0.0;
     QByteArray systemIdentity; //!< SHA256 compatibility binding; not authentication.
+    double cumulativeDampingDissipation = 0.0;
 };
 
 struct RStructuralTrussDynamicsWork
 {
     double externalWork = 0.0, supportWork = 0.0;
     double electricalWork = 0.0, lengthWork = 0.0;
+    double dampingDissipation = 0.0;
 };
 
 struct RStructuralTrussDynamicsResult
@@ -64,8 +72,9 @@ struct RStructuralTrussDynamicsResult
 
 //! Pure, fixed-mass mixed TRUSS1 Newmark beta=1/4, gamma=1/2 driver.
 //! Constructor copies and freezes geometry/laws/mass/supports/analytic curves.
-//! Commands are held over each step: voltage, conductor charge, cable L0 and
-//! external force. No time-varying L0 path exists in this API. V/Q switching,
+//! Commands are held over each step: voltage, conductor charge and cable L0.
+//! External force may have separate left/right endpoints; work uses their mean.
+//! No time-varying L0 path exists in this API. V/Q switching,
 //! support impulses, extrapolation, rotations, MPC and shared circuits are absent.
 //! initialize requires prescribed q/v to agree with frozen analytic values.
 //! refresh and trialStep revalidate the complete accepted left state and return
@@ -77,10 +86,20 @@ public:
     RStructuralTrussDynamicsState initialize(double time,
         const std::vector<double> &displacements, const std::vector<double> &velocities,
         const RStructuralTrussDynamicsInputs &inputs) const;
+    //! Validate an accepted state and return its already-certified physical
+    //! assembly for readout extraction. This does not advance or mutate state.
+    RStructuralTrussAssemblyResult certifyAcceptedState(const RStructuralTrussDynamicsState &accepted) const;
     RStructuralTrussDynamicsResult refresh(const RStructuralTrussDynamicsState &accepted,
         const RStructuralTrussDynamicsInputs &newHeldInputs) const;
     RStructuralTrussDynamicsResult trialStep(const RStructuralTrussDynamicsState &accepted,
         const RStructuralTrussDynamicsInputs &newHeldInputs, double dt,
+        const RStructuralTrussDynamicsOptions &options = {}) const;
+    //! Exact original grid endpoint t0+stepIndex*nominalDt; physics uses its
+    //! representable difference from the certified preceding endpoint.
+    //! The caller owns original-grid identity across persisted restarts.
+    RStructuralTrussDynamicsResult trialStepOnGrid(const RStructuralTrussDynamicsState &accepted,
+        const RStructuralTrussDynamicsInputs &inputs, double time0,
+        std::uint64_t stepIndex, double nominalDt,
         const RStructuralTrussDynamicsOptions &options = {}) const;
     const QByteArray &systemIdentity() const { return identity; }
 
@@ -88,6 +107,10 @@ private:
     RStructuralTrussDynamicsSystem system;
     QByteArray identity;
     std::vector<std::size_t> freeDofs;
+    bool zeroDamping = true;
+    RStructuralTrussDynamicsResult trialInterval(const RStructuralTrussDynamicsState &accepted,
+        const RStructuralTrussDynamicsInputs &inputs, double dt, double endTime,
+        const RStructuralTrussDynamicsOptions &options) const;
     void prescribed(double time, std::vector<double> &q,
                     std::vector<double> &v, std::vector<double> &a) const;
     void validateInputs(const RStructuralTrussDynamicsInputs &inputs) const;

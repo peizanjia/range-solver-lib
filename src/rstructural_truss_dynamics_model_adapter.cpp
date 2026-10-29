@@ -2,6 +2,7 @@
 #include "rstructural_truss_dynamics_restart_adapter.h"
 #include "rstructural_static_truss_model.h"
 #include "rstructural_native_control.h"
+#include "rstructural_piezo_native_readout.h"
 
 #include <algorithm>
 #include <cmath>
@@ -220,6 +221,7 @@ RStructuralTrussDynamicsModelAdapter::RStructuralTrussDynamicsModelAdapter(const
     preflight(model);
     frozenSetup = model.getProblemSetup().getStructuralTrussDynamicsSetup();
     frozenControlSpec = model.getProblemSetup().getStructuralNativeControlSpec();
+    frozenReadoutSetup = model.getProblemSetup().getStructuralPiezoReadoutSetup();
     frozenFingerprint = frozenSetup.computeSourceFingerprint(model);
     if (frozenSetup.sourceFingerprint != frozenFingerprint)
         fail("Native mixed model must be bound to its exact current source before freezing.");
@@ -324,10 +326,25 @@ RStructuralTrussDynamicsModelAdapter::RStructuralTrussDynamicsModelAdapter(const
             fail(QString("Native mixed free DOF at physical node %1, axis %2 has no positive frozen mass.")
                  .arg(frozenMaps.orderedPhysicalNodeIds[d/3]).arg(uint(d%3)));
     frozenDriver = std::make_unique<RStructuralTrussDynamics>(frozenSystem);
+    if (frozenReadoutSetup.hasNonDefaultData())
+        frozenReadout = std::make_unique<RStructuralPiezoNativeReadout>(*this,frozenReadoutSetup);
     if (frozenControlSpec.source == RStructuralNativeControlSource::LocalV3)
     {
         const RStructuralNativeControl provider(*this); // Resolve the actual compiled factory during preflight.
     }
+}
+
+RStructuralTrussDynamicsModelAdapter::~RStructuralTrussDynamicsModelAdapter() = default;
+
+RStructuralTrussDynamicsState RStructuralTrussDynamicsModelAdapter::sourceInitialState() const
+{
+    return frozenDriver->initialize(frozenInitialTime,initialQ,initialV,initialInputs);
+}
+
+const RStructuralPiezoNativeReadout &RStructuralTrussDynamicsModelAdapter::piezoReadout() const
+{
+    if (!frozenReadout) fail("Native piezo readout requires a classified source catalog.");
+    return *frozenReadout;
 }
 
 double RStructuralTrussDynamicsModelAdapter::targetTime(uint steps) const

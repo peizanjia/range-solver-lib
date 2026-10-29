@@ -42,7 +42,7 @@ namespace
 bool isNativeMixedStressTask(const RProblemTaskItem &task)
 {
     if (task.getProblemType() == R_PROBLEM_STRESS)
-        return task.getNChildren() == 0;
+        return task.getNChildren() == 0 && task.getNIterations() == 1;
     return task.getProblemType() == R_PROBLEM_NONE && task.getNIterations() == 1 &&
         task.getNChildren() == 1 && isNativeMixedStressTask(task.getChild(0));
 }
@@ -800,6 +800,58 @@ public:
 
 void RSolver::_init()
 {
+    if (this->pModel->getProblemSetup().getStructuralPiezoAxialSetup().enabled)
+    {
+        // Certify the actual axial operators before any generic result cleanup
+        // or legacy initial-condition interpretation. The facade validates all
+        // supported topology and requires the parent scalar truss source.
+        auto native = std::make_unique<RStructuralPiezoAxialNativeRun>(
+            *this->pModel,this->nativeAxialCallbacks);
+        if (!isNativeMixedStressTask(this->pModel->getProblemTaskTree()))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Native axial dynamics requires one stress leaf with no repeated task iterations.");
+        if (!this->pModel->getMonitoringPointManager().empty())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Native axial dynamics cannot map legacy monitoring points; use native result frames and named port outputs.");
+        const QString stressConvergence = RFileUtils::getFileNameWithSuffix(
+            this->convergenceFileName,RProblem::getId(R_PROBLEM_STRESS));
+        auto stress = std::make_unique<RSolverStress>(this->pModel,this->modelFileName,
+                                                     stressConvergence,this->sharedData,false);
+        // Writer/frame forwarding only; never invoke the generic stress FE path.
+        this->solversExecutionCount.insert(R_PROBLEM_STRESS,native->completedSteps());
+        this->solvers.insert(R_PROBLEM_STRESS,stress.get());
+        stress.release();
+        this->nativeAxialRun = std::move(native);
+        return;
+    }
+    if (this->pModel->getProblemSetup().getStructuralPiezoAxialSetup().hasNonDefaultData()
+        || this->pModel->getProblemSetup().getStructuralPiezoAxialRestart().hasNonDefaultData())
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Disabled axial experiments cannot enter the legacy solver route.");
+    if (this->pModel->getProblemSetup().getStructuralPiezoLayeredSetup().enabled)
+    {
+        // Certify the actual layered operators before any generic result cleanup
+        // or legacy initial-condition interpretation. The facade validates all
+        // supported topology and rejects mixed source/control declarations.
+        auto native = std::make_unique<RStructuralPiezoLayeredNativeRun>(
+            *this->pModel,this->nativeLayeredCallbacks);
+        if (!isNativeMixedStressTask(this->pModel->getProblemTaskTree()))
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Native layered dynamics requires one stress leaf with no repeated task iterations.");
+        if (!this->pModel->getMonitoringPointManager().empty())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Native layered dynamics cannot map legacy monitoring points; use native result frames and named port outputs.");
+        const QString stressConvergence = RFileUtils::getFileNameWithSuffix(
+            this->convergenceFileName,RProblem::getId(R_PROBLEM_STRESS));
+        auto stress = std::make_unique<RSolverStress>(this->pModel,this->modelFileName,
+                                                     stressConvergence,this->sharedData,false);
+        // Writer/frame forwarding only; never invoke the generic stress FE path.
+        this->solversExecutionCount.insert(R_PROBLEM_STRESS,native->completedSteps());
+        this->solvers.insert(R_PROBLEM_STRESS,stress.get());
+        stress.release();
+        this->nativeLayeredRun = std::move(native);
+        return;
+    }
     RProblemTypeMask problemTypeMask = this->pModel->getProblemTaskTree().getProblemTypeMask();
     if (problemTypeMask == R_PROBLEM_NONE)
     {
@@ -995,12 +1047,16 @@ void RSolver::_init()
 RSolver::RSolver(RModel &model,
                  const QString &modelFileName,
                  const QString &convergenceFileName,
-                 ExecutionPolicy executionPolicy)
+                 ExecutionPolicy executionPolicy,
+                 RStructuralPiezoLayeredRuntimeCallbacks layeredCallbacks,
+                 RStructuralPiezoAxialRuntimeCallbacks axialCallbacks)
     : pModel(&model)
     , modelFileName(modelFileName)
     , convergenceFileName(convergenceFileName)
     , executionPolicy(executionPolicy)
     , transientHeatStressRetryPending(false)
+    , nativeLayeredCallbacks(std::move(layeredCallbacks))
+    , nativeAxialCallbacks(std::move(axialCallbacks))
 {
     this->_init();
 }
@@ -1020,10 +1076,12 @@ void RSolver::setParallelExecutionReportObserver(ParallelExecutionReportObserver
 
 void RSolver::setStructuralSupportResponseObserver(StructuralSupportResponseObserver observer)
 {
-    if ((this->nativeMixedRun ||
+    if ((this->nativeMixedRun || this->nativeLayeredRun || this->nativeAxialRun ||
+         this->pModel->getProblemSetup().getStructuralPiezoAxialSetup().enabled ||
+         this->pModel->getProblemSetup().getStructuralPiezoLayeredSetup().enabled ||
          this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled) && observer)
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Native mixed dynamics does not support legacy support-response observers; full semantic mapping is pending.");
+                     "Dedicated native dynamics does not support legacy support-response observers; full semantic mapping is pending.");
     if ((this->pModel->getProblemSetup().getStructuralCableSetup().enabled ||
          this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled) && observer)
     {
@@ -1055,11 +1113,13 @@ void RSolver::setStructuralControlCallback(const QString &controllerId,
                                            const QString &controllerRevision,
                                           StructuralControlCallback callback)
 {
-    if ((this->nativeMixedRun ||
+    if ((this->nativeMixedRun || this->nativeLayeredRun || this->nativeAxialRun ||
+         this->pModel->getProblemSetup().getStructuralPiezoAxialSetup().enabled ||
+         this->pModel->getProblemSetup().getStructuralPiezoLayeredSetup().enabled ||
          this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled) &&
         (callback || !controllerId.isEmpty() || !controllerRevision.isEmpty()))
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Native mixed held-input dynamics does not support legacy controller callbacks or identities; v3 integration is pending.");
+                     "Dedicated native dynamics does not support legacy controller callbacks or identities.");
     const bool cableDynamics =
         this->pModel->getProblemSetup().getStructuralCableSetup().enabled &&
         this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
@@ -1083,10 +1143,12 @@ void RSolver::setStructuralControlCallback(const QString &controllerId,
 
 void RSolver::setStructuralControlStepObserver(StructuralControlStepObserver observer)
 {
-    if ((this->nativeMixedRun ||
+    if ((this->nativeMixedRun || this->nativeLayeredRun || this->nativeAxialRun ||
+         this->pModel->getProblemSetup().getStructuralPiezoAxialSetup().enabled ||
+         this->pModel->getProblemSetup().getStructuralPiezoLayeredSetup().enabled ||
          this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled) && observer)
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Native mixed held-input dynamics does not support legacy control-step observers; v3 integration is pending.");
+                     "Dedicated native dynamics does not support legacy control-step observers.");
     const bool cableDynamics =
         this->pModel->getProblemSetup().getStructuralCableSetup().enabled &&
         this->pModel->getProblemSetup().getStructuralDynamicsSetup().getEnabled();
@@ -1154,10 +1216,14 @@ void RSolver::setAcceptedStructuralStepObserver(
 
 void RSolver::setAcceptedStepParticipant(std::shared_ptr<RAcceptedStepParticipant> participant)
 {
-    if (!this->nativeMixedRun ||
-        !this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled)
+    const bool axialSource = this->pModel->getProblemSetup().getStructuralPiezoAxialSetup().enabled;
+    const bool mixedSource = this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled && !axialSource;
+    const bool layeredSource = this->pModel->getProblemSetup().getStructuralPiezoLayeredSetup().enabled;
+    if (!((this->nativeMixedRun && mixedSource && !layeredSource && !axialSource) ||
+          (this->nativeLayeredRun && layeredSource && !mixedSource && !axialSource) ||
+          (this->nativeAxialRun && axialSource && !layeredSource)))
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Accepted-step publication participants currently require native mixed dynamics.");
+                     "Accepted-step publication participants require dedicated native mixed, layered or axial dynamics.");
     this->acceptedStepParticipant = std::move(participant);
 }
 
@@ -1170,9 +1236,45 @@ void RSolver::setNativeMixedStepBudget(uint stepBudget)
     this->nativeMixedStepBudget = stepBudget;
 }
 
+void RSolver::setNativeAcceptedTraceOutput(bool enabled)
+{
+    if(enabled && ((!this->nativeLayeredRun && !this->nativeAxialRun) || !this->acceptedStepParticipant))
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Complete accepted trace output requires native piezo dynamics and its publication participant.");
+    this->nativeAcceptedTraceOutput=enabled;
+}
+
 bool RSolver::isNativeMixedRetryable() const noexcept
 {
     return this->nativeMixedRun && this->nativeMixedRun->isRetryable();
+}
+
+void RSolver::setNativeLayeredStepBudget(uint stepBudget)
+{
+    if (!this->nativeLayeredRun ||
+        !this->pModel->getProblemSetup().getStructuralPiezoLayeredSetup().enabled)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native layered step budgets require the dedicated layered dynamics mode.");
+    this->nativeLayeredStepBudget = stepBudget;
+}
+
+bool RSolver::isNativeLayeredRetryable() const noexcept
+{
+    return this->nativeLayeredRun && this->nativeLayeredRun->isRetryable();
+}
+
+void RSolver::setNativeAxialStepBudget(uint stepBudget)
+{
+    if (!this->nativeAxialRun ||
+        !this->pModel->getProblemSetup().getStructuralPiezoAxialSetup().enabled)
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native axial step budgets require the dedicated axial dynamics mode.");
+    this->nativeAxialStepBudget = stepBudget;
+}
+
+bool RSolver::isNativeAxialRetryable() const noexcept
+{
+    return this->nativeAxialRun && this->nativeAxialRun->isRetryable();
 }
 
 void RSolver::runNativeMixed()
@@ -1317,8 +1419,199 @@ void RSolver::runNativeMixed()
     }
 }
 
+void RSolver::runNativeLayered()
+{
+    this->runNativePiezo(*this->nativeLayeredRun,this->nativeLayeredStepBudget,this->nativeLayeredRollbackModel);
+}
+
+void RSolver::runNativeAxial()
+{
+    this->runNativePiezo(*this->nativeAxialRun,this->nativeAxialStepBudget,this->nativeAxialRollbackModel);
+}
+
+template<class NativeRun>
+void RSolver::runNativePiezo(NativeRun &run,uint stepBudget,std::unique_ptr<RModel> &rollbackModel)
+{
+    if (!run.isRetryable())
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native piezo run cannot retry after incomplete rollback; the accepted model backup is retained.");
+    if (this->structuralSupportResponseObserver || this->structuralControlCallback ||
+        this->structuralControlStepObserver || !this->structuralControllerId.isEmpty() ||
+        !this->structuralControllerRevision.isEmpty())
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native piezo dynamics rejects legacy control and support observer callbacks.");
+    if (!isNativeMixedStressTask(this->pModel->getProblemTaskTree()))
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native piezo dynamics requires one stress leaf with no repeated task iterations.");
+    run.validateCurrentSource(*this->pModel);
+
+    // The bounded dense native piezo plant is qualified under one deterministic
+    // OpenMP worker. Report the policy actually used by its numerical driver.
+    const auto &requestedPolicy = this->pModel->getProblemSetup().getParallelExecutionConfig();
+    requestedPolicy.validate();
+    RParallelExecutionConfig serialPolicy;
+    serialPolicy.setMode(RParallelExecutionMode::SerialDeterministic);
+    RParallelExecutionContext parallelContext(serialPolicy);
+    auto parallel = parallelContext.getReport();
+    parallel.requestedThreads = requestedPolicy.getRequestedThreads();
+    if (requestedPolicy.getMode() != RParallelExecutionMode::SerialDeterministic)
+    {
+        parallel.fallback = true;
+        parallel.diagnostic = QStringLiteral("Native piezo dense FE uses the qualified deterministic serial policy; the source thread policy is retained for other routes.");
+    }
+    if (this->parallelExecutionReportObserver)
+        this->parallelExecutionReportObserver(parallel);
+    RLogger::info("Parallel execution: requested=%u applied=%u actual=%u backend=%s deterministic=%s\n",
+                  parallel.requestedThreads,parallel.appliedThreads,parallel.actualThreads,
+                  parallel.backend.toUtf8().constData(),parallel.deterministicReduction ? "yes" : "no");
+    if (!parallel.diagnostic.isEmpty())
+        RLogger::warning("Parallel execution: %s\n",parallel.diagnostic.toUtf8().constData());
+    // A reporting callback can capture mutable source; recheck it before any
+    // trial or output transaction, even when the original target is exhausted.
+    run.validateCurrentSource(*this->pModel);
+    const RModel baseline = run.acceptedModel(*this->pModel);
+    if (!baseline.getMonitoringPointManager().empty())
+        throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                     "Native piezo dynamics cannot map legacy monitoring points.");
+    auto *stress = static_cast<RSolverStress*>(this->solvers.value(R_PROBLEM_STRESS,nullptr));
+    if (!stress)
+        throw RError(RError::Type::Application,R_ERROR_REF,
+                     "Native piezo run has no registered native output forwarder.");
+    TransientOutputLock outputRunLock(this->modelFileName);
+    TransientMonitoringOutputRunLock monitoringRunLock(baseline.getMonitoringPointManager(),
+                                                      this->modelFileName,baseline.getTimeSolver());
+    rejectUnpublishedOutputRecords(this->modelFileName,baseline.getTimeSolver(),
+                                   run.completedSteps() != 0);
+    // Freeze per-invocation policy. Notifications may configure a later run,
+    // but cannot alter this invocation's prepared checkpoint boundary.
+    const uint budget = stepBudget;
+    const auto participant = this->acceptedStepParticipant;
+    uint invocationAcceptedSteps = 0;
+    // QMap lookup/detach/allocation is before the decision interval. No map
+    // operation occurs between final publication and the noexcept promotions.
+    uint &executionCount = this->solversExecutionCount[R_PROBLEM_STRESS];
+    while (run.hasRemainingSteps())
+    {
+        if (RApplicationState::getInstance().getStateType() == R_APPLICATION_STATE_STOP)
+            break;
+        const bool invocationBoundary = budget != 0 && invocationAcceptedSteps+1 == budget;
+        auto prepared = run.prepare(*this->pModel,invocationBoundary);
+        run.validatePrepared(*prepared);
+        if (!prepared->candidateModel().getMonitoringPointManager().empty())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Native piezo candidate contains unsupported legacy monitoring points.");
+        auto acceptedModel = std::make_unique<RModel>(*this->pModel);
+        const QString acceptedWriterPath = stress->modelFileName;
+        DeferredOutputTransaction outputTransaction;
+        TransientMonitoringOutputTransaction monitoringTransaction;
+        std::unique_ptr<RAcceptedStepPublication> publication;
+        bool modelAssignmentAttempted = false;
+        try
+        {
+            // The complete trace preserves every FE state independently of
+            // display frequency; repeated MODEL output is a separate policy.
+            if(!this->nativeAcceptedTraceOutput)
+                outputTransaction.prepare(this->modelFileName,prepared->candidateModel().getTimeSolver());
+            modelAssignmentAttempted = true;
+            *this->pModel = prepared->candidateModel();
+            monitoringTransaction.prepare(this->pModel->getMonitoringPointManager(),
+                                          this->modelFileName,this->pModel->getTimeSolver());
+            monitoringTransaction.restoreOutputFileNames();
+            // No staging paths may appear in the result or recovery model.
+            run.validatePrepared(*prepared);
+            run.validatePrepared(*prepared,*this->pModel);
+            if (participant)
+            {
+                publication = participant->stage(*this->pModel,prepared->identity());
+                if (!publication)
+                    throw RError(RError::Type::Application,R_ERROR_REF,
+                                 "Native accepted-step participant returned no prepared publication.");
+                run.validatePrepared(*prepared,*this->pModel);
+            }
+            monitoringTransaction.publish();
+            if(!this->nativeAcceptedTraceOutput)
+                stress->publishDeferredResults();
+            // LAST recovery-authority publication is the decision boundary.
+            // Between its return and these promotions: no allocation, model
+            // copy/setter, I/O, cancellation, observer or application hook.
+            if (publication) publication->publish();
+            run.commit(*prepared);
+            executionCount = prepared->completedSteps();
+            ++invocationAcceptedSteps;
+            if (publication) publication->commit();
+            outputTransaction.commit();
+            monitoringTransaction.commit();
+        }
+        catch (...)
+        {
+            const auto originalFailure = std::current_exception();
+            // Reverse publication order: checkpoint, result/link, monitoring,
+            // caller model and writer-private path. Physics/cursor never moved.
+            const bool checkpointRestored = !publication || publication->rollback();
+            stress->discardPendingResultFrameObserver();
+            const QString outputFailure = outputTransaction.rollback();
+            const QString monitoringFailure = monitoringTransaction.rollback();
+            bool modelRestored = true;
+            try
+            {
+                if (modelAssignmentAttempted) *this->pModel = *acceptedModel;
+                stress->modelFileName = acceptedWriterPath;
+            }
+            catch (...)
+            {
+                modelRestored = false;
+            }
+            if (!checkpointRestored || !outputFailure.isEmpty() ||
+                !monitoringFailure.isEmpty() || !modelRestored)
+            {
+                run.markNonRetryable();
+                rollbackModel = std::move(acceptedModel);
+                throw RError(RError::Type::Application,R_ERROR_REF,
+                             "Native piezo transaction failed with incomplete rollback; retries are disabled and the accepted model backup is retained. Checkpoint restored=%s; model/writer restored=%s. %s %s",
+                             checkpointRestored ? "yes" : "no",modelRestored ? "yes" : "no",
+                             outputFailure.toUtf8().constData(),monitoringFailure.toUtf8().constData());
+            }
+            std::rethrow_exception(originalFailure);
+        }
+        // All notifications are outside the abortable transaction. A result
+        // observer is diagnostic; an accepted observer may stop future trials
+        // by throwing, but a subsequent run resumes after this committed step.
+        RLogger::info("Native piezo accepted step: %u of %u | time=%g [sec]\n",
+                      prepared->completedSteps(),run.targetSteps(),
+                      prepared->identity().timeS);
+        stress->publishResultFrameObserver();
+        if (this->acceptedStructuralStepObserver)
+            this->acceptedStructuralStepObserver(*this->pModel);
+        if (invocationBoundary ||
+            RApplicationState::getInstance().getStateType() == R_APPLICATION_STATE_STOP)
+            break;
+    }
+}
+
 void RSolver::run()
 {
+    if (this->nativeAxialRun ||
+        this->pModel->getProblemSetup().getStructuralPiezoAxialSetup().hasNonDefaultData() ||
+        this->pModel->getProblemSetup().getStructuralPiezoAxialRestart().hasNonDefaultData())
+    {
+        if (!this->nativeAxialRun ||
+            !this->pModel->getProblemSetup().getStructuralPiezoAxialSetup().enabled)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Native axial mode cannot be enabled or disabled after constructing RSolver.");
+        this->runNativeAxial();
+        return;
+    }
+
+    if (this->nativeLayeredRun ||
+        this->pModel->getProblemSetup().getStructuralPiezoLayeredSetup().enabled)
+    {
+        if (!this->nativeLayeredRun ||
+            !this->pModel->getProblemSetup().getStructuralPiezoLayeredSetup().enabled)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Native layered mode cannot be enabled or disabled after constructing RSolver.");
+        this->runNativeLayered();
+        return;
+    }
     if (this->nativeMixedRun ||
         this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled)
     {

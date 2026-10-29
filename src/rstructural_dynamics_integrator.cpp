@@ -2,9 +2,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
+#include <QDebug>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 #include "rmatrixsolver.h"
 
@@ -37,6 +43,32 @@ RRVector product(const RSparseMatrix &matrix, const RRVector &vector)
     return result;
 }
 
+RRVector originalResidual(const RSparseMatrix &matrix,const RRVector &solution,const RRVector &rhs)
+{
+    RRVector result(rhs.size(),0.0);
+    for(uint i=0;i<matrix.getNRows();++i)
+    {
+        // The original row may cancel strongly. Retain multiplication tails
+        // with FMA and addition tails with TwoSum; long double is only binary64
+        // on MSVC. No matrix entry or certificate threshold is changed.
+        double high=-rhs[i],low=0.0;
+        const auto add=[&](double value)
+        {
+            const double sum=high+value,tail=sum-high;
+            low+=(high-(sum-tail))+(value-tail);
+            high=sum;
+        };
+        const auto &row=matrix.getVector(i);
+        for(uint j=0;j<row.size();++j)
+        {
+            const double a=row.getValue(j),x=solution[row.getIndex(j)],value=a*x;
+            add(value);add(std::fma(a,x,-value));
+        }
+        result[i]=high+low;
+    }
+    return result;
+}
+
 double quadraticEnergy(const RSparseMatrix &matrix, const RRVector &vector)
 {
     return 0.5*RRVector::dot(vector,product(matrix,vector));
@@ -49,6 +81,11 @@ bool finiteVector(const RRVector &vector)
         if (!std::isfinite(value)) return false;
     }
     return true;
+}
+
+bool sameBits(double a,double b)
+{
+    return std::memcmp(&a,&b,sizeof(double)) == 0;
 }
 }
 
@@ -159,14 +196,159 @@ RRVector RStructuralDynamicsIntegrator::solve(const RSparseMatrix &matrix, const
     RMatrixSolver linearSolver(this->solverConf);
     linearSolver.disableConvergenceLogFile();
     RRVector solution;
-    linearSolver.solve(matrix,rhs,solution);
+    // Membrane translations and plate rotations have very different physical
+    // scales. Use the existing diagonal preconditioner, without changing the
+    // original equation, solver configuration or iteration budget.
+    linearSolver.solve(matrix,rhs,solution,R_MATRIX_PRECONDITIONER_JACOBI);
     if (!finiteVector(solution))
         throw std::runtime_error("Dynamics linear solve returned non-finite values");
-    RRVector residual = product(matrix,solution);
-    addScaled(residual,rhs,-1.0);
-    if (RRVector::euclideanNorm(residual) >
-        1.0e-8*RRVector::euclideanNorm(rhs)+1.0e-12)
-        throw std::runtime_error("Dynamics linear solve did not converge");
+    RRVector residual = originalResidual(matrix,solution,rhs);
+    const double residualLimit = 1.0e-8*RRVector::euclideanNorm(rhs)+1.0e-12;
+    if (!std::isfinite(residualLimit))
+        throw std::runtime_error("Dynamics linear residual scale is non-finite");
+    // A norm-only check can hide an inaccurate small-force row. Certify fresh
+    // componentwise backward error on the ORIGINAL matrix, then correct its
+    // residual with the same bounded solver. All Newmark predictors, q/v/a and
+    // work are subsequently formed from this one corrected acceleration.
+    uint worstRow=0;
+    const auto componentwiseError = [&]()
+    {
+        double maximum = 0.0;
+        for (uint i=0; i<matrix.getNRows(); ++i)
+        {
+            double scale = std::abs(rhs[i]);
+            const auto &row = matrix.getVector(i);
+            for (uint j=0; j<row.size(); ++j)
+                scale += std::abs(row.getValue(j)*solution[row.getIndex(j)]);
+            if (!std::isfinite(scale) || !std::isfinite(residual[i]))
+                throw std::runtime_error("Dynamics componentwise linear certificate is non-finite");
+            const double error = scale == 0.0 ? (residual[i] == 0.0 ? 0.0 : std::numeric_limits<double>::infinity())
+                                              : std::abs(residual[i])/scale;
+            if(error>maximum){maximum=error;worstRow=i;}
+        }
+        return maximum;
+    };
+    constexpr double componentwiseTolerance = 1.0e-12;
+    const bool diagnostic=qEnvironmentVariableIsSet("RANGE_DYNAMICS_SOLVE_DIAGNOSTICS") && matrix.getNRows()<=128;
+    const RRVector initialSolution=diagnostic?solution:RRVector{};
+    QJsonArray passes;
+    const auto report=[&](bool certified)
+    {
+        if(!diagnostic)return;
+        // Bound successful and failed captures separately: a late failure is
+        // still recorded after the first successful corrected solves.
+        static thread_local uint successRecords=0,failureRecords=0;
+        auto &count=certified?successRecords:failureRecords;
+        if(count>=(certified?2u:4u))return;
+        ++count;QJsonArray rows,right,initial,final;
+        for(uint i=0;i<matrix.getNRows();++i){QJsonArray row;
+            for(uint j=0;j<matrix.getNRows();++j)row.append(matrix.findValue(i,j));
+            rows.append(row);right.append(rhs[i]);initial.append(initialSolution[i]);final.append(solution[i]);}
+        const QJsonObject record{{"schema","range.dynamics-original-solve-diagnostic/v1"},{"certified",certified},
+            {"originalMatrix",rows},{"rhs",right},{"initialSolution",initial},{"finalSolution",final},{"passes",passes},
+            {"solverType",this->solverConf.getType()},{"innerIterations",int(this->solverConf.getNInnerIterations())},
+            {"outerIterations",int(this->solverConf.getNOuterIterations())},{"solverTolerance",this->solverConf.getSolverCvgValue()},
+            {"originalNormLimit",residualLimit},{"originalRowTolerance",componentwiseTolerance}};
+        qInfo().noquote()<<"DYNAMICS_SOLVE_DIAGNOSTIC"<<QJsonDocument(record).toJson(QJsonDocument::Compact);
+    };
+    RSparseMatrix correctionMatrix;RRVector inverseDiagonal;
+    bool equilibrated=false;
+    uint correctionBlockWidth=1;
+    // A restarted, norm-stopped Krylov correction can resolve the large rows
+    // before an almost-unloaded coupled row. Continue only while its unchanged
+    // original-row certificate requires it; bound work and reject stagnation.
+    // Exact captured 40-DOF QUAD replays with bounded block Jacobi certify in
+    // two, nine and six corrections under configured 10-by-10 GMRES. Twenty is
+    // a finite internal ceiling with reserve, not a change to the configured
+    // per-call solver budget or either ORIGINAL-matrix gate.
+    constexpr uint maximumCorrections=20;
+    for (uint refinement=0; refinement<maximumCorrections; ++refinement)
+    {
+        const double rowError=componentwiseError(),norm=RRVector::euclideanNorm(residual);
+        if(diagnostic)passes.append(QJsonObject{{"pass",int(refinement)},{"worstRow",int(worstRow)},
+            {"rowError",rowError},{"originalResidualNorm",norm}});
+        if (rowError <= componentwiseTolerance && norm <= residualLimit)
+        {
+            if(refinement)report(true);
+            return solution;
+        }
+        if(refinement==0)
+        {
+            // Symmetric positive diagonal equilibration preserves SPD for CG:
+            // solve D^-1 A D^-1 z = D^-1 r, then delta = D^-1 z.
+            // The configured solver, budget and ORIGINAL-A gates stay intact.
+            inverseDiagonal.resize(matrix.getNRows(),1.0);equilibrated=true;
+            for(uint i=0;i<matrix.getNRows();++i){const double diagonal=matrix.findValue(i,i);
+                if(!(diagonal>0)){equilibrated=false;break;}
+                inverseDiagonal[i]=1.0/std::sqrt(diagonal);}
+            if(equilibrated){correctionMatrix.setNRows(matrix.getNRows());
+                for(uint i=0;i<matrix.getNRows();++i){const auto &row=matrix.getVector(i);
+                    for(uint j=0;j<row.size();++j){const uint column=row.getIndex(j);
+                        const double value=row.getValue(j)*inverseDiagonal[i]*inverseDiagonal[column];
+                        if(!std::isfinite(value))throw std::runtime_error("Dynamics correction equilibration is non-finite");
+                        correctionMatrix.addValue(i,column,value);}}}
+            if(equilibrated && matrix.getNRows()>1)
+            {
+                correctionBlockWidth=std::min(10u,std::max(1u,matrix.getNRows()/2));
+                while(matrix.getNRows()%correctionBlockWidth)--correctionBlockWidth;
+                if(correctionBlockWidth>=matrix.getNRows())
+                    throw std::logic_error("Dynamics correction block must be smaller than the system");
+                // Existing block Jacobi inverts these same principal blocks.
+                // Check its bounded inversion before entering Krylov iterations;
+                // never invert the complete system or substitute another solver.
+                if(correctionBlockWidth>1)for(uint begin=0;begin<matrix.getNRows();begin+=correctionBlockWidth)
+                {
+                    RRMatrix block(correctionBlockWidth,correctionBlockWidth,0.0);
+                    for(uint i=0;i<correctionBlockWidth;++i)for(uint j=0;j<correctionBlockWidth;++j)
+                        block[i][j]=correctionMatrix.findValue(begin+i,begin+j);
+                    block.invert(); // Existing singular-pivot checks remain authoritative.
+                    for(uint i=0;i<correctionBlockWidth;++i)for(uint j=0;j<correctionBlockWidth;++j)
+                        if(!std::isfinite(block[i][j]))throw std::runtime_error("Dynamics correction block inverse is non-finite");
+                }
+            }
+        }
+        RMatrixSolver correctionSolver(this->solverConf);
+        correctionSolver.disableConvergenceLogFile();
+        RRVector correction;
+        RRVector correctionRhs=residual;
+        if(equilibrated)for(uint i=0;i<correctionRhs.size();++i)correctionRhs[i]*=inverseDiagonal[i];
+        if(!finiteVector(correctionRhs))throw std::runtime_error("Dynamics equilibrated correction force is non-finite");
+        correctionSolver.solve(equilibrated?correctionMatrix:matrix,correctionRhs,correction,
+            correctionBlockWidth>1?R_MATRIX_PRECONDITIONER_BLOCK_JACOBI:R_MATRIX_PRECONDITIONER_JACOBI,correctionBlockWidth);
+        if (!finiteVector(correction) || correction.size() != solution.size())
+            throw std::runtime_error("Dynamics residual correction returned invalid values");
+        if(equilibrated)for(uint i=0;i<correction.size();++i)correction[i]*=inverseDiagonal[i];
+        if(diagnostic){auto pass=passes.last().toObject();pass["equilibrated"]=equilibrated;
+            pass["correctionBlockWidth"]=int(correctionBlockWidth);
+            pass["correctionNorm"]=RRVector::euclideanNorm(correction);passes.replace(passes.size()-1,pass);}
+        if (!finiteVector(correction) || correction.size() != solution.size())
+            throw std::runtime_error("Dynamics residual correction returned invalid values");
+        bool changed = false;
+        for (uint i=0; i<solution.size(); ++i)
+        {
+            const double next = solution[i]-correction[i];
+            changed = changed || !sameBits(next,solution[i]);
+            solution[i] = next;
+        }
+        if (!finiteVector(solution) || !changed)
+        {
+            report(false);
+            throw std::runtime_error("Dynamics residual refinement is non-finite or stagnated");
+        }
+        residual = originalResidual(matrix,solution,rhs);
+    }
+    if (componentwiseError() > componentwiseTolerance || RRVector::euclideanNorm(residual) > residualLimit)
+    {
+        const double error=componentwiseError();std::ostringstream message;message.precision(17);
+        if(diagnostic)passes.append(QJsonObject{{"pass",int(maximumCorrections)},{"worstRow",int(worstRow)},
+            {"rowError",error},{"originalResidualNorm",RRVector::euclideanNorm(residual)}});
+        report(false);
+        message<<"Dynamics original-matrix norm and componentwise linear certificate did not converge within "
+               <<maximumCorrections<<" residual corrections: row="<<worstRow<<" rowError="<<error
+               <<" residualNorm="<<RRVector::euclideanNorm(residual)<<" normLimit="<<residualLimit;
+        throw std::runtime_error(message.str());
+    }
+    report(true);
     return solution;
 }
 
@@ -211,17 +393,47 @@ const RStructuralDynamicsState &RStructuralDynamicsIntegrator::trialStep(double 
     if (!this->initialized) throw std::logic_error("Dynamics integrator is not initialized");
     if (!std::isfinite(dt) || dt <= 0.0)
         throw std::invalid_argument("Dynamics time step must be positive and finite");
-    if (this->options.method == Method::CentralDifference &&
-        dt >= 0.95*this->centralDifferenceStepLimit)
-        throw std::invalid_argument("Central difference time step exceeds the conservative stability limit");
     if (this->fixedStep > 0.0 && std::abs(dt-this->fixedStep) >
         1.0e-12*std::max(dt,this->fixedStep))
         throw std::invalid_argument("Dynamics integrator requires a fixed time step");
+    const double rightTime = this->accepted.time+dt;
+    // Preserve the ordinary API's first accepted elapsed-step contract.
+    return this->trialInterval(dt,rightTime,rightTime-this->accepted.time);
+}
+
+const RStructuralDynamicsState &RStructuralDynamicsIntegrator::trialStepOnGrid(
+    double time0,std::uint64_t stepIndex,double nominalDt)
+{
+    if (!this->initialized) throw std::logic_error("Dynamics integrator is not initialized");
+    // Every integer in the admitted clock must be exactly representable in
+    // binary64; otherwise adjacent indices may alias before time arithmetic.
+    if (!std::isfinite(time0) || !std::isfinite(nominalDt) || nominalDt <= 0.0 ||
+        stepIndex == 0 || stepIndex > (std::uint64_t(1)<<53))
+        throw std::invalid_argument("Invalid canonical dynamics grid");
+    const double leftTime = stepIndex == 1 ? time0 : time0+double(stepIndex-1)*nominalDt;
+    const double rightTime = time0+double(stepIndex)*nominalDt;
+    if (!std::isfinite(leftTime) || !std::isfinite(rightTime) ||
+        !sameBits(this->accepted.time,leftTime) ||
+        (this->fixedStep == 0.0 ? stepIndex != 1 :
+         stepIndex == 1 || !sameBits(this->fixedStep,nominalDt)))
+        throw std::invalid_argument("Canonical dynamics grid differs from accepted clock/step");
+    return this->trialInterval(rightTime-leftTime,rightTime,nominalDt);
+}
+
+const RStructuralDynamicsState &RStructuralDynamicsIntegrator::trialInterval(
+    double dt,double rightTime,double declaredFixedStep)
+{
+    if (!std::isfinite(dt) || dt <= 0.0 || !std::isfinite(rightTime) ||
+        rightTime <= this->accepted.time)
+        throw std::invalid_argument("Dynamics interval must advance finite representable time");
+    if (this->options.method == Method::CentralDifference &&
+        dt >= 0.95*this->centralDifferenceStepLimit)
+        throw std::invalid_argument("Central difference time step exceeds the conservative stability limit");
 
     // Never expose a partially evaluated candidate if a callback or solve throws.
     this->candidateReady = false;
     RStructuralDynamicsState next = this->accepted;
-    next.time += dt;
+    next.time = rightTime;
     if (this->options.method == Method::CentralDifference)
     {
         // Central-difference half-step velocity; damping uses a centered term.
@@ -261,7 +473,8 @@ const RStructuralDynamicsState &RStructuralDynamicsIntegrator::trialStep(double 
         addScaled(vPredictor,this->accepted.a,dt*(1.0-gamma));
 
         // M[(1-am)a+am a_n]+C[(1-af)v+af v_n]+K[(1-af)q+af q_n]=f(t_n+(1-af)dt).
-        RRVector effectiveForce = this->evaluateForce(this->accepted.time+(1.0-alphaF)*dt);
+        RRVector effectiveForce = this->evaluateForce(alphaF == 0.0 ? next.time :
+            this->accepted.time+(1.0-alphaF)*dt);
         RRVector rhs = effectiveForce;
         addScaled(rhs,product(this->mass,this->accepted.a),-alphaM);
         RRVector weightedVelocity = vPredictor;
@@ -284,6 +497,7 @@ const RStructuralDynamicsState &RStructuralDynamicsIntegrator::trialStep(double 
 
     this->updateEnergy(next,dt);
     this->candidate = std::move(next);
+    this->candidateFixedStep = declaredFixedStep;
     this->candidateReady = true;
     return this->candidate;
 }
@@ -308,7 +522,7 @@ void RStructuralDynamicsIntegrator::updateEnergy(RStructuralDynamicsState &state
 void RStructuralDynamicsIntegrator::acceptStep()
 {
     if (!this->candidateReady) throw std::logic_error("No candidate dynamics step to accept");
-    if (this->fixedStep == 0.0) this->fixedStep = this->candidate.time-this->accepted.time;
+    if (this->fixedStep == 0.0) this->fixedStep = this->candidateFixedStep;
     this->accepted = std::move(this->candidate);
     this->candidate = {};
     this->candidateReady = false;

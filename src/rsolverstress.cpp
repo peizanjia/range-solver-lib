@@ -37,6 +37,38 @@ RValueVector nativeMixedMonitoringValue(const RModel &model,const RMonitoringPoi
                          "Native mixed monitoring requires a finite position in the reference mesh.");
     const RNode location(point.getPosition());
     const auto &variable = model.getVariable(variableId);
+    // BEAM1 and QUAD1 have no implementation in RElement::interpolate
+    // (its default branch returns zero). Forward exact nodal kinematics only;
+    // an interior beam displacement would additionally need Hermite rotations.
+    if (model.getProblemSetup().getStructuralPiezoLayeredSetup().enabled)
+    {
+        if (variable.getApplyType() != R_VARIABLE_APPLY_NODE || variable.getNVectors() == 0 ||
+            variable.getNValues() != model.getNNodes())
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Native layered monitoring requires a complete nodal kinematic field.");
+        uint nodeId = RConstants::eod;
+        for (uint i=0;i<model.getNNodes();++i)
+            if (model.getNode(i).getDistance(location) == 0.0)
+            {
+                if (nodeId != RConstants::eod)
+                    throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                                 "Native layered monitoring position matches multiple nodes.");
+                nodeId = i;
+            }
+        if (nodeId == RConstants::eod)
+            throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                         "Native layered monitoring supports exact mesh nodes; interior BEAM1/QUAD1 interpolation is unsupported.");
+        RValueVector values;
+        values.resize(variable.getNVectors());
+        for (uint component=0;component<variable.getNVectors();++component)
+        {
+            values[component] = variable.getValue(component,nodeId);
+            if (!std::isfinite(values[component]))
+                throw RError(RError::Type::InvalidInput,R_ERROR_REF,
+                             "Native layered monitoring encountered a nonfinite nodal value.");
+        }
+        return values;
+    }
     const bool elemental = variable.getApplyType() == R_VARIABLE_APPLY_ELEMENT;
     uint elementId = RConstants::eod;
     for (uint i=0;i<model.getNElements();++i)
@@ -1211,9 +1243,10 @@ void RSolverStress::validateNativeMixedMonitoringPoints(const RModel &model)
 
 void RSolverStress::processNativeMixedMonitoringPoints()
 {
-    if (!this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled)
+    if (!this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled &&
+        !this->pModel->getProblemSetup().getStructuralPiezoLayeredSetup().enabled)
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Native mixed monitoring forwarding requires the dedicated mixed dynamics mode.");
+                     "Native monitoring forwarding requires dedicated mixed or layered dynamics.");
     // Values and point availability are certified before publishing any files.
     // The host redirects these appends to its monitoring transaction's stages.
     for (const auto &point : this->pModel->getMonitoringPointManager())
@@ -1252,9 +1285,10 @@ bool RSolverStress::hasConverged() const
 
 void RSolverStress::validateRunConfiguration() const
 {
-    if (this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled)
+    if (this->pModel->getProblemSetup().getStructuralTrussDynamicsSetup().enabled ||
+        this->pModel->getProblemSetup().getStructuralPiezoLayeredSetup().enabled)
         throw RError(RError::Type::InvalidInput,R_ERROR_REF,
-                     "Native mixed dynamics must run through the dedicated RSolver accepted-state transaction, not RSolverStress::run.");
+                     "Native mixed or layered dynamics must run through the dedicated RSolver accepted-state transaction, not RSolverStress::run.");
     const bool cableEnabled = this->pModel->getProblemSetup().getStructuralCableSetup().enabled;
     const bool piezoEnabled = this->pModel->getProblemSetup().getStructuralPiezoSetup().enabled;
     const bool cableDynamicsEnabled = cableEnabled &&

@@ -5,8 +5,20 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <limits>
 
 #include "rparallel_execution_context.h"
+
+namespace {
+int openMPThreadLimit()
+{
+#if defined(_OPENMP) && _OPENMP >= 200805
+    return omp_get_thread_limit();
+#else
+    return std::numeric_limits<int>::max();
+#endif
+}
+}
 
 class TestParallelExecutionContext : public QObject
 {
@@ -75,7 +87,7 @@ void TestParallelExecutionContext::fixedThreadsReportsActualBackendAndFallback()
     const RParallelExecutionReport &report = limited.getReport();
     QCOMPARE(report.requestedThreads,processors + 1u);
     QCOMPARE(report.appliedThreads,uint(std::min(omp_get_num_procs(),
-                                                 omp_get_thread_limit())));
+                                                 openMPThreadLimit())));
     QVERIFY(report.fallback);
     QVERIFY(!report.diagnostic.isEmpty());
 }
@@ -90,7 +102,7 @@ void TestParallelExecutionContext::autoScopeUsesRuntimeSelection()
     QCOMPARE(report.requestedThreads,0u);
     QCOMPARE(report.appliedThreads,uint(std::min({originalMaxThreads,
                                                    omp_get_num_procs(),
-                                                   omp_get_thread_limit()})));
+                                                   openMPThreadLimit()})));
     QVERIFY(report.actualThreads >= 1u);
     QVERIFY(report.actualThreads <= report.appliedThreads);
     QCOMPARE(report.deterministicReduction,report.actualThreads == 1u);

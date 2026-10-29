@@ -2,6 +2,7 @@
 #define RSTRUCTURAL_DYNAMICS_INTEGRATOR_H
 
 #include <functional>
+#include <cstdint>
 
 #include <rml_matrix_solver_conf.h>
 #include <rml_sparse_matrix.h>
@@ -83,6 +84,13 @@ class RStructuralDynamicsIntegrator
 
         //! Computes a candidate without changing the committed state. Once accepted, dt is fixed.
         const RStructuralDynamicsState &trialStep(double dt);
+        //! Advance on the original canonical grid t0+index*nominalDt. The
+        //! accepted clock must equal the preceding grid point exactly. Solve
+        //! and integrate work over the actual representable endpoint interval;
+        //! persist nominalDt as fixedStep, without cumulative clock drift.
+        const RStructuralDynamicsState &trialStepOnGrid(double time0,
+                                                       std::uint64_t stepIndex,
+                                                       double nominalDt);
         void acceptStep();
         void rejectStep();
 
@@ -104,6 +112,7 @@ class RStructuralDynamicsIntegrator
         RStructuralDynamicsState accepted;
         RStructuralDynamicsState candidate;
         double fixedStep = 0.0;
+        double candidateFixedStep = 0.0;
         double initialMechanicalEnergy = 0.0;
         //! Certified conservative limit from a strictly diagonally dominant mass matrix.
         double centralDifferenceStepLimit = 0.0;
@@ -115,6 +124,8 @@ class RStructuralDynamicsIntegrator
         bool candidateReady = false;
 
         RRVector evaluateForce(double time) const;
+        const RStructuralDynamicsState &trialInterval(double dt,double rightTime,
+                                                       double declaredFixedStep);
         const RSparseMatrix &operatorForStep(double dt);
         RRVector solve(const RSparseMatrix &matrix, const RRVector &rhs) const;
         void updateEnergy(RStructuralDynamicsState &state, double dt) const;

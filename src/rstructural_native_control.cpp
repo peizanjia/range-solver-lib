@@ -1,4 +1,5 @@
 #include "rstructural_native_control.h"
+#include "rstructural_piezo_native_readout.h"
 
 #include <algorithm>
 #include <cmath>
@@ -167,6 +168,20 @@ RStructuralNativeControl::RStructuralNativeControl(const RStructuralTrussDynamic
                     fail("Native electrical sensor requires exactly one independent physical port ID.");
                 target=maps.memberByPortId.at(sensor.portId);
                 owner=QString("%1:p:%2").arg(uint(sensor.quantity)).arg(sensor.portId); break;
+            case RStructuralNativeMeasurementQuantity::PiezoReadoutVoltage:
+            case RStructuralNativeMeasurementQuantity::PiezoReadoutCharge:
+            {
+                const auto &readout=adapter.piezoReadout();
+                const auto found=readout.portIndices().find(sensor.portId);
+                if(found==readout.portIndices().end() || sensor.physicalNodeId!=0 || sensor.physicalMemberId!=0 || sensor.axis!=0)
+                    fail("Native piezo readout sensor requires one classified electrical port.");
+                target=found->second;
+                const auto quantity=rStructuralPiezoReadoutQuantity(readout.setup().ports.at(target).readout);
+                if((sensor.quantity==RStructuralNativeMeasurementQuantity::PiezoReadoutVoltage && quantity!=RStructuralPiezoReadoutQuantity::Voltage) ||
+                   (sensor.quantity==RStructuralNativeMeasurementQuantity::PiezoReadoutCharge && quantity!=RStructuralPiezoReadoutQuantity::Charge))
+                    fail("Native piezo readout sensor quantity differs from its frozen electrical boundary.");
+                owner=QString("%1:p:%2").arg(uint(sensor.quantity)).arg(sensor.portId); break;
+            }
             default: fail("Native sensor quantity is unsupported.");
         }
         if (!sensorOwners.insert(owner).second) fail("Native sensor aliases duplicate the same quantity/physical target.");
@@ -292,6 +307,9 @@ RStructuralNativeControlFrame RStructuralNativeControl::sample(const RStructural
     adapter.driver().refresh(state,state.appliedInputs); // validate only; sample the original left acceleration.
     const auto &system=adapter.system();
     const auto fresh=RStructuralTrussAssembly::evaluate(system.referenceNodes,state.displacements,system.members,state.appliedInputs.memberInputs);
+    std::vector<RStructuralPiezoNativeReadoutSample> readouts;
+    if(std::any_of(spec.sensors.begin(),spec.sensors.end(),[](const auto &s) { return uint(s.quantity)>=7; }))
+        readouts=adapter.piezoReadout().observe(state,fresh);
     RStructuralNativeControlFrame frame;
     frame.completedFE=completed; frame.controlTick=completed; frame.sampleTime=state.time;
     frame.nextFETime=adapter.targetTime(completed+1); frame.nextControlTime=frame.nextFETime;
@@ -312,6 +330,9 @@ RStructuralNativeControlFrame RStructuralNativeControl::sample(const RStructural
             case RStructuralNativeMeasurementQuantity::PortCharge:
                 if (!fresh.memberResponses.at(target).electrical) fail("Native charge sensor has no independent port response.");
                 value=fresh.memberResponses.at(target).electrical->conductorCharge; break;
+            case RStructuralNativeMeasurementQuantity::PiezoReadoutVoltage:
+            case RStructuralNativeMeasurementQuantity::PiezoReadoutCharge:
+                value=readouts.at(target).value; break;
             case RStructuralNativeMeasurementQuantity::SupportReaction:
                 value=system.nodalLumpedMass.at(target/3)*state.accelerations.at(target)+
                     (fresh.internalForces.at(target)-state.appliedInputs.externalForces.at(target)); break;

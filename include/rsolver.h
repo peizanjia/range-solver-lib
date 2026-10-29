@@ -12,6 +12,8 @@
 #include "rstructural_control_protocol.h"
 #include "rsolvershareddata.h"
 #include "raccepted_step_publication.h"
+#include "rstructural_piezo_layered_native_run.h"
+#include "rstructural_piezo_axial_native_run.h"
 
 struct RParallelExecutionReport;
 class RStructuralTrussNativeRun;
@@ -71,10 +73,21 @@ class RSolver
         bool transientHeatStressRetryPending;
         //! Dedicated accepted state survives failed trials and repeated run().
         std::unique_ptr<RStructuralTrussNativeRun> nativeMixedRun;
+        std::unique_ptr<RStructuralPiezoLayeredNativeRun> nativeLayeredRun;
+        RStructuralPiezoLayeredRuntimeCallbacks nativeLayeredCallbacks;
+        std::unique_ptr<RStructuralPiezoAxialNativeRun> nativeAxialRun;
+        RStructuralPiezoAxialRuntimeCallbacks nativeAxialCallbacks;
         std::shared_ptr<RAcceptedStepParticipant> acceptedStepParticipant;
         uint nativeMixedStepBudget = 0;
+        uint nativeLayeredStepBudget = 0;
+        uint nativeAxialStepBudget = 0;
+        bool nativeAcceptedTraceOutput = false;
         //! Keep the exact model backup if restoring caller-owned storage fails.
         std::unique_ptr<RModel> nativeMixedRollbackModel;
+        std::unique_ptr<RModel> nativeLayeredRollbackModel;
+        std::unique_ptr<RModel> nativeAxialRollbackModel;
+        template<class NativeRun> void runNativePiezo(NativeRun &run,uint stepBudget,
+                                                     std::unique_ptr<RModel> &rollbackModel);
 
     public:
 
@@ -82,7 +95,9 @@ class RSolver
         RSolver(RModel &model,
                 const QString &modelFileName,
                 const QString &convergenceFileName,
-                ExecutionPolicy executionPolicy = ExecutionPolicy::AllRegisteredSolvers);
+                ExecutionPolicy executionPolicy = ExecutionPolicy::AllRegisteredSolvers,
+                RStructuralPiezoLayeredRuntimeCallbacks layeredCallbacks = {},
+                RStructuralPiezoAxialRuntimeCallbacks axialCallbacks = {});
 
         //! Copy constructor (deleted to prevent double-free of solvers).
         RSolver(const RSolver &solver) = delete;
@@ -132,23 +147,32 @@ class RSolver
         //! of result display frequency. Observer failures stop subsequent steps.
         void setAcceptedStructuralStepObserver(AcceptedStructuralStepObserver observer);
 
-        //! Native mixed mode only. Stage before output publication; its
+        //! Dedicated native mixed, layered or axial mode. Stage before output publication; its
         //! recovery-authority publish is last, followed by noexcept commits.
         void setAcceptedStepParticipant(std::shared_ptr<RAcceptedStepParticipant> participant);
+        //! Complete accepted trace replaces repeated display MODEL writes. The
+        //! physical grid and saved display frequency remain unchanged.
+        void setNativeAcceptedTraceOutput(bool enabled);
 
         //! Maximum accepted FE steps per run() invocation; zero is unlimited.
         //! The original physical target and source identity remain unchanged.
         //! The last budget step requests a final checkpoint publication.
         void setNativeMixedStepBudget(uint stepBudget);
+        void setNativeLayeredStepBudget(uint stepBudget);
+        void setNativeAxialStepBudget(uint stepBudget);
 
         //! False after incomplete external/model rollback; further native
         //! trials are rejected and the last accepted state is preserved.
         bool isNativeMixedRetryable() const noexcept;
+        bool isNativeLayeredRetryable() const noexcept;
+        bool isNativeAxialRetryable() const noexcept;
 
     protected:
 
         //! Dedicated native dispatch; never enters the generic stress driver.
         void runNativeMixed();
+        void runNativeLayered();
+        void runNativeAxial();
 
         //! Run single solver.
         void runSingle();

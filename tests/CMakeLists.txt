@@ -12,6 +12,9 @@ endif()
 set(CMAKE_AUTOMOC ON)
 
 set(range_solver_lib_tests
+    tst_structural_piezo_axial_native_run
+    tst_structural_piezo_axial_operators
+    tst_structural_truss_damped_forcing
     tst_native_result_frame_observer
     tst_scales
     tst_local_rotation
@@ -34,6 +37,18 @@ set(range_solver_lib_tests
     tst_structural_truss_dynamics_fe
     tst_structural_cable_fe
     tst_structural_piezo_kernel
+    tst_structural_piezo_material_ops
+    tst_structural_piezo_beam_layer_kernel
+    tst_structural_piezo_plate_mitc4_kernel
+    tst_structural_piezo_electrical_system
+    tst_structural_piezo_native_readout
+    tst_structural_piezo_layered_mesh
+    tst_structural_piezo_layered_model_adapter
+    tst_structural_piezo_layered_dynamics
+    tst_structural_piezo_layered_native_run
+    tst_structural_piezo_layered_beam_oracle
+    tst_structural_piezo_layered_plate_oracle
+    tst_structural_piezo_solid
     tst_structural_piezo_fe
     tst_structural_control_force_map
     tst_structural_control_conditioner
@@ -79,6 +94,9 @@ foreach(test_name IN LISTS range_solver_lib_tests)
     if(test_name STREQUAL "tst_structural_native_control")
         add_test(NAME ${test_name} COMMAND ${test_name}
             -o "${CMAKE_CURRENT_BINARY_DIR}/native-control-core-detail.txt,txt" -o -,txt)
+    elseif(test_name MATCHES "^tst_structural_piezo_(material_ops|beam_layer_kernel|plate_mitc4_kernel|electrical_system|native_readout|solid|axial_.*|layered_.*)$" OR test_name STREQUAL "tst_structural_truss_damped_forcing")
+        add_test(NAME ${test_name} COMMAND ${test_name}
+            -o "${CMAKE_CURRENT_BINARY_DIR}/${test_name}-detail.txt,txt" -o -,txt)
     else()
         add_test(NAME ${test_name} COMMAND ${test_name})
     endif()

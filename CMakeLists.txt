@@ -44,6 +44,16 @@ qt_add_library(range-solver-lib
         src/rstructural_truss_native_run.cpp
         src/rstructural_piezo_model_adapter.cpp
         src/rstructural_piezo_kernel.cpp
+        src/rstructural_piezo_element_operators.cpp
+        src/rstructural_piezo_beam_layer_kernel.cpp
+        src/rstructural_piezo_plate_mitc4_kernel.cpp
+        src/rstructural_piezo_electrical_system.cpp
+        src/rstructural_piezo_native_readout.cpp
+        src/rstructural_piezo_layered_mesh.cpp
+        src/rstructural_piezo_layered_model_adapter.cpp
+        src/rstructural_piezo_layered_dynamics.cpp
+        src/rstructural_piezo_layered_restart_codec.cpp
+        src/rstructural_piezo_layered_native_run.cpp
         src/rstructural_control_force_map.cpp
         src/rstructural_control_conditioner.cpp
         src/rstructural_control_runtime_parameters.cpp
@@ -108,6 +118,15 @@ qt_add_library(range-solver-lib
         include/rstructural_truss_native_run.h
         include/rstructural_piezo_model_adapter.h
         include/rstructural_piezo_kernel.h
+        include/rstructural_piezo_element_operators.h
+        include/rstructural_piezo_electrical_system.h
+        include/rstructural_piezo_native_readout.h
+        include/rstructural_piezo_layered_mesh.h
+        include/rstructural_piezo_layered_model_adapter.h
+        include/rstructural_piezo_layered_dynamics.h
+        include/rstructural_piezo_layered_run_state.h
+        include/rstructural_piezo_layered_restart_codec.h
+        include/rstructural_piezo_layered_native_run.h
         include/rstructural_control_force_map.h
         include/rstructural_control_conditioner.h
         include/rstructural_control_runtime_parameters.h
@@ -147,7 +166,11 @@ target_link_libraries(range-solver-lib
 set(range_native_control_hash_inputs
     "${CMAKE_CURRENT_SOURCE_DIR}/src/rstructural_native_control.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/rstructural_native_control.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../range-model-lib/include/rml_structural_native_control.h")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../range-model-lib/include/rml_structural_native_control.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/rstructural_piezo_native_readout.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/rstructural_piezo_native_readout.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../range-model-lib/src/rml_structural_piezo_readout_setup.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../range-model-lib/include/rml_structural_piezo_readout_setup.h")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${range_native_control_hash_inputs})
 set(range_native_control_identity_material "range.native.pi.implementation/v1\n")
 foreach(range_native_control_hash_input IN LISTS range_native_control_hash_inputs)
@@ -161,6 +184,13 @@ target_compile_definitions(range-solver-lib PRIVATE
     RANGE_NATIVE_CONTROL_IMPLEMENTATION_SHA256="${range_native_control_implementation_sha256}")
 
 # Unit tests (opt-in via -DRANGE_BUILD_TESTS=ON)
+target_sources(range-solver-lib PRIVATE src/rstructural_piezo_axial_operators.cpp include/rstructural_piezo_axial_operators.h)
+target_sources(range-solver-lib PRIVATE src/rstructural_piezo_solid_kernel.cpp
+    src/rstructural_piezo_solid_mesh.cpp include/rstructural_piezo_solid_kernel.h)
+target_sources(range-solver-lib PRIVATE
+    src/rstructural_piezo_axial_native_run.cpp src/rstructural_piezo_axial_restart_codec.cpp
+    include/rstructural_piezo_axial_native_run.h include/rstructural_piezo_axial_restart_codec.h
+    include/rstructural_piezo_axial_run_state.h)
 if(RANGE_BUILD_TESTS)
     add_subdirectory(tests)
 endif()

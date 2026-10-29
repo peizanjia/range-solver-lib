@@ -43,16 +43,24 @@ void RSolverMesh::prepare()
     for (uint i=0;i<this->pModel->getNVolumes();i++)
     {
         const RVolume &rVolume = this->pModel->getVolume(i);
-#pragma omp parallel for default(shared) reduction(max:maxVolume)
-        for (int64_t j=0;j<int64_t(rVolume.size());j++)
+#pragma omp parallel default(shared)
         {
-            uint elementID = rVolume.get(uint(j));
-            const RElement &rElement = this->pModel->getElement(elementID);
-
-            double volume = 0.0;
-            if (rElement.findVolume(this->pModel->getNodes(),volume))
+            double threadMaxVolume = 0.0;
+#pragma omp for
+            for (int64_t j=0;j<int64_t(rVolume.size());j++)
             {
-                maxVolume = std::max(maxVolume,volume);
+                uint elementID = rVolume.get(uint(j));
+                const RElement &rElement = this->pModel->getElement(elementID);
+
+                double volume = 0.0;
+                if (rElement.findVolume(this->pModel->getNodes(),volume))
+                {
+                    threadMaxVolume = std::max(threadMaxVolume,volume);
+                }
+            }
+#pragma omp critical(range_solver_mesh_max_volume)
+            {
+                maxVolume = std::max(maxVolume,threadMaxVolume);
             }
         }
     }

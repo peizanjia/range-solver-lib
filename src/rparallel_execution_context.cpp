@@ -21,8 +21,14 @@ RParallelExecutionContext::RParallelExecutionContext(const RParallelExecutionCon
     this->report.deterministicReductionRequested = config.getDeterministicReduction();
 
     const bool nested = omp_in_parallel() != 0;
-    const uint threadLimit = uint(std::max(1,omp_get_thread_limit()));
     const uint integerLimit = uint(std::numeric_limits<int>::max());
+#if defined(_OPENMP) && _OPENMP >= 200805
+    const uint threadLimit = uint(std::max(1,omp_get_thread_limit()));
+#else
+    // MSVC /openmp implements OpenMP 2.0 and has no omp_get_thread_limit API.
+    // Bound requests by visible processors and report the team actually made.
+    const uint threadLimit = integerLimit;
+#endif
     const uint maxRuntimeThreads = std::min({threadLimit,integerLimit,
                                              this->report.availableThreads});
     uint requestedScopeThreads = 1;
@@ -46,8 +52,9 @@ RParallelExecutionContext::RParallelExecutionContext(const RParallelExecutionCon
     omp_set_num_threads(int(this->report.appliedThreads));
 
     int measuredThreads = 1;
-#pragma omp parallel reduction(max:measuredThreads)
+#pragma omp parallel
     {
+#pragma omp single
         measuredThreads = omp_get_num_threads();
     }
     this->report.actualThreads = uint(std::max(1,measuredThreads));
